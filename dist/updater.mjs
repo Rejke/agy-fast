@@ -278,6 +278,8 @@ var UPDATER_RUNTIME_FILES = [
   "assets/logo.svg",
   "dist/mcp-server.mjs",
   "dist/session-start.mjs",
+  "dist/pre-invocation.mjs",
+  "dist/pre-tool-use.mjs",
   "dist/benchmark.mjs",
   "dist/updater.mjs",
   "scripts/install.mjs",

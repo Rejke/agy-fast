@@ -2,9 +2,99 @@
 
 
 // src/session-start.ts
-import { promises as fs3 } from "node:fs";
-import path5 from "node:path";
+import { promises as fs6 } from "node:fs";
+import path7 from "node:path";
 import { fileURLToPath } from "node:url";
+
+// src/utils/hook-io.ts
+import { promises as fs } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+var DEFAULT_MAX_STDIN_BYTES = 256 * 1024;
+function getHookHomeDir(env = process.env) {
+  return process.platform === "win32" ? env.USERPROFILE || env.HOME || os.homedir() : env.HOME || env.USERPROFILE || os.homedir();
+}
+function getHookCacheDir(env = process.env) {
+  const custom = env.AGY_FAST_CACHE_DIR?.trim();
+  return custom ? path.resolve(custom) : path.join(getHookHomeDir(env), ".gemini", "cache", "agy-fast");
+}
+async function readHookConfig(env = process.env) {
+  try {
+    const cfgPath = path.join(getHookCacheDir(env), "config.json");
+    const raw = await fs.readFile(cfgPath, "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed;
+    }
+  } catch {
+  }
+  return {};
+}
+async function readStdin(timeoutMs = 1500, maxBytes = DEFAULT_MAX_STDIN_BYTES) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    let totalBytes = 0;
+    let settled = false;
+    const onData = (chunk) => {
+      if (settled) return;
+      const buf = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
+      const remaining = maxBytes - totalBytes;
+      if (remaining <= 0) {
+        finish();
+        return;
+      }
+      if (buf.length > remaining) {
+        chunks.push(buf.subarray(0, remaining));
+        totalBytes += remaining;
+        finish();
+      } else {
+        chunks.push(buf);
+        totalBytes += buf.length;
+      }
+    };
+    const onEnd = () => finish();
+    const onError = () => finish();
+    const ignoreLateError = () => {
+    };
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      process.stdin.off("data", onData);
+      process.stdin.off("end", onEnd);
+      process.stdin.off("close", onEnd);
+      process.stdin.off("error", onError);
+      process.stdin.on("error", ignoreLateError);
+      process.stdin.pause();
+      if (typeof process.stdin.unref === "function") {
+        process.stdin.unref();
+      }
+      resolve(Buffer.concat(chunks).toString("utf8"));
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    timer.unref();
+    process.stdin.on("data", onData);
+    process.stdin.on("end", onEnd);
+    process.stdin.on("close", onEnd);
+    process.stdin.on("error", onError);
+  });
+}
+function writeAndExit(payload) {
+  let exited = false;
+  const done = () => {
+    if (exited) return;
+    exited = true;
+    process.exit(0);
+  };
+  const failsafe = setTimeout(done, 150);
+  failsafe.unref();
+  process.stdout.on("error", done);
+  try {
+    process.stdout.write(payload, done);
+  } catch {
+    done();
+  }
+}
 
 // src/utils/output-filter.ts
 var DEFAULT_INLINE_MAX_BYTES = 8800;
@@ -70,12 +160,12 @@ function sliceSafeChars(text, maxChars) {
 
 // src/utils/host-compat.ts
 import { promises as fsp } from "node:fs";
-import os from "node:os";
-import path2 from "node:path";
+import os2 from "node:os";
+import path3 from "node:path";
 
 // src/utils/exec-utils.ts
 import { spawn, spawnSync } from "node:child_process";
-import path from "node:path";
+import path2 from "node:path";
 var DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
 var WINDOWS_CODEPAGE_LABELS = {
   866: "ibm866",
@@ -127,7 +217,7 @@ function getWindowsSystem32Binary(name) {
   const systemRoot = process.env.SystemRoot || process.env.WINDIR || "";
   if (systemRoot) {
     return {
-      bin: path.join(systemRoot, "System32", name),
+      bin: path2.join(systemRoot, "System32", name),
       cwd: systemRoot
     };
   }
@@ -605,9 +695,9 @@ function formatSessionStartCompatNotice(compat) {
 }
 function getConfigPath(env = process.env) {
   const custom = env.AGY_FAST_CACHE_DIR?.trim();
-  const home = process.platform === "win32" ? env.USERPROFILE || env.HOME || os.homedir() : env.HOME || env.USERPROFILE || os.homedir();
-  const cacheDir = custom ? path2.resolve(custom) : path2.join(home, ".gemini", "cache", "agy-fast");
-  return path2.join(cacheDir, "config.json");
+  const home = process.platform === "win32" ? env.USERPROFILE || env.HOME || os2.homedir() : env.HOME || env.USERPROFILE || os2.homedir();
+  const cacheDir = custom ? path3.resolve(custom) : path3.join(home, ".gemini", "cache", "agy-fast");
+  return path3.join(cacheDir, "config.json");
 }
 async function readSavedEditsFormat(env = process.env) {
   try {
@@ -619,10 +709,526 @@ async function readSavedEditsFormat(env = process.env) {
   }
 }
 
+// src/utils/quota-hooks.ts
+import crypto from "node:crypto";
+import { promises as fs3 } from "node:fs";
+import path4 from "node:path";
+
+// src/utils/transcript-context.ts
+import { promises as fs2 } from "node:fs";
+var DEFAULT_AUTO_COMPACT_TOKENS = 38e4;
+var DEFAULT_IMAGE_GUARD_TOKENS = 15e4;
+var INITIAL_TAIL_CHUNK_BYTES = 128 * 1024;
+var MAX_CHUNK_BYTES = 512 * 1024;
+var DEFAULT_MAX_TAIL_BYTES = 2 * 1024 * 1024;
+var PLANNER_MARKER = Buffer.from("PLANNER_RESPONSE", "utf8");
+function parseFiniteNonNegativeInt(val) {
+  if (typeof val !== "number" || !Number.isFinite(val) || val < 0) return null;
+  return Math.floor(val);
+}
+function parseTokenThreshold(raw) {
+  if (raw === void 0 || raw === null) return null;
+  if (raw === false) return 0;
+  if (typeof raw === "number") {
+    if (!Number.isFinite(raw) || raw < 0) return null;
+    return Math.floor(raw);
+  }
+  if (typeof raw === "string") {
+    const norm = raw.trim().toLowerCase();
+    if (!norm) return null;
+    if (norm === "0" || norm === "off" || norm === "false" || norm === "disabled") {
+      return 0;
+    }
+    const cleaned = norm.replace(/_/g, "");
+    if (!/^\d+$/.test(cleaned)) return null;
+    const n = Number.parseInt(cleaned, 10);
+    if (!Number.isSafeInteger(n) || n < 0) return null;
+    return n;
+  }
+  return null;
+}
+function resolveTokenThreshold(envValue, configValue, defaultValue) {
+  const fromEnv = parseTokenThreshold(envValue);
+  if (fromEnv !== null) return fromEnv;
+  const fromCfg = parseTokenThreshold(configValue);
+  if (fromCfg !== null) return fromCfg;
+  return defaultValue;
+}
+function parsePlannerResponseLine(lineBuf) {
+  if (lineBuf.length === 0 || !lineBuf.includes(PLANNER_MARKER)) return null;
+  let obj;
+  try {
+    const parsed = JSON.parse(lineBuf.toString("utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    obj = parsed;
+  } catch {
+    return null;
+  }
+  if (obj.type !== "PLANNER_RESPONSE") return null;
+  const inputTokens = parseFiniteNonNegativeInt(obj.input_tokens ?? obj.inputTokens);
+  const cacheReadTokens = parseFiniteNonNegativeInt(
+    obj.cache_read_tokens ?? obj.cacheReadTokens
+  );
+  if (inputTokens === null && cacheReadTokens === null) return null;
+  const total = (inputTokens ?? 0) + (cacheReadTokens ?? 0);
+  if (total <= 0) return null;
+  const stepIndex = parseFiniteNonNegativeInt(obj.step_index ?? obj.stepIndex);
+  const model = typeof obj.model === "string" && obj.model.trim() ? obj.model.trim() : void 0;
+  return {
+    contextTokens: total,
+    inputTokens: inputTokens ?? 0,
+    cacheReadTokens: cacheReadTokens ?? 0,
+    stepIndex,
+    model
+  };
+}
+function scanBufferBackwardsForPlanner(buf) {
+  let end = buf.length;
+  while (end > 0) {
+    const nl = buf.lastIndexOf(10, end - 1);
+    const start = nl === -1 ? 0 : nl + 1;
+    let lineEnd = end;
+    if (lineEnd > start && buf[lineEnd - 1] === 13) {
+      lineEnd--;
+    }
+    if (lineEnd > start) {
+      const hit = parsePlannerResponseLine(buf.subarray(start, lineEnd));
+      if (hit) return hit;
+    }
+    end = nl;
+  }
+  return null;
+}
+async function readExactChunk(fh, offset, length) {
+  const buf = Buffer.allocUnsafe(length);
+  let filled = 0;
+  while (filled < length) {
+    const res = await fh.read(buf, filled, length - filled, offset + filled);
+    if (res.bytesRead <= 0) break;
+    filled += res.bytesRead;
+  }
+  return filled === length ? buf : buf.subarray(0, filled);
+}
+async function readLatestTranscriptContext(transcriptPath, options = {}) {
+  if (!transcriptPath || typeof transcriptPath !== "string") return null;
+  const trimmed = transcriptPath.trim();
+  if (!trimmed) return null;
+  const maxTailBytes = Math.max(
+    4096,
+    options.maxTailBytes ?? DEFAULT_MAX_TAIL_BYTES
+  );
+  let chunkSize = Math.max(
+    1024,
+    Math.min(options.initialChunkBytes ?? INITIAL_TAIL_CHUNK_BYTES, maxTailBytes)
+  );
+  let fh = null;
+  try {
+    fh = await fs2.open(trimmed, "r");
+    const stat = await fh.stat();
+    if (!stat.isFile() || stat.size <= 0) return null;
+    let pos = stat.size;
+    let totalRead = 0;
+    let trailingPartial = Buffer.alloc(0);
+    while (pos > 0 && totalRead < maxTailBytes) {
+      const remainingBudget = maxTailBytes - totalRead;
+      const toRead = Math.min(chunkSize, pos, remainingBudget);
+      const start = pos - toRead;
+      const chunk = await readExactChunk(fh, start, toRead);
+      if (chunk.length === 0) break;
+      pos = start;
+      totalRead += chunk.length;
+      const combined = trailingPartial.length > 0 ? Buffer.concat([chunk, trailingPartial]) : chunk;
+      if (pos === 0) {
+        return scanBufferBackwardsForPlanner(combined);
+      }
+      const firstNl = combined.indexOf(10);
+      if (firstNl === -1) {
+        trailingPartial = combined;
+      } else {
+        trailingPartial = combined.subarray(0, firstNl);
+        const completeTail = combined.subarray(firstNl + 1);
+        const found = scanBufferBackwardsForPlanner(completeTail);
+        if (found) return found;
+      }
+      chunkSize = Math.min(chunkSize * 2, MAX_CHUNK_BYTES);
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    if (fh) {
+      await fh.close().catch(() => {
+      });
+    }
+  }
+}
+
+// src/utils/quota-hooks.ts
+var COMPACT_STATE_DIR = "compact-nudge";
+var STATE_TTL_MS = 7 * 24 * 60 * 60 * 1e3;
+var MAX_TRACKED_FILES = 400;
+var BLOCKED_IMAGE_EXTENSIONS = /* @__PURE__ */ new Set([
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".webp",
+  ".gif",
+  ".bmp",
+  ".avif",
+  ".tiff",
+  ".tif"
+]);
+function formatTokensCompact(tokens) {
+  if (tokens >= 1e3) {
+    return `${Math.round(tokens / 1e3)}k`;
+  }
+  return String(tokens);
+}
+function getTranscriptPath(payload) {
+  if (typeof payload.transcriptPath === "string" && payload.transcriptPath.trim()) {
+    return payload.transcriptPath.trim();
+  }
+  if (typeof payload.transcript_path === "string" && payload.transcript_path.trim()) {
+    return payload.transcript_path.trim();
+  }
+  return "";
+}
+function getConversationKey(payload, transcriptPath) {
+  if (typeof payload.conversationId === "string" && payload.conversationId.trim()) {
+    return payload.conversationId.trim();
+  }
+  if (typeof payload.conversation_id === "string" && payload.conversation_id.trim()) {
+    return payload.conversation_id.trim();
+  }
+  return transcriptPath;
+}
+function parseToolArgs(raw) {
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    return raw;
+  }
+  if (typeof raw === "string" && raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed;
+      }
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+function extractFilePathArg(args) {
+  for (const key of [
+    "Path",
+    "path",
+    "AbsolutePath",
+    "absolutePath",
+    "file_path",
+    "filePath"
+  ]) {
+    const val = args[key];
+    if (typeof val === "string" && val.trim()) {
+      return val.trim();
+    }
+  }
+  return "";
+}
+function isImageFilePath(filePath) {
+  if (!filePath) return false;
+  const normalized = filePath.replace(/\\/g, "/");
+  const ext = path4.posix.extname(normalized).toLowerCase();
+  return BLOCKED_IMAGE_EXTENSIONS.has(ext);
+}
+function detectImageToolCall(payload) {
+  const toolCall = payload.toolCall ?? payload.tool_call;
+  if (!toolCall || typeof toolCall !== "object") return null;
+  const rawName = typeof toolCall.name === "string" ? toolCall.name.trim() : "";
+  if (!rawName) return null;
+  const normName = rawName.toLowerCase();
+  const args = parseToolArgs(toolCall.args ?? toolCall.arguments);
+  if (!args) return null;
+  if (normName === "read_file" || normName === "view_file") {
+    const targetPath = extractFilePathArg(args);
+    if (targetPath && isImageFilePath(targetPath)) {
+      return {
+        kind: "read_file",
+        toolName: rawName,
+        target: targetPath
+      };
+    }
+    return null;
+  }
+  if (normName === "preview_snapshot" || normName.endsWith("_preview_snapshot")) {
+    if (args.includeImage === true || args.include_image === true) {
+      return {
+        kind: "preview_snapshot",
+        toolName: rawName,
+        target: rawName
+      };
+    }
+    return null;
+  }
+  return null;
+}
+function getConversationStateHash(conversationKey) {
+  return crypto.createHash("sha256").update(conversationKey).digest("hex").slice(0, 24);
+}
+async function readMarkerFile(filePath) {
+  let raw;
+  try {
+    raw = await fs3.readFile(filePath, "utf8");
+  } catch (err) {
+    if (err?.code === "ENOENT") {
+      return { status: "missing" };
+    }
+    return { status: "in-progress" };
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const e = parsed;
+      if (typeof e.nudgedAtTokens === "number" && Number.isFinite(e.nudgedAtTokens) && typeof e.nudgeCount === "number" && Number.isFinite(e.nudgeCount) && typeof e.updatedAt === "number" && Number.isFinite(e.updatedAt)) {
+        return {
+          status: "present",
+          entry: {
+            nudgedAtTokens: Math.floor(e.nudgedAtTokens),
+            nudgedAtStep: typeof e.nudgedAtStep === "number" && Number.isFinite(e.nudgedAtStep) ? Math.floor(e.nudgedAtStep) : null,
+            nudgeCount: Math.max(1, Math.floor(e.nudgeCount)),
+            updatedAt: e.updatedAt
+          }
+        };
+      }
+    }
+  } catch {
+  }
+  return { status: "in-progress" };
+}
+async function tryClaimMarker(filePath, entry) {
+  try {
+    await fs3.mkdir(path4.dirname(filePath), { recursive: true });
+  } catch {
+    return false;
+  }
+  let handle = null;
+  try {
+    handle = await fs3.open(filePath, "wx");
+    await handle.writeFile(`${JSON.stringify(entry)}
+`, "utf8");
+    await handle.close();
+    handle = null;
+    return true;
+  } catch {
+    if (handle) {
+      await handle.close().catch(() => {
+      });
+      await fs3.rm(filePath, { force: true }).catch(() => {
+      });
+    }
+    return false;
+  }
+}
+async function pruneOldMarkerFiles(stateDir, now) {
+  try {
+    const names = await fs3.readdir(stateDir);
+    const jsonNames = names.filter((n) => n.endsWith(".json"));
+    if (jsonNames.length === 0) return;
+    const stats = await Promise.all(
+      jsonNames.map(async (name) => {
+        const full = path4.join(stateDir, name);
+        try {
+          const st = await fs3.stat(full);
+          return { full, mtimeMs: st.mtimeMs };
+        } catch {
+          return null;
+        }
+      })
+    );
+    const live = stats.filter((s) => s !== null);
+    const toDelete = [];
+    const kept = [];
+    for (const item of live) {
+      if (now - item.mtimeMs > STATE_TTL_MS) {
+        toDelete.push(item.full);
+      } else {
+        kept.push(item);
+      }
+    }
+    if (kept.length > MAX_TRACKED_FILES) {
+      kept.sort((a, b) => b.mtimeMs - a.mtimeMs);
+      for (const extra of kept.slice(MAX_TRACKED_FILES)) {
+        toDelete.push(extra.full);
+      }
+    }
+    await Promise.all(
+      toDelete.map((full) => fs3.rm(full, { force: true }).catch(() => {
+      }))
+    );
+  } catch {
+  }
+}
+async function evaluatePreInvocation(payload, options = {}) {
+  const env = options.env ?? process.env;
+  const now = options.now ?? Date.now();
+  const transcriptPath = getTranscriptPath(payload);
+  if (!transcriptPath) return {};
+  const cfg = await readHookConfig(env);
+  const threshold = resolveTokenThreshold(
+    env.AGY_FAST_AUTO_COMPACT_TOKENS,
+    cfg.autoCompactTokens,
+    DEFAULT_AUTO_COMPACT_TOKENS
+  );
+  if (threshold <= 0) return {};
+  const snapshot = await readLatestTranscriptContext(
+    transcriptPath,
+    options.tailOptions
+  );
+  if (!snapshot) return {};
+  const conversationKey = getConversationKey(payload, transcriptPath);
+  const stateDir = path4.join(getHookCacheDir(env), COMPACT_STATE_DIR);
+  const keyHash = getConversationStateHash(conversationKey);
+  const marker1Path = path4.join(stateDir, `${keyHash}.1.json`);
+  const marker2Path = path4.join(stateDir, `${keyHash}.2.json`);
+  if (snapshot.contextTokens < threshold) {
+    const existingMarker = await readMarkerFile(marker1Path);
+    if (existingMarker.status === "present") {
+      const staleReset = snapshot.stepIndex !== null && existingMarker.entry.nudgedAtStep !== null && snapshot.stepIndex <= existingMarker.entry.nudgedAtStep;
+      if (!staleReset) {
+        await Promise.all([
+          fs3.rm(marker1Path, { force: true }).catch(() => {
+          }),
+          fs3.rm(marker2Path, { force: true }).catch(() => {
+          })
+        ]);
+      }
+    }
+    return {};
+  }
+  const firstMarker = await readMarkerFile(marker1Path);
+  let nextNudgeCount = 0;
+  let targetMarkerPath = "";
+  if (firstMarker.status === "missing") {
+    nextNudgeCount = 1;
+    targetMarkerPath = marker1Path;
+  } else if (firstMarker.status === "present") {
+    const escalationStep = Math.max(5e4, Math.round(threshold * 0.15));
+    if (snapshot.contextTokens >= firstMarker.entry.nudgedAtTokens + escalationStep) {
+      const secondMarker = await readMarkerFile(marker2Path);
+      if (secondMarker.status === "missing") {
+        nextNudgeCount = 2;
+        targetMarkerPath = marker2Path;
+      }
+    }
+  }
+  if (nextNudgeCount === 0 || !targetMarkerPath) {
+    return {};
+  }
+  const claimed = await tryClaimMarker(targetMarkerPath, {
+    nudgedAtTokens: snapshot.contextTokens,
+    nudgedAtStep: snapshot.stepIndex,
+    nudgeCount: nextNudgeCount,
+    updatedAt: now
+  });
+  if (!claimed) {
+    return {};
+  }
+  await pruneOldMarkerFiles(stateDir, now);
+  const currentLabel = formatTokensCompact(snapshot.contextTokens);
+  const thresholdLabel = formatTokensCompact(threshold);
+  const message = nextNudgeCount === 1 ? `[agy-fast context guard] Context is at ~${currentLabel} tokens (soft threshold: ${thresholdLabel}; built-in compaction cliff: ~510k). Finish only your current atomic step, summarize progress and remaining work cleanly, and return control to the host/user for /compact instead of starting new work.` : `[agy-fast context guard] Urgent: context reached ~${currentLabel} tokens (approaching the ~510k compaction cliff). Do not start additional tool calls; summarize current state and next steps immediately and return control for /compact.`;
+  return {
+    injectSteps: [
+      {
+        systemMessage: {
+          systemMessage: message
+        }
+      }
+    ]
+  };
+}
+async function evaluatePreToolUse(payload, options = {}) {
+  const match = detectImageToolCall(payload);
+  if (!match) return {};
+  const env = options.env ?? process.env;
+  const transcriptPath = getTranscriptPath(payload);
+  if (!transcriptPath) return {};
+  const cfg = await readHookConfig(env);
+  const threshold = resolveTokenThreshold(
+    env.AGY_FAST_IMAGE_GUARD_TOKENS,
+    cfg.imageGuardTokens,
+    DEFAULT_IMAGE_GUARD_TOKENS
+  );
+  if (threshold <= 0) return {};
+  const snapshot = await readLatestTranscriptContext(
+    transcriptPath,
+    options.tailOptions
+  );
+  if (!snapshot || snapshot.contextTokens < threshold) {
+    return {};
+  }
+  const currentLabel = formatTokensCompact(snapshot.contextTokens);
+  const thresholdLabel = formatTokensCompact(threshold);
+  const callDesc = match.kind === "read_file" ? `${match.toolName}(${path4.posix.basename(match.target.replace(/\\/g, "/"))})` : `${match.toolName}(includeImage: true)`;
+  return {
+    decision: "deny",
+    reason: `[agy-fast image guard] Blocked ${callDesc} at ~${currentLabel} context tokens (limit: ${thresholdLabel}) to prevent prompt-cache invalidation and 3-7x TTFT spikes. Delegate visual inspection of this image to a subagent (e.g. invoke_subagent) and have it return text-only findings (values, selectors, file paths, concrete fixes).`
+  };
+}
+async function runPreInvocationCli() {
+  try {
+    const raw = (await readStdin()).trim();
+    if (!raw) {
+      writeAndExit("{}\n");
+      return;
+    }
+    let payload;
+    try {
+      payload = JSON.parse(raw);
+    } catch {
+      writeAndExit("{}\n");
+      return;
+    }
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      writeAndExit("{}\n");
+      return;
+    }
+    const result = await evaluatePreInvocation(payload);
+    writeAndExit(`${JSON.stringify(result)}
+`);
+  } catch {
+    writeAndExit("{}\n");
+  }
+}
+async function runPreToolUseCli() {
+  try {
+    const raw = (await readStdin()).trim();
+    if (!raw) {
+      writeAndExit("{}\n");
+      return;
+    }
+    let payload;
+    try {
+      payload = JSON.parse(raw);
+    } catch {
+      writeAndExit("{}\n");
+      return;
+    }
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      writeAndExit("{}\n");
+      return;
+    }
+    const result = await evaluatePreToolUse(payload);
+    writeAndExit(`${JSON.stringify(result)}
+`);
+  } catch {
+    writeAndExit("{}\n");
+  }
+}
+
 // src/utils/snapshot.ts
-import { promises as fs } from "node:fs";
-import os2 from "node:os";
-import path3 from "node:path";
+import { promises as fs4 } from "node:fs";
+import os3 from "node:os";
+import path5 from "node:path";
 import { performance } from "node:perf_hooks";
 
 // src/utils/fs-utils.ts
@@ -859,26 +1465,26 @@ function isSystemUserParentPath(p) {
   return lowerPosix === "/users" || lowerPosix === "/home" || /^[a-z]:\/users$/i.test(lowerPosix) || /^[a-z]:\/documents and settings$/i.test(lowerPosix);
 }
 function normalizePathForCompare(p) {
-  const resolved = path3.resolve(p);
-  const root = path3.parse(resolved).root;
+  const resolved = path5.resolve(p);
+  const root = path5.parse(resolved).root;
   const trimmed = resolved.length > root.length ? resolved.replace(/[\\/]+$/, "") : resolved;
   return process.platform === "win32" || process.platform === "darwin" ? trimmed.toLowerCase() : trimmed;
 }
 async function boundedRealpath(p, deadlineMs) {
   if (deadlineMs === void 0) {
-    return fs.realpath(p).catch(() => p);
+    return fs4.realpath(p).catch(() => p);
   }
-  const res = await raceWithDeadline(fs.realpath(p), deadlineMs);
+  const res = await raceWithDeadline(fs4.realpath(p), deadlineMs);
   return res.ok ? res.value : p;
 }
 async function isHomeOrSystemRoot(workspaceDir, deadlineMs) {
-  const resolved = path3.resolve(workspaceDir);
-  if (path3.parse(resolved).root === resolved) return true;
+  const resolved = path5.resolve(workspaceDir);
+  if (path5.parse(resolved).root === resolved) return true;
   if (isSystemUserParentPath(resolved)) return true;
   const homeCandidates = /* @__PURE__ */ new Set();
-  for (const cand of [os2.homedir(), process.env.HOME, process.env.USERPROFILE]) {
+  for (const cand of [os3.homedir(), process.env.HOME, process.env.USERPROFILE]) {
     if (cand && cand.trim()) {
-      homeCandidates.add(path3.resolve(cand.trim()));
+      homeCandidates.add(path5.resolve(cand.trim()));
     }
   }
   const resolvedKey = normalizePathForCompare(resolved);
@@ -890,7 +1496,7 @@ async function isHomeOrSystemRoot(workspaceDir, deadlineMs) {
     boundedRealpath(resolved, deadlineMs),
     ...candList.map((cand) => boundedRealpath(cand, deadlineMs))
   ]);
-  if (path3.parse(realWorkspace).root === realWorkspace) return true;
+  if (path5.parse(realWorkspace).root === realWorkspace) return true;
   if (isSystemUserParentPath(realWorkspace)) return true;
   const wsKeys = /* @__PURE__ */ new Set([resolvedKey, normalizePathForCompare(realWorkspace)]);
   for (const realCand of realCands) {
@@ -1028,7 +1634,7 @@ async function getTwoLevelTree(workspaceDir, topRes, isHomeRoot, deadlineMs) {
           continue;
         }
         const subRes = await raceWithDeadline(
-          fs.readdir(path3.join(workspaceDir, entry.name), {
+          fs4.readdir(path5.join(workspaceDir, entry.name), {
             withFileTypes: true
           }),
           deadlineMs
@@ -1113,7 +1719,7 @@ async function detectManifestsInDir(dirPath, prefix) {
     // package.json
     (async () => {
       try {
-        const raw = await fs.readFile(path3.join(dirPath, "package.json"), "utf8");
+        const raw = await fs4.readFile(path5.join(dirPath, "package.json"), "utf8");
         const pkg = JSON.parse(raw);
         const scriptNames = pkg.scripts ? Object.keys(pkg.scripts).slice(0, 12) : [];
         const label = pkg.name ? `${prefix}package.json (${pkg.name})` : `${prefix}package.json`;
@@ -1128,7 +1734,7 @@ async function detectManifestsInDir(dirPath, prefix) {
       if (prefix) return;
       for (const name of ["Makefile", "makefile"]) {
         try {
-          const raw = await fs.readFile(path3.join(dirPath, name), "utf8");
+          const raw = await fs4.readFile(path5.join(dirPath, name), "utf8");
           const targets = [];
           for (const line of raw.split(/\r?\n/)) {
             const m = /^([A-Za-z0-9_.-]+)\s*:(?!=)/.exec(line);
@@ -1148,7 +1754,7 @@ async function detectManifestsInDir(dirPath, prefix) {
     // pom.xml (Maven)
     (async () => {
       try {
-        const raw = await fs.readFile(path3.join(dirPath, "pom.xml"), "utf8");
+        const raw = await fs4.readFile(path5.join(dirPath, "pom.xml"), "utf8");
         const stripped = raw.replace(/<parent>[\s\S]*?<\/parent>/i, "");
         const m = /<artifactId>\s*([^<\s]+)\s*<\/artifactId>/i.exec(stripped);
         hints.push(
@@ -1161,7 +1767,7 @@ async function detectManifestsInDir(dirPath, prefix) {
     (async () => {
       for (const name of ["build.gradle.kts", "build.gradle"]) {
         try {
-          await fs.access(path3.join(dirPath, name));
+          await fs4.access(path5.join(dirPath, name));
           hints.push(`${prefix}${name} (gradle)`);
           break;
         } catch {
@@ -1171,7 +1777,7 @@ async function detectManifestsInDir(dirPath, prefix) {
     // pyproject.toml
     (async () => {
       try {
-        const raw = await fs.readFile(path3.join(dirPath, "pyproject.toml"), "utf8");
+        const raw = await fs4.readFile(path5.join(dirPath, "pyproject.toml"), "utf8");
         const tools = [];
         if (/\[tool\.pytest/.test(raw)) tools.push("pytest");
         if (/\[tool\.ruff/.test(raw)) tools.push("ruff");
@@ -1187,7 +1793,7 @@ async function detectManifestsInDir(dirPath, prefix) {
     // Cargo.toml
     (async () => {
       try {
-        const raw = await fs.readFile(path3.join(dirPath, "Cargo.toml"), "utf8");
+        const raw = await fs4.readFile(path5.join(dirPath, "Cargo.toml"), "utf8");
         const isWorkspace = /\[workspace\]/.test(raw);
         hints.push(
           isWorkspace ? `${prefix}Cargo.toml (workspace)` : `${prefix}Cargo.toml`
@@ -1198,7 +1804,7 @@ async function detectManifestsInDir(dirPath, prefix) {
     // go.mod
     (async () => {
       try {
-        const raw = await fs.readFile(path3.join(dirPath, "go.mod"), "utf8");
+        const raw = await fs4.readFile(path5.join(dirPath, "go.mod"), "utf8");
         const m = /^module\s+(\S+)/m.exec(raw);
         hints.push(m?.[1] ? `${prefix}go.mod (${m[1]})` : `${prefix}go.mod`);
       } catch {
@@ -1226,7 +1832,7 @@ async function getProjectManifestSummary(workspaceDir, topRes, isHomeRoot, deadl
           if (idx >= subdirs.length || performance.now() >= deadlineMs) break;
           const d = subdirs[idx];
           const res = await raceWithDeadline(
-            detectManifestsInDir(path3.join(workspaceDir, d.name), `${d.name}/`),
+            detectManifestsInDir(path5.join(workspaceDir, d.name), `${d.name}/`),
             deadlineMs
           );
           if (res.ok) {
@@ -1283,13 +1889,13 @@ async function buildWorkspaceSnapshot(workspaceDir, options = {}) {
   const gitTimeoutMs = options.gitTimeoutMs ?? 800;
   const scanTimeoutMs = typeof options.scanTimeoutMs === "number" && Number.isFinite(options.scanTimeoutMs) ? Math.max(1, Math.trunc(options.scanTimeoutMs)) : DEFAULT_SCAN_TIMEOUT_MS;
   const scanDeadline = performance.now() + scanTimeoutMs;
-  const statRes = await raceWithDeadline(fs.stat(workspaceDir), scanDeadline);
+  const statRes = await raceWithDeadline(fs4.stat(workspaceDir), scanDeadline);
   if (!statRes.ok || !statRes.value.isDirectory()) return null;
   const gitPromise = getGitSummary(workspaceDir, gitTimeoutMs);
   const [isHomeRoot, topRes] = await Promise.all([
     isHomeOrSystemRoot(workspaceDir, scanDeadline),
     raceWithDeadline(
-      fs.readdir(workspaceDir, { withFileTypes: true }),
+      fs4.readdir(workspaceDir, { withFileTypes: true }),
       scanDeadline
     )
   ]);
@@ -1358,23 +1964,23 @@ async function buildWorkspaceSnapshot(workspaceDir, options = {}) {
 
 // src/utils/updater-core.ts
 import { spawn as spawn2 } from "node:child_process";
-import { promises as fs2 } from "node:fs";
-import os3 from "node:os";
-import path4 from "node:path";
+import { promises as fs5 } from "node:fs";
+import os4 from "node:os";
+import path6 from "node:path";
 var DEFAULT_REPO_URL = "https://github.com/INK-Q/agy-fast.git";
 var DEFAULT_CHECK_INTERVAL_HOURS = 4;
 var LOCK_STALE_MS = 10 * 60 * 1e3;
 function getHomeDir(env = process.env) {
-  return process.platform === "win32" ? env.USERPROFILE || env.HOME || os3.homedir() : env.HOME || env.USERPROFILE || os3.homedir();
+  return process.platform === "win32" ? env.USERPROFILE || env.HOME || os4.homedir() : env.HOME || env.USERPROFILE || os4.homedir();
 }
 function getUpdaterPaths(env = process.env) {
   const custom = env.AGY_FAST_CACHE_DIR?.trim();
-  const cacheDir = custom ? path4.resolve(custom) : path4.join(getHomeDir(env), ".gemini", "cache", "agy-fast");
+  const cacheDir = custom ? path6.resolve(custom) : path6.join(getHomeDir(env), ".gemini", "cache", "agy-fast");
   return {
     cacheDir,
-    stateFile: path4.join(cacheDir, "update-state.json"),
-    configFile: path4.join(cacheDir, "config.json"),
-    lockFile: path4.join(cacheDir, "update.lock")
+    stateFile: path6.join(cacheDir, "update-state.json"),
+    configFile: path6.join(cacheDir, "config.json"),
+    lockFile: path6.join(cacheDir, "update.lock")
   };
 }
 function parseSemver(raw) {
@@ -1418,7 +2024,7 @@ function parseUpdateChannel(raw) {
 }
 async function readJsonFile(filePath) {
   try {
-    const raw = await fs2.readFile(filePath, "utf8");
+    const raw = await fs5.readFile(filePath, "utf8");
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
       return parsed;
@@ -1428,17 +2034,17 @@ async function readJsonFile(filePath) {
   return null;
 }
 async function writeJsonAtomically(filePath, data) {
-  await fs2.mkdir(path4.dirname(filePath), { recursive: true });
+  await fs5.mkdir(path6.dirname(filePath), { recursive: true });
   const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}`;
-  await fs2.writeFile(tmpPath, `${JSON.stringify(data, null, 2)}
+  await fs5.writeFile(tmpPath, `${JSON.stringify(data, null, 2)}
 `, "utf8");
   try {
-    await fs2.rename(tmpPath, filePath);
+    await fs5.rename(tmpPath, filePath);
   } catch {
     try {
-      await fs2.copyFile(tmpPath, filePath);
+      await fs5.copyFile(tmpPath, filePath);
     } finally {
-      await fs2.rm(tmpPath, { force: true }).catch(() => {
+      await fs5.rm(tmpPath, { force: true }).catch(() => {
       });
     }
   }
@@ -1490,7 +2096,7 @@ async function resolveUpdaterSettings(env = process.env) {
 }
 async function readInstalledVersion(pluginDir) {
   const manifest = await readJsonFile(
-    path4.join(pluginDir, "plugin.json")
+    path6.join(pluginDir, "plugin.json")
   );
   if (manifest && typeof manifest.version === "string" && manifest.version.trim()) {
     return manifest.version.trim();
@@ -1524,13 +2130,13 @@ async function consumeSnapshotUpdateNotice(pluginDir, currentVersion, env = proc
     ).catch(() => {
     });
     const reason = state.availableReason ? ` (${state.availableReason})` : "";
-    const installerPath = path4.join(pluginDir, "scripts", "install.mjs");
+    const installerPath = path6.join(pluginDir, "scripts", "install.mjs");
     return `[agy-fast] Update available: v${currentVersion} -> v${state.availableVersion}${reason}. Run: node "${installerPath}" update`;
   }
   return null;
 }
 function spawnBackgroundUpdateCheck(pluginDir, env = process.env) {
-  const updaterPath = path4.join(pluginDir, "dist", "updater.mjs");
+  const updaterPath = path6.join(pluginDir, "dist", "updater.mjs");
   try {
     const child = spawn2(
       process.execPath,
@@ -1559,74 +2165,17 @@ function firstNonEmptyPath(list) {
   }
   return "";
 }
-var MAX_STDIN_BYTES = 256 * 1024;
 var MAX_SNAPSHOT_BYTES = 1500;
-async function readStdin(timeoutMs = 1500) {
-  return new Promise((resolve) => {
-    const chunks = [];
-    let totalBytes = 0;
-    let settled = false;
-    const onData = (chunk) => {
-      if (settled) return;
-      const buf = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
-      const remaining = MAX_STDIN_BYTES - totalBytes;
-      if (remaining <= 0) {
-        finish();
-        return;
-      }
-      if (buf.length > remaining) {
-        chunks.push(buf.subarray(0, remaining));
-        totalBytes += remaining;
-        finish();
-      } else {
-        chunks.push(buf);
-        totalBytes += buf.length;
-      }
-    };
-    const onEnd = () => finish();
-    const onError = () => finish();
-    const ignoreLateError = () => {
-    };
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      process.stdin.off("data", onData);
-      process.stdin.off("end", onEnd);
-      process.stdin.off("close", onEnd);
-      process.stdin.off("error", onError);
-      process.stdin.on("error", ignoreLateError);
-      process.stdin.pause();
-      if (typeof process.stdin.unref === "function") {
-        process.stdin.unref();
-      }
-      resolve(Buffer.concat(chunks).toString("utf8"));
-    };
-    const timer = setTimeout(finish, timeoutMs);
-    timer.unref();
-    process.stdin.on("data", onData);
-    process.stdin.on("end", onEnd);
-    process.stdin.on("close", onEnd);
-    process.stdin.on("error", onError);
-  });
-}
-function writeAndExit(payload) {
-  let exited = false;
-  const done = () => {
-    if (exited) return;
-    exited = true;
-    process.exit(0);
-  };
-  const failsafe = setTimeout(done, 150);
-  failsafe.unref();
-  process.stdout.on("error", done);
-  try {
-    process.stdout.write(payload, done);
-  } catch {
-    done();
-  }
-}
 async function main() {
+  const hookMode = globalThis.__agyFastHook;
+  if (hookMode === "pre-invocation") {
+    await runPreInvocationCli();
+    return;
+  }
+  if (hookMode === "pre-tool-use") {
+    await runPreToolUseCli();
+    return;
+  }
   try {
     const raw = (await readStdin()).trim();
     if (!raw) {
@@ -1656,8 +2205,8 @@ async function main() {
     }
     let updateNotice = null;
     try {
-      const pluginDir = path5.resolve(
-        path5.dirname(fileURLToPath(import.meta.url)),
+      const pluginDir = path7.resolve(
+        path7.dirname(fileURLToPath(import.meta.url)),
         ".."
       );
       const settings = await resolveUpdaterSettings();
@@ -1671,8 +2220,8 @@ async function main() {
           currentVersion
         );
         if (shouldTriggerBackgroundCheck(state, Date.now(), settings.checkIntervalMs)) {
-          const updaterPath = path5.join(pluginDir, "dist", "updater.mjs");
-          const hasUpdater = await fs3.access(updaterPath).then(() => true).catch(() => false);
+          const updaterPath = path7.join(pluginDir, "dist", "updater.mjs");
+          const hasUpdater = await fs6.access(updaterPath).then(() => true).catch(() => false);
           if (hasUpdater) {
             await writeUpdateState({
               lastCheckAttemptAt: (/* @__PURE__ */ new Date()).toISOString()

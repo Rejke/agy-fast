@@ -208,7 +208,7 @@ describe("MCP Stdio Server end-to-end", () => {
 
     const toolList = (
       byId.get(3)?.result as {
-        tools: Array<{ name: string; inputSchema: unknown }>;
+        tools: Array<{ name: string; description: string; inputSchema: unknown }>;
       }
     ).tools;
     assert.deepEqual(
@@ -220,12 +220,25 @@ describe("MCP Stdio Server end-to-end", () => {
       properties: { edits: { type: string } };
     };
     assert.equal(applySchema.properties.edits.type, "array");
-    // Ensure schemas avoid oneOf/anyOf/allOf for maximum client compatibility
+    // Ensure schemas avoid oneOf/anyOf/allOf and stay well under Antigravity ACP's
+    // ~2000-2048B eager tool declaration cutoff (which silently drops >2KB tool schemas).
     for (const tool of toolList) {
       assert.equal(
         hasDisallowedSchemaKeyword(tool.inputSchema),
         false,
         `Tool ${tool.name} schema should not contain oneOf/anyOf/allOf`,
+      );
+      const declBytes = Buffer.byteLength(
+        JSON.stringify({
+          name: tool.name,
+          description: tool.description,
+          parameters: tool.inputSchema,
+        }),
+        "utf8",
+      );
+      assert.ok(
+        declBytes <= 1800,
+        `Tool ${tool.name} declaration JSON is ${declBytes} bytes (>1800B limit for Antigravity ACP eager loading)`,
       );
     }
 

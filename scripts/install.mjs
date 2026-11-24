@@ -25,11 +25,16 @@ const RUNTIME_FILES = [
   "assets/logo.svg",
   "dist/mcp-server.mjs",
   "dist/session-start.mjs",
+  "dist/pre-invocation.mjs",
+  "dist/pre-tool-use.mjs",
   "dist/benchmark.mjs",
   "dist/updater.mjs",
   "scripts/install.mjs",
   "LICENSE",
 ];
+
+const DEFAULT_AUTO_COMPACT_TOKENS = 380_000;
+const DEFAULT_IMAGE_GUARD_TOKENS = 150_000;
 
 const OPTIONAL_DOC_FILES = [
   "assets/logo-light.svg",
@@ -94,6 +99,23 @@ async function writeUpdaterConfigFile(patch) {
   return { cfgPath, config: merged };
 }
 
+function parseTokenThresholdValue(raw) {
+  if (raw === false) return 0;
+  if (typeof raw === "number") {
+    return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : null;
+  }
+  if (typeof raw !== "string") return null;
+  const norm = raw.trim().toLowerCase();
+  if (!norm) return null;
+  if (norm === "0" || norm === "off" || norm === "false" || norm === "disabled") {
+    return 0;
+  }
+  const cleaned = norm.replace(/_/g, "");
+  if (!/^\d+$/.test(cleaned)) return null;
+  const n = Number.parseInt(cleaned, 10);
+  return Number.isSafeInteger(n) && n >= 0 ? n : null;
+}
+
 function parseArgs(argv) {
   const args = argv.slice(2);
   let command = "install";
@@ -112,6 +134,8 @@ function parseArgs(argv) {
   let repoUrl = "";
   let editsFormat = "";
   let toolLoading = "";
+  let autoCompactTokens = null;
+  let imageGuardTokens = null;
 
   const positional = [];
   for (let i = 0; i < args.length; i++) {
@@ -172,6 +196,26 @@ function parseArgs(argv) {
         );
       }
       toolLoading = args[++i].toLowerCase();
+    } else if (a === "--auto-compact-tokens") {
+      const next = args[i + 1];
+      const parsed = parseTokenThresholdValue(next);
+      if (parsed === null) {
+        throw new Error(
+          "Invalid value after --auto-compact-tokens (expected non-negative integer or 'off')",
+        );
+      }
+      autoCompactTokens = parsed;
+      i++;
+    } else if (a === "--image-guard-tokens") {
+      const next = args[i + 1];
+      const parsed = parseTokenThresholdValue(next);
+      if (parsed === null) {
+        throw new Error(
+          "Invalid value after --image-guard-tokens (expected non-negative integer or 'off')",
+        );
+      }
+      imageGuardTokens = parsed;
+      i++;
     } else if (a === "--target") {
       const next = args[i + 1];
       if (!next || next.startsWith("-")) {
@@ -226,6 +270,8 @@ function parseArgs(argv) {
     repoUrl,
     editsFormat,
     toolLoading,
+    autoCompactTokens,
+    imageGuardTokens,
   };
 }
 
@@ -258,6 +304,8 @@ Options:
   --edits-format auto|array|string
                                 Configure apply_edits.edits schema preference (default auto)
   --tool-loading eager|lazy     Configure MCP tool loading mode in mcp_config.json (default eager)
+  --auto-compact-tokens <N|off> Configure PreInvocation soft compaction nudge threshold (default 380000)
+  --image-guard-tokens <N|off>  Configure PreToolUse image guard threshold (default 150000)
   -h, --help                    Show this help
 `);
 }
@@ -548,6 +596,169 @@ async function verifySessionStartLive(hookScriptPath, sampleWorkspace) {
       }),
     );
   });
+}
+
+function killProcessTree(child) {
+  if (!child || typeof child.pid !== "number") return;
+  if (process.platform === "win32") {
+    try {
+      const killer = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
+        stdio: "ignore",
+        windowsHide: true,
+      });
+      killer.on("error", () => {});
+      if (typeof killer.unref === "function") killer.unref();
+    } catch {
+      // Fall back to direct kill below
+    }
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // Ignore if already exited
+    }
+    return;
+  }
+  try {
+    process.kill(-child.pid, "SIGKILL");
+  } catch {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // Ignore if already exited
+    }
+  }
+}
+
+async function runHookCommandSmokeJson(command, cwd, payloadObj, extraEnv = {}, label = "Hook") {
+  const start = Date.now();
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, {
+      cwd,
+      shell: true,
+      detached: process.platform !== "win32",
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+      env: { ...process.env, ...extraEnv },
+    });
+    let stdout = "";
+    let settled = false;
+    const finishReject = (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    };
+    const timer = setTimeout(() => {
+      killProcessTree(child);
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      child.stdin?.destroy();
+      if (typeof child.unref === "function") child.unref();
+      finishReject(new Error(`${label} smoke test timed out after 5s`));
+    }, 5000);
+    timer.unref();
+
+    child.stdout.on("data", (d) => {
+      stdout += d.toString("utf8");
+    });
+    child.on("error", (err) => {
+      finishReject(err);
+    });
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code !== 0) {
+        reject(new Error(`${label} exited with code ${code}`));
+        return;
+      }
+      try {
+        resolve({
+          durationMs: Date.now() - start,
+          json: JSON.parse(stdout.trim()),
+        });
+      } catch (err) {
+        reject(err);
+      }
+    });
+
+    child.stdin.end(JSON.stringify(payloadObj));
+  });
+}
+
+async function verifyQuotaHooksLive(targetDir) {
+  const hooksCfg = await readJsonSafe(path.join(targetDir, "hooks.json"));
+  const preInvCmd = hooksCfg?.["agy-fast-context-guard"]?.PreInvocation?.[0]?.command;
+  const preToolCmd = hooksCfg?.["agy-fast-image-guard"]?.PreToolUse?.[0]?.hooks?.[0]?.command;
+  if (typeof preInvCmd !== "string" || typeof preToolCmd !== "string") {
+    return {
+      preInvocationOk: false,
+      preInvocationMs: 0,
+      preToolUseOk: false,
+      preToolUseMs: 0,
+    };
+  }
+
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-doctor-hooks-"));
+  try {
+    const transcriptPath = path.join(tmpDir, "transcript.jsonl");
+    const cacheDir = path.join(tmpDir, "cache");
+    const sampleLine = JSON.stringify({
+      step_index: 12,
+      type: "PLANNER_RESPONSE",
+      input_tokens: 120_000,
+      cache_read_tokens: 280_000,
+    });
+    await fs.writeFile(transcriptPath, `${sampleLine}\n`, "utf8");
+
+    const cleanEnv = {
+      PLUGIN_ROOT: targetDir,
+      AGY_FAST_CACHE_DIR: cacheDir,
+      AGY_FAST_AUTO_COMPACT_TOKENS: String(DEFAULT_AUTO_COMPACT_TOKENS),
+      AGY_FAST_IMAGE_GUARD_TOKENS: String(DEFAULT_IMAGE_GUARD_TOKENS),
+    };
+
+    const [preInvRes, preToolRes] = await Promise.all([
+      runHookCommandSmokeJson(
+        preInvCmd,
+        targetDir,
+        {
+          conversationId: "doctor-smoke",
+          transcriptPath,
+          hookEventName: "PreInvocation",
+        },
+        cleanEnv,
+        "PreInvocation hook",
+      ),
+      runHookCommandSmokeJson(
+        preToolCmd,
+        targetDir,
+        {
+          conversationId: "doctor-smoke",
+          transcriptPath,
+          hookEventName: "PreToolUse",
+          toolCall: {
+            id: "toolu_doctor",
+            name: "read_file",
+            args: { Path: "/tmp/screenshot.png" },
+          },
+        },
+        cleanEnv,
+        "PreToolUse hook",
+      ),
+    ]);
+
+    const nudgeMsg = preInvRes.json?.injectSteps?.[0]?.systemMessage?.systemMessage || "";
+    const denied = preToolRes.json?.decision === "deny";
+    return {
+      preInvocationOk: typeof nudgeMsg === "string" && nudgeMsg.length > 0,
+      preInvocationMs: preInvRes.durationMs,
+      preToolUseOk: denied,
+      preToolUseMs: preToolRes.durationMs,
+    };
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 async function assertSourceFilesPresent(srcRoot) {
@@ -956,10 +1167,13 @@ async function runDoctor(targetDir, quiet = false, doctorOpts = {}) {
   const hookPath = path.join(targetDir, "dist", "session-start.mjs");
   const mcpCheck = await verifyMcpServerLive(mcpPath);
   const hookCheck = await verifySessionStartLive(hookPath, targetDir);
+  const quotaHookCheck = await verifyQuotaHooksLive(targetDir);
 
   report.mcpTools = mcpCheck.tools;
   report.hookLatencyMs = hookCheck.durationMs;
   report.hookBytes = hookCheck.bytes;
+  report.preInvocationOk = quotaHookCheck.preInvocationOk;
+  report.preToolUseOk = quotaHookCheck.preToolUseOk;
 
   if (hasAgy) {
     const valRes = spawnCliSync("agy", ["plugin", "validate", "--strict", targetDir], {
@@ -1005,6 +1219,14 @@ async function runDoctor(targetDir, quiet = false, doctorOpts = {}) {
     parseToolLoadingValue(process.env.AGY_FAST_TOOL_LOADING || "") ||
     parseToolLoadingValue(updaterCfg.toolLoading) ||
     "eager";
+  const effectiveAutoCompactTokens =
+    parseTokenThresholdValue(process.env.AGY_FAST_AUTO_COMPACT_TOKENS) ??
+    parseTokenThresholdValue(updaterCfg.autoCompactTokens) ??
+    DEFAULT_AUTO_COMPACT_TOKENS;
+  const effectiveImageGuardTokens =
+    parseTokenThresholdValue(process.env.AGY_FAST_IMAGE_GUARD_TOKENS) ??
+    parseTokenThresholdValue(updaterCfg.imageGuardTokens) ??
+    DEFAULT_IMAGE_GUARD_TOKENS;
   const installedMcpCfg = await readJsonSafe(path.join(targetDir, "mcp_config.json"));
   const installedToolsMap =
     installedMcpCfg?.mcpServers?.fast?.tools &&
@@ -1062,6 +1284,12 @@ async function runDoctor(targetDir, quiet = false, doctorOpts = {}) {
     console.log(
       `  - SessionStart: ${hookCheck.bytes > 0 ? "OK" : "EMPTY (FAILED)"} (${hookCheck.durationMs}ms, ${hookCheck.bytes} bytes)`,
     );
+    console.log(
+      `  - PreInvocation: ${quotaHookCheck.preInvocationOk ? "OK" : "FAILED"} (${quotaHookCheck.preInvocationMs}ms; threshold: ${effectiveAutoCompactTokens === 0 ? "off" : effectiveAutoCompactTokens})`,
+    );
+    console.log(
+      `  - PreToolUse  : ${quotaHookCheck.preToolUseOk ? "OK" : "FAILED"} (${quotaHookCheck.preToolUseMs}ms; image guard: ${effectiveImageGuardTokens === 0 ? "off" : effectiveImageGuardTokens})`,
+    );
     const checkSummary = updaterState.availableVersion
       ? `update available: v${updaterState.availableVersion}`
       : updaterState.lastCheckAt
@@ -1104,6 +1332,8 @@ async function runDoctor(targetDir, quiet = false, doctorOpts = {}) {
   const ok =
     hasAllExpectedTools &&
     hookCheck.bytes > 0 &&
+    quotaHookCheck.preInvocationOk &&
+    quotaHookCheck.preToolUseOk &&
     !hasBrokenIsolated &&
     (report.agyValidated === null || report.agyValidated === true);
   return { ok, report };
@@ -1208,7 +1438,9 @@ async function runInstall(opts) {
     opts.channel ||
     opts.repoUrl ||
     opts.editsFormat ||
-    opts.toolLoading
+    opts.toolLoading ||
+    opts.autoCompactTokens !== null ||
+    opts.imageGuardTokens !== null
   ) {
     const patch = {};
     if (opts.autoUpdate) patch.autoUpdate = opts.autoUpdate;
@@ -1217,6 +1449,8 @@ async function runInstall(opts) {
     if (opts.repoUrl) patch.repoUrl = opts.repoUrl;
     if (opts.editsFormat) patch.editsFormat = opts.editsFormat;
     if (opts.toolLoading) patch.toolLoading = opts.toolLoading;
+    if (opts.autoCompactTokens !== null) patch.autoCompactTokens = opts.autoCompactTokens;
+    if (opts.imageGuardTokens !== null) patch.imageGuardTokens = opts.imageGuardTokens;
     await writeUpdaterConfigFile(patch);
   }
 
@@ -1246,6 +1480,8 @@ async function runConfig(opts) {
   if (opts.repoUrl) patch.repoUrl = opts.repoUrl;
   if (opts.editsFormat) patch.editsFormat = opts.editsFormat;
   if (opts.toolLoading) patch.toolLoading = opts.toolLoading;
+  if (opts.autoCompactTokens !== null) patch.autoCompactTokens = opts.autoCompactTokens;
+  if (opts.imageGuardTokens !== null) patch.imageGuardTokens = opts.imageGuardTokens;
 
   let cfgPath = path.join(getUpdaterCacheDir(), "config.json");
   let cfg;
@@ -1283,6 +1519,16 @@ async function runConfig(opts) {
     console.log(`  - repoUrl           : ${cfg.repoUrl || "https://github.com/INK-Q/agy-fast.git"}`);
     console.log(`  - editsFormat       : ${cfg.editsFormat || "auto"}`);
     console.log(`  - toolLoading       : ${cfg.toolLoading || "eager"}`);
+    const cfgAutoCompact =
+      parseTokenThresholdValue(cfg.autoCompactTokens) ?? DEFAULT_AUTO_COMPACT_TOKENS;
+    const cfgImageGuard =
+      parseTokenThresholdValue(cfg.imageGuardTokens) ?? DEFAULT_IMAGE_GUARD_TOKENS;
+    console.log(
+      `  - autoCompactTokens : ${cfgAutoCompact === 0 ? "off" : cfgAutoCompact}`,
+    );
+    console.log(
+      `  - imageGuardTokens  : ${cfgImageGuard === 0 ? "off" : cfgImageGuard}`,
+    );
     if (appliedToolLoadingNote) {
       console.log(`  ${appliedToolLoadingNote}`);
     }
@@ -1298,12 +1544,21 @@ async function runUpdate(opts) {
     );
   }
 
-  if (opts.autoUpdate || opts.intervalHours !== null || opts.editsFormat || opts.toolLoading) {
+  if (
+    opts.autoUpdate ||
+    opts.intervalHours !== null ||
+    opts.editsFormat ||
+    opts.toolLoading ||
+    opts.autoCompactTokens !== null ||
+    opts.imageGuardTokens !== null
+  ) {
     const patch = {};
     if (opts.autoUpdate) patch.autoUpdate = opts.autoUpdate;
     if (opts.intervalHours !== null) patch.checkIntervalHours = opts.intervalHours;
     if (opts.editsFormat) patch.editsFormat = opts.editsFormat;
     if (opts.toolLoading) patch.toolLoading = opts.toolLoading;
+    if (opts.autoCompactTokens !== null) patch.autoCompactTokens = opts.autoCompactTokens;
+    if (opts.imageGuardTokens !== null) patch.imageGuardTokens = opts.imageGuardTokens;
     await writeUpdaterConfigFile(patch);
   }
 

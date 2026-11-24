@@ -1,12 +1,17 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { readStdin, writeAndExit } from "./utils/hook-io.js";
 import { truncateWithByteNotice } from "./utils/output-filter.js";
 import {
   formatSessionStartCompatNotice,
   readSavedEditsFormat,
   resolveHostCompat,
 } from "./utils/host-compat.js";
+import {
+  runPreInvocationCli,
+  runPreToolUseCli,
+} from "./utils/quota-hooks.js";
 import { buildWorkspaceSnapshot } from "./utils/snapshot.js";
 import {
   consumeSnapshotUpdateNotice,
@@ -44,85 +49,22 @@ function firstNonEmptyPath(list: unknown): string {
   return "";
 }
 
-const MAX_STDIN_BYTES = 256 * 1024;
 const MAX_SNAPSHOT_BYTES = 1500;
 
-async function readStdin(timeoutMs = 1500): Promise<string> {
-  return new Promise<string>((resolve) => {
-    const chunks: Buffer[] = [];
-    let totalBytes = 0;
-    let settled = false;
-
-    const onData = (chunk: Buffer | string) => {
-      if (settled) return;
-      const buf = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
-      const remaining = MAX_STDIN_BYTES - totalBytes;
-      if (remaining <= 0) {
-        finish();
-        return;
-      }
-      if (buf.length > remaining) {
-        chunks.push(buf.subarray(0, remaining));
-        totalBytes += remaining;
-        finish();
-      } else {
-        chunks.push(buf);
-        totalBytes += buf.length;
-      }
-    };
-
-    const onEnd = () => finish();
-    const onError = () => finish();
-    const ignoreLateError = () => {};
-
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      process.stdin.off("data", onData);
-      process.stdin.off("end", onEnd);
-      process.stdin.off("close", onEnd);
-      process.stdin.off("error", onError);
-      // Keep a no-op error listener so late pipe resets never crash fail-open exit
-      process.stdin.on("error", ignoreLateError);
-      // Release stdin handle so a parent that omits EOF never hangs the hook process
-      process.stdin.pause();
-      if (typeof (process.stdin as { unref?: () => void }).unref === "function") {
-        (process.stdin as { unref: () => void }).unref();
-      }
-      resolve(Buffer.concat(chunks).toString("utf8"));
-    };
-
-    const timer = setTimeout(finish, timeoutMs);
-    timer.unref();
-
-    process.stdin.on("data", onData);
-    process.stdin.on("end", onEnd);
-    process.stdin.on("close", onEnd);
-    process.stdin.on("error", onError);
-  });
-}
-
-function writeAndExit(payload: string): void {
-  // Explicitly exit after stdout flushes so any abandoned libuv fs.readdir/fs.readFile
-  // threadpool call after scanTimeoutMs cannot keep the SessionStart subprocess alive.
-  let exited = false;
-  const done = () => {
-    if (exited) return;
-    exited = true;
-    process.exit(0);
-  };
-  const failsafe = setTimeout(done, 150);
-  failsafe.unref();
-  process.stdout.on("error", done);
-  try {
-    process.stdout.write(payload, done);
-  } catch {
-    done();
-  }
-}
-
 async function main(): Promise<void> {
+  // Backward-compatible dispatch for installations auto-updated by older agy-fast
+  // updaters (<=0.2.10) that copy dist/session-start.mjs and hooks.json but not yet
+  // dist/pre-invocation.mjs or dist/pre-tool-use.mjs.
+  const hookMode = (globalThis as { __agyFastHook?: unknown }).__agyFastHook;
+  if (hookMode === "pre-invocation") {
+    await runPreInvocationCli();
+    return;
+  }
+  if (hookMode === "pre-tool-use") {
+    await runPreToolUseCli();
+    return;
+  }
+
   try {
     const raw = (await readStdin()).trim();
     if (!raw) {

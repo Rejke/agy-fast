@@ -49,6 +49,8 @@ describe("installer", () => {
     assert.match(out1, /Installed agy-fast/);
     assert.match(out1, /MCP server\s+: OK \(5 tools:/);
     assert.match(out1, /SessionStart: OK/);
+    assert.match(out1, /PreInvocation: OK/);
+    assert.match(out1, /PreToolUse\s+: OK/);
 
     // Verify all runtime files (including installer for self-doctor) are present and no node_modules copied
     for (const rel of [
@@ -59,6 +61,8 @@ describe("installer", () => {
       "assets/logo.svg",
       "dist/mcp-server.mjs",
       "dist/session-start.mjs",
+      "dist/pre-invocation.mjs",
+      "dist/pre-tool-use.mjs",
       "dist/benchmark.mjs",
       "dist/updater.mjs",
       "scripts/install.mjs",
@@ -669,6 +673,30 @@ describe("installer", () => {
       );
       const backToLazy = JSON.parse(await fs.readFile(mcpConfigPath, "utf8"));
       assert.equal(backToLazy.mcpServers.fast.tools, undefined);
+
+      // 5. `config --auto-compact-tokens` & `--image-guard-tokens` persist cleanly and surface in doctor
+      const quotaCfgOut = execFileSync(
+        process.execPath,
+        [
+          INSTALL_SCRIPT,
+          "config",
+          "--no-acp",
+          "--auto-compact-tokens",
+          "320000",
+          "--image-guard-tokens",
+          "off",
+        ],
+        { env, encoding: "utf8" },
+      );
+      assert.match(quotaCfgOut, /autoCompactTokens\s*: 320000/);
+      assert.match(quotaCfgOut, /imageGuardTokens\s*: off/);
+      const quotaDocOut = execFileSync(
+        process.execPath,
+        [INSTALL_SCRIPT, "doctor"],
+        { env, encoding: "utf8" },
+      );
+      assert.match(quotaDocOut, /PreInvocation: OK \(.*threshold: 320000\)/);
+      assert.match(quotaDocOut, /PreToolUse\s+: OK \(.*image guard: off\)/);
     } finally {
       await fs.rm(modeHome, { recursive: true, force: true });
     }
