@@ -6,14 +6,12 @@ import path from "node:path";
 import { after, before, describe, it } from "node:test";
 import {
   DEFAULT_AUTO_COMPACT_TOKENS,
-  DEFAULT_IMAGE_GUARD_TOKENS,
   parseTokenThreshold,
   readLatestTranscriptContext,
 } from "../src/utils/transcript-context.js";
 import { getConversationStateHash } from "../src/utils/quota-hooks.js";
 
 const PRE_INVOCATION_SCRIPT = path.resolve(process.cwd(), "dist", "pre-invocation.mjs");
-const PRE_TOOL_USE_SCRIPT = path.resolve(process.cwd(), "dist", "pre-tool-use.mjs");
 
 function runNodeHook(
   scriptPath: string,
@@ -25,7 +23,6 @@ function runNodeHook(
     const env: NodeJS.ProcessEnv = { ...process.env };
     delete env.AGY_FAST_CACHE_DIR;
     delete env.AGY_FAST_AUTO_COMPACT_TOKENS;
-    delete env.AGY_FAST_IMAGE_GUARD_TOKENS;
     for (const [k, v] of Object.entries(extraEnv)) {
       if (v === undefined) delete env[k];
       else env[k] = v;
@@ -59,7 +56,6 @@ function runShellHook(
     delete env.AGY_PLUGIN_ROOT;
     delete env.AGY_FAST_CACHE_DIR;
     delete env.AGY_FAST_AUTO_COMPACT_TOKENS;
-    delete env.AGY_FAST_IMAGE_GUARD_TOKENS;
     for (const [k, v] of Object.entries(extraEnv)) {
       if (v === undefined) delete env[k];
       else env[k] = v;
@@ -168,7 +164,6 @@ describe("quota & context guard hooks", () => {
     assert.equal(parseTokenThreshold("380_000"), 380_000);
     assert.equal(parseTokenThreshold("invalid"), null);
     assert.equal(DEFAULT_AUTO_COMPACT_TOKENS, 380_000);
-    assert.equal(DEFAULT_IMAGE_GUARD_TOKENS, 150_000);
   });
 
   it("PreInvocation nudges at >=380k, debounces, escalates once, and resets after compaction", async () => {
@@ -313,161 +308,20 @@ describe("quota & context guard hooks", () => {
     }
   });
 
-  it("PreToolUse denies image read_file & preview_snapshot(includeImage:true) at >=150k and fails open otherwise", async () => {
-    const cacheDir = path.join(tmpDir, "cache-pre-tool");
-    const highTranscript = path.join(tmpDir, "high-ctx.jsonl");
-    const lowTranscript = path.join(tmpDir, "low-ctx.jsonl");
-    await fs.writeFile(highTranscript, `${plannerLine(10, 50_000, 100_000)}\n`, "utf8"); // exactly 150k
-    await fs.writeFile(lowTranscript, `${plannerLine(10, 49_999, 100_000)}\n`, "utf8"); // 149,999
 
-    const env = { AGY_FAST_CACHE_DIR: cacheDir };
-
-    // Blocked image extensions (case-insensitive) via read_file and view_file at >=150k
-    for (const [toolName, imgPath] of [
-      ["read_file", "/tmp/shot.png"],
-      ["read_file", "C:\\Users\\dev\\Capture.JPG"],
-      ["read_file", "/tmp/photo.jpeg"],
-      ["read_file", "/tmp/ui.webp"],
-      ["read_file", "/tmp/anim.GIF"],
-      ["read_file", "/tmp/raw.bmp"],
-      ["read_file", "/tmp/modern.avif"],
-      ["read_file", "/tmp/scan.tiff"],
-      ["view_file", "/tmp/view.PNG"],
-    ] as const) {
-      const res = await runNodeHook(
-        PRE_TOOL_USE_SCRIPT,
-        JSON.stringify({
-          transcriptPath: highTranscript,
-          hookEventName: "PreToolUse",
-          toolCall: { id: "t1", name: toolName, args: { Path: imgPath } },
-        }),
-        env,
-      );
-      assert.equal(res.code, 0);
-      assert.equal(res.stderr, "");
-      const parsed = JSON.parse(res.stdout) as { decision?: string; reason?: string };
-      assert.equal(parsed.decision, "deny", `Expected deny for ${toolName}(${imgPath})`);
-      assert.match(parsed.reason ?? "", /subagent/i);
-      assert.match(parsed.reason ?? "", /text-only/i);
-    }
-
-    // Blocked preview_snapshot & mcp_rcode_preview_snapshot when includeImage === true at >=150k
-    for (const snapTool of ["preview_snapshot", "mcp_rcode_preview_snapshot"]) {
-      const deniedRes = await runNodeHook(
-        PRE_TOOL_USE_SCRIPT,
-        JSON.stringify({
-          transcriptPath: highTranscript,
-          toolCall: { id: "t2", name: snapTool, args: { includeImage: true } },
-        }),
-        env,
-      );
-      const parsed = JSON.parse(deniedRes.stdout) as { decision?: string; reason?: string };
-      assert.equal(parsed.decision, "deny", `Expected deny for ${snapTool}(includeImage: true)`);
-      assert.match(parsed.reason ?? "", /subagent/i);
-
-      // Text-only preview_snapshot (includeImage false or omitted) passes through
-      for (const args of [{ includeImage: false }, {}]) {
-        const allowRes = await runNodeHook(
-          PRE_TOOL_USE_SCRIPT,
-          JSON.stringify({
-            transcriptPath: highTranscript,
-            toolCall: { id: "t3", name: snapTool, args },
-          }),
-          env,
-        );
-        assert.deepEqual(JSON.parse(allowRes.stdout), {});
-      }
-    }
-
-    // Non-image read_file passes through even at high context
-    const codeRes = await runNodeHook(
-      PRE_TOOL_USE_SCRIPT,
-      JSON.stringify({
-        transcriptPath: highTranscript,
-        toolCall: { id: "t4", name: "read_file", args: { Path: "/repo/src/index.ts" } },
-      }),
-      env,
-    );
-    assert.deepEqual(JSON.parse(codeRes.stdout), {});
-
-    // Image read_file below 150k passes through
-    const lowRes = await runNodeHook(
-      PRE_TOOL_USE_SCRIPT,
-      JSON.stringify({
-        transcriptPath: lowTranscript,
-        toolCall: { id: "t5", name: "read_file", args: { Path: "/tmp/shot.png" } },
-      }),
-      env,
-    );
-    assert.deepEqual(JSON.parse(lowRes.stdout), {});
-
-    // Env override & config override & disable
-    await fs.mkdir(cacheDir, { recursive: true });
-    await fs.writeFile(
-      path.join(cacheDir, "config.json"),
-      JSON.stringify({ imageGuardTokens: 100_000 }),
-      "utf8",
-    );
-    const cfgDeny = await runNodeHook(
-      PRE_TOOL_USE_SCRIPT,
-      JSON.stringify({
-        transcriptPath: lowTranscript, // 149,999 >= 100,000
-        toolCall: { id: "t6", name: "read_file", args: { Path: "/tmp/shot.png" } },
-      }),
-      env,
-    );
-    assert.equal(JSON.parse(cfgDeny.stdout).decision, "deny");
-
-    const envOff = await runNodeHook(
-      PRE_TOOL_USE_SCRIPT,
-      JSON.stringify({
-        transcriptPath: highTranscript,
-        toolCall: { id: "t7", name: "read_file", args: { Path: "/tmp/shot.png" } },
-      }),
-      { ...env, AGY_FAST_IMAGE_GUARD_TOKENS: "0" },
-    );
-    assert.deepEqual(JSON.parse(envOff.stdout), {});
-
-    // Fail-open on missing transcript / malformed stdin
-    for (const bad of [
-      "",
-      "{not-json",
-      JSON.stringify({ toolCall: { name: "read_file", args: { Path: "/tmp/a.png" } } }),
-      JSON.stringify({
-        transcriptPath: path.join(tmpDir, "missing.jsonl"),
-        toolCall: { name: "read_file", args: { Path: "/tmp/a.png" } },
-      }),
-    ]) {
-      const res = await runNodeHook(PRE_TOOL_USE_SCRIPT, bad, env);
-      assert.equal(res.code, 0);
-      assert.deepEqual(JSON.parse(res.stdout), {});
-    }
-  });
-
-  it("hooks.json commands for PreInvocation and PreToolUse are shell-safe and resolve from unrelated CWD", async () => {
+  it("hooks.json command for PreInvocation is shell-safe and resolves from unrelated CWD", async () => {
     const hooksConfig = JSON.parse(
       await fs.readFile(path.resolve(process.cwd(), "hooks.json"), "utf8"),
     ) as {
       "agy-fast-context-guard": { PreInvocation: Array<{ command: string }> };
-      "agy-fast-image-guard": {
-        PreToolUse: Array<{ matcher: string; hooks: Array<{ command: string }> }>;
-      };
+      "agy-fast-image-guard"?: unknown;
     };
 
+    assert.equal(hooksConfig["agy-fast-image-guard"], undefined);
     const preInvCmd = hooksConfig["agy-fast-context-guard"].PreInvocation[0]!.command;
-    const preToolGroup = hooksConfig["agy-fast-image-guard"].PreToolUse[0]!;
-    const preToolCmd = preToolGroup.hooks[0]!.command;
 
     // Cross-shell safe (no sh/cmd-divergent metacharacters)
     assert.doesNotMatch(preInvCmd, /[$%!<>|&`\\]/);
-    assert.doesNotMatch(preToolCmd, /[$%!<>|&`\\]/);
-
-    // Matcher regex matches read_file, preview_snapshot, and mcp_rcode_preview_snapshot
-    const matcherRe = new RegExp(`^(?:${preToolGroup.matcher})$`);
-    assert.ok(matcherRe.test("read_file"));
-    assert.ok(matcherRe.test("preview_snapshot"));
-    assert.ok(matcherRe.test("mcp_rcode_preview_snapshot"));
-    assert.ok(!matcherRe.test("run_command"));
 
     const unrelatedCwd = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-unrelated-quota-"));
     const cacheDir = path.join(unrelatedCwd, "cache");
@@ -487,19 +341,6 @@ describe("quota & context guard hooks", () => {
         JSON.parse(rInv.stdout)?.injectSteps?.[0]?.systemMessage?.systemMessage ?? "",
         /400k/,
       );
-
-      const rTool = await runShellHook(
-        preToolCmd,
-        unrelatedCwd,
-        JSON.stringify({
-          transcriptPath: transcript,
-          toolCall: { id: "s1", name: "mcp_rcode_preview_snapshot", args: { includeImage: true } },
-        }),
-        { PLUGIN_ROOT: process.cwd(), AGY_FAST_CACHE_DIR: cacheDir },
-      );
-      assert.equal(rTool.code, 0, `stderr: ${rTool.stderr}`);
-      assert.equal(rTool.stderr, "");
-      assert.equal(JSON.parse(rTool.stdout).decision, "deny");
     } finally {
       await fs.rm(unrelatedCwd, { recursive: true, force: true });
     }
@@ -510,12 +351,8 @@ describe("quota & context guard hooks", () => {
       await fs.readFile(path.resolve(process.cwd(), "hooks.json"), "utf8"),
     ) as {
       "agy-fast-context-guard": { PreInvocation: Array<{ command: string }> };
-      "agy-fast-image-guard": {
-        PreToolUse: Array<{ hooks: Array<{ command: string }> }>;
-      };
     };
     const preInvCmd = hooksConfig["agy-fast-context-guard"].PreInvocation[0]!.command;
-    const preToolCmd = hooksConfig["agy-fast-image-guard"].PreToolUse[0]!.hooks[0]!.command;
 
     const decoyDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-decoy-ws-"));
     const emptyHome = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-decoy-home-"));
@@ -528,7 +365,7 @@ describe("quota & context guard hooks", () => {
         "utf8",
       );
       const decoyScript = `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(sentinel)}, "owned"); process.stdout.write('{"decision":"allow"}\\n');\n`;
-      for (const name of ["pre-invocation.mjs", "pre-tool-use.mjs", "session-start.mjs"]) {
+      for (const name of ["pre-invocation.mjs", "session-start.mjs"]) {
         await fs.writeFile(path.join(decoyDir, "dist", name), decoyScript, "utf8");
       }
 
@@ -540,11 +377,8 @@ describe("quota & context guard hooks", () => {
         AGY_PLUGIN_ROOT: undefined,
       };
       const r1 = await runShellHook(preInvCmd, decoyDir, "{}", env);
-      const r2 = await runShellHook(preToolCmd, decoyDir, "{}", env);
       assert.equal(r1.code, 0);
-      assert.equal(r2.code, 0);
       assert.deepEqual(JSON.parse(r1.stdout), {});
-      assert.deepEqual(JSON.parse(r2.stdout), {});
       await assert.rejects(fs.stat(sentinel), "Decoy workspace module must never execute");
     } finally {
       await fs.rm(decoyDir, { recursive: true, force: true });
@@ -557,12 +391,8 @@ describe("quota & context guard hooks", () => {
       await fs.readFile(path.resolve(process.cwd(), "hooks.json"), "utf8"),
     ) as {
       "agy-fast-context-guard": { PreInvocation: Array<{ command: string }> };
-      "agy-fast-image-guard": {
-        PreToolUse: Array<{ hooks: Array<{ command: string }> }>;
-      };
     };
     const preInvCmd = hooksConfig["agy-fast-context-guard"].PreInvocation[0]!.command;
-    const preToolCmd = hooksConfig["agy-fast-image-guard"].PreToolUse[0]!.hooks[0]!.command;
 
     const legacyInstallDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-legacy-upgrade-"));
     const cacheDir = path.join(legacyInstallDir, "cache");
@@ -570,7 +400,7 @@ describe("quota & context guard hooks", () => {
     await fs.writeFile(transcript, `${plannerLine(30, 120_000, 280_000)}\n`, "utf8"); // 400k
 
     try {
-      // Simulate base 2014a981 UPDATER_RUNTIME_FILES (does NOT include dist/pre-invocation.mjs or dist/pre-tool-use.mjs)
+      // Simulate base 2014a981 UPDATER_RUNTIME_FILES (does NOT include dist/pre-invocation.mjs)
       const legacyFiles = [
         "plugin.json",
         "mcp_config.json",
@@ -605,19 +435,6 @@ describe("quota & context guard hooks", () => {
         /400k/,
       );
 
-      const rTool = await runShellHook(
-        preToolCmd,
-        legacyInstallDir,
-        JSON.stringify({
-          transcriptPath: transcript,
-          toolCall: { id: "leg1", name: "read_file", args: { Path: "/tmp/screen.png" } },
-        }),
-        env,
-      );
-      assert.equal(rTool.code, 0, `stderr: ${rTool.stderr}`);
-      assert.equal(rTool.stderr, "");
-      assert.equal(JSON.parse(rTool.stdout).decision, "deny");
-
       // Doctor must also pass on this legacy-upgraded installation (C7)
       const docOut = execFileSync(
         process.execPath,
@@ -632,7 +449,6 @@ describe("quota & context guard hooks", () => {
         },
       );
       assert.match(docOut, /PreInvocation: OK/);
-      assert.match(docOut, /PreToolUse\s+: OK/);
     } finally {
       await fs.rm(legacyInstallDir, { recursive: true, force: true });
     }

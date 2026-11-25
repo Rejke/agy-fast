@@ -269,7 +269,6 @@ node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./aft
 | `AGY_FAST_EDITS_FORMAT` | `auto` *（默认）* \| `array` \| `string` | 控制 `apply_edits.edits` 参数格式策略（`auto` 在支持 `"eager": true` 的 CLI ≥1.5.8、桌面端 2.0、IDE 与第三方客户端统一走省 token 的强类型原生数组，在旧版懒加载 CLI 1.5.0–1.5.7 自动切换为 JSON 数组字符串以防 `[]` 丢参；服务端始终同时兼容两种格式） |
 | `AGY_FAST_HOST` | 如 `cli@1.5.14`、`ide@2.7.0`、`desktop@2.34.0` | 手动覆盖自动探测到的 Antigravity 宿主端类型与版本 |
 | `AGY_FAST_AUTO_COMPACT_TOKENS` | `380000` *（默认）* \| `<N>` \| `off` | `PreInvocation` 软压缩提示阈值（`0`/`off` 关闭；也支持 `config --auto-compact-tokens` 持久化） |
-| `AGY_FAST_IMAGE_GUARD_TOKENS` | `150000` *（默认）* \| `<N>` \| `off` | `PreToolUse` 长会话图片拦截阈值（`0`/`off` 关闭；也支持 `config --image-guard-tokens` 持久化） |
 
 **更新生效提示：** 新版 `rules/AGENTS.md` 与 `dist/session-start.mjs` 在下一次开启新会话时自动生效；Antigravity Desktop 2.0 / IDE 若需立即刷新常驻 MCP 服务，重载窗口或重启一次即可。
 
@@ -280,7 +279,7 @@ node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./aft
 - **严格遵守官方接口**：仅使用 Antigravity 官方文档定义的插件扩展机制（`plugin.json`、`mcp_config.json`、`hooks.json`、`rules/AGENTS.md`）。
 - **完全无侵入**：绝不影响 Antigravity 本身的表现与原生行为，**Diff 差异对比窗口**、**文件修改列表**、检查点与内置工具均保持原样工作。
 - **不篡改安全与程序文件**：不修改客户端程序文件，不绕过、不禁用任何内置安全评估机制或认证流程。
-- **轻量失败放行额度护栏钩子**：除 `SessionStart` 外，新增两个可关闭的失败放行钩子：`PreInvocation`（上下文 `>=380k` 时按会话防抖提示收尾并执行 `/compact`，可用 `AGY_FAST_AUTO_COMPACT_TOKENS=off` 或 `config --auto-compact-tokens off` 关闭）和 `PreToolUse`（上下文 `>=150k` 时拦截 `read_file`/`view_file`/`preview_snapshot(includeImage:true)` 加载图片并提示委派子代理，其余场景返回中性 `{}`；可用 `AGY_FAST_IMAGE_GUARD_TOKENS=off` 或 `config --image-guard-tokens off` 关闭）。不注册 `PostToolUse`、`PostInvocation` 或 `Stop` 钩子。
+- **轻量失败放行上下文护栏钩子**：除 `SessionStart` 外，新增一个可关闭的失败放行 `PreInvocation` 钩子（上下文 `>=380k` 时按会话防抖提示收尾并执行 `/compact`，可用 `AGY_FAST_AUTO_COMPACT_TOKENS=off` 或 `config --auto-compact-tokens off` 关闭）。不注册 `PreToolUse`、`PostToolUse`、`PostInvocation` 或 `Stop` 钩子。
 - **全部钩子失败放行**：遇到不可读目录、缺失会话日志或异常输入时均返回 `{}` 并正常退出，绝不阻断会话。
 - **本地优先且源码透明**：全部 MCP 工具与基准测试均在本地离线执行，零代码或日志上传；预构建 `dist/*.mjs` 产物不混淆，每一行执行代码均可直接审计。
 

@@ -6,7 +6,6 @@ const DEFAULT_MAX_STDIN_BYTES = 256 * 1024;
 
 export interface HookConfig {
   autoCompactTokens?: unknown;
-  imageGuardTokens?: unknown;
 }
 
 export function getHookHomeDir(env: NodeJS.ProcessEnv = process.env): string {

@@ -1,7 +1,6 @@
 import { promises as fs } from "node:fs";
 
 export const DEFAULT_AUTO_COMPACT_TOKENS = 380_000;
-export const DEFAULT_IMAGE_GUARD_TOKENS = 150_000;
 
 const INITIAL_TAIL_CHUNK_BYTES = 128 * 1024;
 const MAX_CHUNK_BYTES = 512 * 1024;

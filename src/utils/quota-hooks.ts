@@ -9,7 +9,6 @@ import {
 } from "./hook-io.js";
 import {
   DEFAULT_AUTO_COMPACT_TOKENS,
-  DEFAULT_IMAGE_GUARD_TOKENS,
   readLatestTranscriptContext,
   resolveTokenThreshold,
   type TailReadOptions,
@@ -19,18 +18,6 @@ const COMPACT_STATE_DIR = "compact-nudge";
 const STATE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_TRACKED_FILES = 400;
 
-export const BLOCKED_IMAGE_EXTENSIONS = new Set([
-  ".png",
-  ".jpg",
-  ".jpeg",
-  ".webp",
-  ".gif",
-  ".bmp",
-  ".avif",
-  ".tiff",
-  ".tif",
-]);
-
 export interface PreInvocationPayload {
   conversationId?: string;
   conversation_id?: string;
@@ -38,24 +25,6 @@ export interface PreInvocationPayload {
   transcript_path?: string;
   invocationNum?: number;
   initialNumSteps?: number;
-  hookEventName?: string;
-}
-
-export interface PreToolUseToolCall {
-  id?: string;
-  name?: string;
-  args?: unknown;
-  arguments?: unknown;
-}
-
-export interface PreToolUsePayload {
-  conversationId?: string;
-  conversation_id?: string;
-  transcriptPath?: string;
-  transcript_path?: string;
-  toolCall?: PreToolUseToolCall;
-  tool_call?: PreToolUseToolCall;
-  stepIdx?: number;
   hookEventName?: string;
 }
 
@@ -72,17 +41,6 @@ export interface PreInvocationResult {
       systemMessage: string;
     };
   }>;
-}
-
-export interface PreToolUseResult {
-  decision?: "allow" | "deny" | "ask" | "force_ask";
-  reason?: string;
-}
-
-export interface ImageToolCallMatch {
-  kind: "read_file" | "preview_snapshot";
-  toolName: string;
-  target: string;
 }
 
 export function formatTokensCompact(tokens: number): string {
@@ -116,89 +74,6 @@ function getConversationKey(
     return payload.conversation_id.trim();
   }
   return transcriptPath;
-}
-
-function parseToolArgs(raw: unknown): Record<string, unknown> | null {
-  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
-    return raw as Record<string, unknown>;
-  }
-  if (typeof raw === "string" && raw.trim()) {
-    try {
-      const parsed = JSON.parse(raw) as unknown;
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        return parsed as Record<string, unknown>;
-      }
-    } catch {
-      return null;
-    }
-  }
-  return null;
-}
-
-function extractFilePathArg(args: Record<string, unknown>): string {
-  for (const key of [
-    "Path",
-    "path",
-    "AbsolutePath",
-    "absolutePath",
-    "file_path",
-    "filePath",
-  ]) {
-    const val = args[key];
-    if (typeof val === "string" && val.trim()) {
-      return val.trim();
-    }
-  }
-  return "";
-}
-
-export function isImageFilePath(filePath: string): boolean {
-  if (!filePath) return false;
-  // Normalize Windows backslashes so path.extname works identically across platforms
-  const normalized = filePath.replace(/\\/g, "/");
-  const ext = path.posix.extname(normalized).toLowerCase();
-  return BLOCKED_IMAGE_EXTENSIONS.has(ext);
-}
-
-export function detectImageToolCall(
-  payload: PreToolUsePayload,
-): ImageToolCallMatch | null {
-  const toolCall = payload.toolCall ?? payload.tool_call;
-  if (!toolCall || typeof toolCall !== "object") return null;
-  const rawName = typeof toolCall.name === "string" ? toolCall.name.trim() : "";
-  if (!rawName) return null;
-
-  const normName = rawName.toLowerCase();
-  const args = parseToolArgs(toolCall.args ?? toolCall.arguments);
-  if (!args) return null;
-
-  if (normName === "read_file" || normName === "view_file") {
-    const targetPath = extractFilePathArg(args);
-    if (targetPath && isImageFilePath(targetPath)) {
-      return {
-        kind: "read_file",
-        toolName: rawName,
-        target: targetPath,
-      };
-    }
-    return null;
-  }
-
-  if (
-    normName === "preview_snapshot" ||
-    normName.endsWith("_preview_snapshot")
-  ) {
-    if (args.includeImage === true || args.include_image === true) {
-      return {
-        kind: "preview_snapshot",
-        toolName: rawName,
-        target: rawName,
-      };
-    }
-    return null;
-  }
-
-  return null;
 }
 
 export function getConversationStateHash(conversationKey: string): string {
@@ -432,52 +307,6 @@ export async function evaluatePreInvocation(
   };
 }
 
-export async function evaluatePreToolUse(
-  payload: PreToolUsePayload,
-  options: {
-    env?: NodeJS.ProcessEnv;
-    tailOptions?: TailReadOptions;
-  } = {},
-): Promise<PreToolUseResult> {
-  // Fast path: exit with zero disk I/O for non-image tool calls (e.g. code read_file, text preview_snapshot)
-  const match = detectImageToolCall(payload);
-  if (!match) return {};
-
-  const env = options.env ?? process.env;
-  const transcriptPath = getTranscriptPath(payload);
-  if (!transcriptPath) return {};
-
-  const cfg = await readHookConfig(env);
-  const threshold = resolveTokenThreshold(
-    env.AGY_FAST_IMAGE_GUARD_TOKENS,
-    cfg.imageGuardTokens,
-    DEFAULT_IMAGE_GUARD_TOKENS,
-  );
-  if (threshold <= 0) return {};
-
-  const snapshot = await readLatestTranscriptContext(
-    transcriptPath,
-    options.tailOptions,
-  );
-  if (!snapshot || snapshot.contextTokens < threshold) {
-    // Return {} (neutral pass-through) instead of {"decision":"allow"} so we never
-    // auto-approve restricted reads or MCP tools in approval-required mode.
-    return {};
-  }
-
-  const currentLabel = formatTokensCompact(snapshot.contextTokens);
-  const thresholdLabel = formatTokensCompact(threshold);
-  const callDesc =
-    match.kind === "read_file"
-      ? `${match.toolName}(${path.posix.basename(match.target.replace(/\\/g, "/"))})`
-      : `${match.toolName}(includeImage: true)`;
-
-  return {
-    decision: "deny",
-    reason: `[agy-fast image guard] Blocked ${callDesc} at ~${currentLabel} context tokens (limit: ${thresholdLabel}) to prevent prompt-cache invalidation and 3-7x TTFT spikes. Delegate visual inspection of this image to a subagent (e.g. invoke_subagent) and have it return text-only findings (values, selectors, file paths, concrete fixes).`,
-  };
-}
-
 export async function runPreInvocationCli(): Promise<void> {
   try {
     const raw = (await readStdin()).trim();
@@ -500,34 +329,6 @@ export async function runPreInvocationCli(): Promise<void> {
     }
 
     const result = await evaluatePreInvocation(payload);
-    writeAndExit(`${JSON.stringify(result)}\n`);
-  } catch {
-    writeAndExit("{}\n");
-  }
-}
-
-export async function runPreToolUseCli(): Promise<void> {
-  try {
-    const raw = (await readStdin()).trim();
-    if (!raw) {
-      writeAndExit("{}\n");
-      return;
-    }
-
-    let payload: PreToolUsePayload;
-    try {
-      payload = JSON.parse(raw) as PreToolUsePayload;
-    } catch {
-      writeAndExit("{}\n");
-      return;
-    }
-
-    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-      writeAndExit("{}\n");
-      return;
-    }
-
-    const result = await evaluatePreToolUse(payload);
     writeAndExit(`${JSON.stringify(result)}\n`);
   } catch {
     writeAndExit("{}\n");

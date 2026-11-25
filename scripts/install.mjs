@@ -26,7 +26,6 @@ const RUNTIME_FILES = [
   "dist/mcp-server.mjs",
   "dist/session-start.mjs",
   "dist/pre-invocation.mjs",
-  "dist/pre-tool-use.mjs",
   "dist/benchmark.mjs",
   "dist/updater.mjs",
   "scripts/install.mjs",
@@ -34,7 +33,6 @@ const RUNTIME_FILES = [
 ];
 
 const DEFAULT_AUTO_COMPACT_TOKENS = 380_000;
-const DEFAULT_IMAGE_GUARD_TOKENS = 150_000;
 
 const OPTIONAL_DOC_FILES = [
   "assets/logo-light.svg",
@@ -135,7 +133,6 @@ function parseArgs(argv) {
   let editsFormat = "";
   let toolLoading = "";
   let autoCompactTokens = null;
-  let imageGuardTokens = null;
 
   const positional = [];
   for (let i = 0; i < args.length; i++) {
@@ -206,16 +203,6 @@ function parseArgs(argv) {
       }
       autoCompactTokens = parsed;
       i++;
-    } else if (a === "--image-guard-tokens") {
-      const next = args[i + 1];
-      const parsed = parseTokenThresholdValue(next);
-      if (parsed === null) {
-        throw new Error(
-          "Invalid value after --image-guard-tokens (expected non-negative integer or 'off')",
-        );
-      }
-      imageGuardTokens = parsed;
-      i++;
     } else if (a === "--target") {
       const next = args[i + 1];
       if (!next || next.startsWith("-")) {
@@ -271,7 +258,6 @@ function parseArgs(argv) {
     editsFormat,
     toolLoading,
     autoCompactTokens,
-    imageGuardTokens,
   };
 }
 
@@ -305,7 +291,6 @@ Options:
                                 Configure apply_edits.edits schema preference (default auto)
   --tool-loading eager|lazy     Configure MCP tool loading mode in mcp_config.json (default eager)
   --auto-compact-tokens <N|off> Configure PreInvocation soft compaction nudge threshold (default 380000)
-  --image-guard-tokens <N|off>  Configure PreToolUse image guard threshold (default 150000)
   -h, --help                    Show this help
 `);
 }
@@ -689,13 +674,10 @@ async function runHookCommandSmokeJson(command, cwd, payloadObj, extraEnv = {}, 
 async function verifyQuotaHooksLive(targetDir) {
   const hooksCfg = await readJsonSafe(path.join(targetDir, "hooks.json"));
   const preInvCmd = hooksCfg?.["agy-fast-context-guard"]?.PreInvocation?.[0]?.command;
-  const preToolCmd = hooksCfg?.["agy-fast-image-guard"]?.PreToolUse?.[0]?.hooks?.[0]?.command;
-  if (typeof preInvCmd !== "string" || typeof preToolCmd !== "string") {
+  if (typeof preInvCmd !== "string") {
     return {
       preInvocationOk: false,
       preInvocationMs: 0,
-      preToolUseOk: false,
-      preToolUseMs: 0,
     };
   }
 
@@ -715,46 +697,24 @@ async function verifyQuotaHooksLive(targetDir) {
       PLUGIN_ROOT: targetDir,
       AGY_FAST_CACHE_DIR: cacheDir,
       AGY_FAST_AUTO_COMPACT_TOKENS: String(DEFAULT_AUTO_COMPACT_TOKENS),
-      AGY_FAST_IMAGE_GUARD_TOKENS: String(DEFAULT_IMAGE_GUARD_TOKENS),
     };
 
-    const [preInvRes, preToolRes] = await Promise.all([
-      runHookCommandSmokeJson(
-        preInvCmd,
-        targetDir,
-        {
-          conversationId: "doctor-smoke",
-          transcriptPath,
-          hookEventName: "PreInvocation",
-        },
-        cleanEnv,
-        "PreInvocation hook",
-      ),
-      runHookCommandSmokeJson(
-        preToolCmd,
-        targetDir,
-        {
-          conversationId: "doctor-smoke",
-          transcriptPath,
-          hookEventName: "PreToolUse",
-          toolCall: {
-            id: "toolu_doctor",
-            name: "read_file",
-            args: { Path: "/tmp/screenshot.png" },
-          },
-        },
-        cleanEnv,
-        "PreToolUse hook",
-      ),
-    ]);
+    const preInvRes = await runHookCommandSmokeJson(
+      preInvCmd,
+      targetDir,
+      {
+        conversationId: "doctor-smoke",
+        transcriptPath,
+        hookEventName: "PreInvocation",
+      },
+      cleanEnv,
+      "PreInvocation hook",
+    );
 
     const nudgeMsg = preInvRes.json?.injectSteps?.[0]?.systemMessage?.systemMessage || "";
-    const denied = preToolRes.json?.decision === "deny";
     return {
       preInvocationOk: typeof nudgeMsg === "string" && nudgeMsg.length > 0,
       preInvocationMs: preInvRes.durationMs,
-      preToolUseOk: denied,
-      preToolUseMs: preToolRes.durationMs,
     };
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
@@ -1173,7 +1133,6 @@ async function runDoctor(targetDir, quiet = false, doctorOpts = {}) {
   report.hookLatencyMs = hookCheck.durationMs;
   report.hookBytes = hookCheck.bytes;
   report.preInvocationOk = quotaHookCheck.preInvocationOk;
-  report.preToolUseOk = quotaHookCheck.preToolUseOk;
 
   if (hasAgy) {
     const valRes = spawnCliSync("agy", ["plugin", "validate", "--strict", targetDir], {
@@ -1223,10 +1182,6 @@ async function runDoctor(targetDir, quiet = false, doctorOpts = {}) {
     parseTokenThresholdValue(process.env.AGY_FAST_AUTO_COMPACT_TOKENS) ??
     parseTokenThresholdValue(updaterCfg.autoCompactTokens) ??
     DEFAULT_AUTO_COMPACT_TOKENS;
-  const effectiveImageGuardTokens =
-    parseTokenThresholdValue(process.env.AGY_FAST_IMAGE_GUARD_TOKENS) ??
-    parseTokenThresholdValue(updaterCfg.imageGuardTokens) ??
-    DEFAULT_IMAGE_GUARD_TOKENS;
   const installedMcpCfg = await readJsonSafe(path.join(targetDir, "mcp_config.json"));
   const installedToolsMap =
     installedMcpCfg?.mcpServers?.fast?.tools &&
@@ -1287,9 +1242,6 @@ async function runDoctor(targetDir, quiet = false, doctorOpts = {}) {
     console.log(
       `  - PreInvocation: ${quotaHookCheck.preInvocationOk ? "OK" : "FAILED"} (${quotaHookCheck.preInvocationMs}ms; threshold: ${effectiveAutoCompactTokens === 0 ? "off" : effectiveAutoCompactTokens})`,
     );
-    console.log(
-      `  - PreToolUse  : ${quotaHookCheck.preToolUseOk ? "OK" : "FAILED"} (${quotaHookCheck.preToolUseMs}ms; image guard: ${effectiveImageGuardTokens === 0 ? "off" : effectiveImageGuardTokens})`,
-    );
     const checkSummary = updaterState.availableVersion
       ? `update available: v${updaterState.availableVersion}`
       : updaterState.lastCheckAt
@@ -1333,7 +1285,6 @@ async function runDoctor(targetDir, quiet = false, doctorOpts = {}) {
     hasAllExpectedTools &&
     hookCheck.bytes > 0 &&
     quotaHookCheck.preInvocationOk &&
-    quotaHookCheck.preToolUseOk &&
     !hasBrokenIsolated &&
     (report.agyValidated === null || report.agyValidated === true);
   return { ok, report };
@@ -1439,8 +1390,7 @@ async function runInstall(opts) {
     opts.repoUrl ||
     opts.editsFormat ||
     opts.toolLoading ||
-    opts.autoCompactTokens !== null ||
-    opts.imageGuardTokens !== null
+    opts.autoCompactTokens !== null
   ) {
     const patch = {};
     if (opts.autoUpdate) patch.autoUpdate = opts.autoUpdate;
@@ -1450,7 +1400,6 @@ async function runInstall(opts) {
     if (opts.editsFormat) patch.editsFormat = opts.editsFormat;
     if (opts.toolLoading) patch.toolLoading = opts.toolLoading;
     if (opts.autoCompactTokens !== null) patch.autoCompactTokens = opts.autoCompactTokens;
-    if (opts.imageGuardTokens !== null) patch.imageGuardTokens = opts.imageGuardTokens;
     await writeUpdaterConfigFile(patch);
   }
 
@@ -1481,7 +1430,6 @@ async function runConfig(opts) {
   if (opts.editsFormat) patch.editsFormat = opts.editsFormat;
   if (opts.toolLoading) patch.toolLoading = opts.toolLoading;
   if (opts.autoCompactTokens !== null) patch.autoCompactTokens = opts.autoCompactTokens;
-  if (opts.imageGuardTokens !== null) patch.imageGuardTokens = opts.imageGuardTokens;
 
   let cfgPath = path.join(getUpdaterCacheDir(), "config.json");
   let cfg;
@@ -1521,13 +1469,8 @@ async function runConfig(opts) {
     console.log(`  - toolLoading       : ${cfg.toolLoading || "eager"}`);
     const cfgAutoCompact =
       parseTokenThresholdValue(cfg.autoCompactTokens) ?? DEFAULT_AUTO_COMPACT_TOKENS;
-    const cfgImageGuard =
-      parseTokenThresholdValue(cfg.imageGuardTokens) ?? DEFAULT_IMAGE_GUARD_TOKENS;
     console.log(
       `  - autoCompactTokens : ${cfgAutoCompact === 0 ? "off" : cfgAutoCompact}`,
-    );
-    console.log(
-      `  - imageGuardTokens  : ${cfgImageGuard === 0 ? "off" : cfgImageGuard}`,
     );
     if (appliedToolLoadingNote) {
       console.log(`  ${appliedToolLoadingNote}`);
@@ -1549,8 +1492,7 @@ async function runUpdate(opts) {
     opts.intervalHours !== null ||
     opts.editsFormat ||
     opts.toolLoading ||
-    opts.autoCompactTokens !== null ||
-    opts.imageGuardTokens !== null
+    opts.autoCompactTokens !== null
   ) {
     const patch = {};
     if (opts.autoUpdate) patch.autoUpdate = opts.autoUpdate;
@@ -1558,7 +1500,6 @@ async function runUpdate(opts) {
     if (opts.editsFormat) patch.editsFormat = opts.editsFormat;
     if (opts.toolLoading) patch.toolLoading = opts.toolLoading;
     if (opts.autoCompactTokens !== null) patch.autoCompactTokens = opts.autoCompactTokens;
-    if (opts.imageGuardTokens !== null) patch.imageGuardTokens = opts.imageGuardTokens;
     await writeUpdaterConfigFile(patch);
   }
 

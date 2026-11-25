@@ -8,10 +8,7 @@ import {
   readSavedEditsFormat,
   resolveHostCompat,
 } from "./utils/host-compat.js";
-import {
-  runPreInvocationCli,
-  runPreToolUseCli,
-} from "./utils/quota-hooks.js";
+import { runPreInvocationCli } from "./utils/quota-hooks.js";
 import { buildWorkspaceSnapshot } from "./utils/snapshot.js";
 import {
   consumeSnapshotUpdateNotice,
@@ -54,14 +51,10 @@ const MAX_SNAPSHOT_BYTES = 1500;
 async function main(): Promise<void> {
   // Backward-compatible dispatch for installations auto-updated by older agy-fast
   // updaters (<=0.2.10) that copy dist/session-start.mjs and hooks.json but not yet
-  // dist/pre-invocation.mjs or dist/pre-tool-use.mjs.
+  // dist/pre-invocation.mjs.
   const hookMode = (globalThis as { __agyFastHook?: unknown }).__agyFastHook;
   if (hookMode === "pre-invocation") {
     await runPreInvocationCli();
-    return;
-  }
-  if (hookMode === "pre-tool-use") {
-    await runPreToolUseCli();
     return;
   }
 

@@ -717,7 +717,6 @@ import path4 from "node:path";
 // src/utils/transcript-context.ts
 import { promises as fs2 } from "node:fs";
 var DEFAULT_AUTO_COMPACT_TOKENS = 38e4;
-var DEFAULT_IMAGE_GUARD_TOKENS = 15e4;
 var INITIAL_TAIL_CHUNK_BYTES = 128 * 1024;
 var MAX_CHUNK_BYTES = 512 * 1024;
 var DEFAULT_MAX_TAIL_BYTES = 2 * 1024 * 1024;
@@ -867,17 +866,6 @@ async function readLatestTranscriptContext(transcriptPath, options = {}) {
 var COMPACT_STATE_DIR = "compact-nudge";
 var STATE_TTL_MS = 7 * 24 * 60 * 60 * 1e3;
 var MAX_TRACKED_FILES = 400;
-var BLOCKED_IMAGE_EXTENSIONS = /* @__PURE__ */ new Set([
-  ".png",
-  ".jpg",
-  ".jpeg",
-  ".webp",
-  ".gif",
-  ".bmp",
-  ".avif",
-  ".tiff",
-  ".tif"
-]);
 function formatTokensCompact(tokens) {
   if (tokens >= 1e3) {
     return `${Math.round(tokens / 1e3)}k`;
@@ -901,75 +889,6 @@ function getConversationKey(payload, transcriptPath) {
     return payload.conversation_id.trim();
   }
   return transcriptPath;
-}
-function parseToolArgs(raw) {
-  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
-    return raw;
-  }
-  if (typeof raw === "string" && raw.trim()) {
-    try {
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        return parsed;
-      }
-    } catch {
-      return null;
-    }
-  }
-  return null;
-}
-function extractFilePathArg(args) {
-  for (const key of [
-    "Path",
-    "path",
-    "AbsolutePath",
-    "absolutePath",
-    "file_path",
-    "filePath"
-  ]) {
-    const val = args[key];
-    if (typeof val === "string" && val.trim()) {
-      return val.trim();
-    }
-  }
-  return "";
-}
-function isImageFilePath(filePath) {
-  if (!filePath) return false;
-  const normalized = filePath.replace(/\\/g, "/");
-  const ext = path4.posix.extname(normalized).toLowerCase();
-  return BLOCKED_IMAGE_EXTENSIONS.has(ext);
-}
-function detectImageToolCall(payload) {
-  const toolCall = payload.toolCall ?? payload.tool_call;
-  if (!toolCall || typeof toolCall !== "object") return null;
-  const rawName = typeof toolCall.name === "string" ? toolCall.name.trim() : "";
-  if (!rawName) return null;
-  const normName = rawName.toLowerCase();
-  const args = parseToolArgs(toolCall.args ?? toolCall.arguments);
-  if (!args) return null;
-  if (normName === "read_file" || normName === "view_file") {
-    const targetPath = extractFilePathArg(args);
-    if (targetPath && isImageFilePath(targetPath)) {
-      return {
-        kind: "read_file",
-        toolName: rawName,
-        target: targetPath
-      };
-    }
-    return null;
-  }
-  if (normName === "preview_snapshot" || normName.endsWith("_preview_snapshot")) {
-    if (args.includeImage === true || args.include_image === true) {
-      return {
-        kind: "preview_snapshot",
-        toolName: rawName,
-        target: rawName
-      };
-    }
-    return null;
-  }
-  return null;
 }
 function getConversationStateHash(conversationKey) {
   return crypto.createHash("sha256").update(conversationKey).digest("hex").slice(0, 24);
@@ -1146,34 +1065,6 @@ async function evaluatePreInvocation(payload, options = {}) {
     ]
   };
 }
-async function evaluatePreToolUse(payload, options = {}) {
-  const match = detectImageToolCall(payload);
-  if (!match) return {};
-  const env = options.env ?? process.env;
-  const transcriptPath = getTranscriptPath(payload);
-  if (!transcriptPath) return {};
-  const cfg = await readHookConfig(env);
-  const threshold = resolveTokenThreshold(
-    env.AGY_FAST_IMAGE_GUARD_TOKENS,
-    cfg.imageGuardTokens,
-    DEFAULT_IMAGE_GUARD_TOKENS
-  );
-  if (threshold <= 0) return {};
-  const snapshot = await readLatestTranscriptContext(
-    transcriptPath,
-    options.tailOptions
-  );
-  if (!snapshot || snapshot.contextTokens < threshold) {
-    return {};
-  }
-  const currentLabel = formatTokensCompact(snapshot.contextTokens);
-  const thresholdLabel = formatTokensCompact(threshold);
-  const callDesc = match.kind === "read_file" ? `${match.toolName}(${path4.posix.basename(match.target.replace(/\\/g, "/"))})` : `${match.toolName}(includeImage: true)`;
-  return {
-    decision: "deny",
-    reason: `[agy-fast image guard] Blocked ${callDesc} at ~${currentLabel} context tokens (limit: ${thresholdLabel}) to prevent prompt-cache invalidation and 3-7x TTFT spikes. Delegate visual inspection of this image to a subagent (e.g. invoke_subagent) and have it return text-only findings (values, selectors, file paths, concrete fixes).`
-  };
-}
 async function runPreInvocationCli() {
   try {
     const raw = (await readStdin()).trim();
@@ -1193,31 +1084,6 @@ async function runPreInvocationCli() {
       return;
     }
     const result = await evaluatePreInvocation(payload);
-    writeAndExit(`${JSON.stringify(result)}
-`);
-  } catch {
-    writeAndExit("{}\n");
-  }
-}
-async function runPreToolUseCli() {
-  try {
-    const raw = (await readStdin()).trim();
-    if (!raw) {
-      writeAndExit("{}\n");
-      return;
-    }
-    let payload;
-    try {
-      payload = JSON.parse(raw);
-    } catch {
-      writeAndExit("{}\n");
-      return;
-    }
-    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-      writeAndExit("{}\n");
-      return;
-    }
-    const result = await evaluatePreToolUse(payload);
     writeAndExit(`${JSON.stringify(result)}
 `);
   } catch {
@@ -2170,10 +2036,6 @@ async function main() {
   const hookMode = globalThis.__agyFastHook;
   if (hookMode === "pre-invocation") {
     await runPreInvocationCli();
-    return;
-  }
-  if (hookMode === "pre-tool-use") {
-    await runPreToolUseCli();
     return;
   }
   try {

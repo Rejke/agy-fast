@@ -24,11 +24,6 @@ const entrypoints = [
     banner: "// agy-fast PreInvocation Hook (bundled zero-dependency ESM)\n",
   },
   {
-    in: path.join(rootDir, "src", "pre-tool-use.ts"),
-    out: path.join(distDir, "pre-tool-use.mjs"),
-    banner: "// agy-fast PreToolUse Hook (bundled zero-dependency ESM)\n",
-  },
-  {
     in: path.join(rootDir, "src", "benchmark.ts"),
     out: path.join(distDir, "benchmark.mjs"),
     banner: "#!/usr/bin/env node\n// agy-fast Offline Transcript Benchmark CLI\n",

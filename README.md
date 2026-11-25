@@ -271,7 +271,6 @@ node dist/benchmark.mjs compare --before ./run-before/transcript.jsonl --after .
 | `AGY_FAST_EDITS_FORMAT` | `auto` *(default)* \| `array` \| `string` | Controls `apply_edits.edits` schema (`auto` uses token-saving native arrays on eager-capable CLI ≥1.5.8, Desktop 2.0, IDE, and third-party hosts, and switches to JSON array strings on pre-eager CLI 1.5.0–1.5.7; server always accepts both) |
 | `AGY_FAST_HOST` | e.g. `cli@1.5.14`, `ide@2.7.0`, `desktop@2.34.0` | Overrides auto-detected Antigravity host surface & version |
 | `AGY_FAST_AUTO_COMPACT_TOKENS` | `380000` *(default)* \| `<N>` \| `off` | `PreInvocation` soft compaction wrap-up nudge threshold (`0`/`off` disables; also configurable via `config --auto-compact-tokens`) |
-| `AGY_FAST_IMAGE_GUARD_TOKENS` | `150000` *(default)* \| `<N>` \| `off` | `PreToolUse` image guard threshold blocking image reads/`preview_snapshot(includeImage:true)` in long sessions (`0`/`off` disables; also configurable via `config --image-guard-tokens`) |
 
 **Applying updates:** Updated `rules/AGENTS.md` and `dist/session-start.mjs` take effect automatically on the next new session. In Antigravity Desktop 2.0 / IDE, reload or restart the window once to refresh the resident MCP server process.
 
@@ -282,7 +281,7 @@ node dist/benchmark.mjs compare --before ./run-before/transcript.jsonl --after .
 - **Official interfaces only:** Built exclusively on documented Antigravity extension APIs (`plugin.json`, `mcp_config.json`, `hooks.json`, `rules/AGENTS.md`).
 - **Non-invasive by design:** Never alters or interferes with Antigravity's native UI, **diff viewer/window**, **modified-files list**, checkpoints, or built-in tools.
 - **No safety or binary tampering:** Does not patch client binaries, alter authentication, or bypass Antigravity's built-in safety evaluations.
-- **Lightweight fail-open quota guards:** Registers two optional fail-open hooks alongside `SessionStart`: `PreInvocation` (`>=380k` soft wrap-up nudge for `/compact`, debounced per conversation; disable via `AGY_FAST_AUTO_COMPACT_TOKENS=off` or `config --auto-compact-tokens off`) and `PreToolUse` (blocks loading images via `read_file`/`view_file`/`preview_snapshot(includeImage:true)` at `>=150k` with subagent delegation guidance, returning neutral `{}` otherwise; disable via `AGY_FAST_IMAGE_GUARD_TOKENS=off` or `config --image-guard-tokens off`). Registers no `PostToolUse`, `PostInvocation`, or `Stop` hooks.
+- **Lightweight fail-open context guard:** Registers one optional fail-open `PreInvocation` hook alongside `SessionStart` (`>=380k` soft wrap-up nudge for `/compact`, debounced per conversation; disable via `AGY_FAST_AUTO_COMPACT_TOKENS=off` or `config --auto-compact-tokens off`). Registers no `PreToolUse`, `PostToolUse`, `PostInvocation`, or `Stop` hooks.
 - **Fail-open hooks:** On unreadable directories, missing transcripts, or malformed stdin, all hooks return `{}` and exit cleanly—never breaking a session.
 - **Local-first & auditable:** All 5 MCP tools and the benchmark CLI run 100% locally with zero code or transcript uploads; shipped `dist/*.mjs` bundles are unminified ESM so every executed line is directly auditable.
 
