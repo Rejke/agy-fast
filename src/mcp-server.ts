@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpStdioServer, type McpToolDefinition } from "./protocol/mcp.js";
@@ -18,8 +19,9 @@ import {
   type ReadSlicesInput,
 } from "./tools/read-slices.js";
 import { runChecks, type RunChecksInput } from "./tools/run-checks.js";
+import { runAgyFastCli } from "./cli-runner.js";
 
-const SERVER_VERSION = "0.2.10";
+const SERVER_VERSION = "0.3.1";
 const DEFAULT_PLUGIN_ROOT = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "..",
@@ -62,6 +64,54 @@ function isInstalledPluginPath(dirPath: string): boolean {
   );
 }
 
+function isSameDir(a: string, b: string): boolean {
+  const caseInsensitive =
+    process.platform === "win32" || process.platform === "darwin";
+  return caseInsensitive ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+// A host that reports no MCP roots may start the server somewhere that is never a workspace:
+// the filesystem root or the user's home directory itself. Resolving an omitted or relative
+// `cwd` there writes files and runs commands outside any project, so ask for `cwd` instead.
+function detectNonWorkspaceCwd(
+  env: NodeJS.ProcessEnv,
+  currentCwd: string,
+): { dir: string; place: string } | null {
+  const canonCwd = canonicalizeDir(currentCwd);
+  if (path.parse(canonCwd).root === canonCwd) {
+    return { dir: canonCwd, place: "the filesystem root" };
+  }
+  const isFullAbsPath = (p: string): boolean =>
+    process.platform === "win32"
+      ? /^(?:[A-Za-z]:[\\/]|\\\\[^\\])/.test(p)
+      : path.isAbsolute(p);
+  const driveHome =
+    process.platform === "win32" &&
+    typeof env.HOMEDRIVE === "string" &&
+    typeof env.HOMEPATH === "string" &&
+    env.HOMEDRIVE.trim() &&
+    env.HOMEPATH.trim()
+      ? `${env.HOMEDRIVE.trim()}${env.HOMEPATH.trim()}`
+      : "";
+  const homes = [env.HOME, env.USERPROFILE, driveHome]
+    .map((h) => (typeof h === "string" ? h.trim() : ""))
+    .filter((h) => h && isFullAbsPath(h));
+  if (homes.length === 0 && env === process.env) {
+    try {
+      const osHome = os.homedir();
+      if (isFullAbsPath(osHome)) homes.push(osHome);
+    } catch {
+      // No home directory to compare against
+    }
+  }
+  for (const home of homes) {
+    if (home && isSameDir(canonCwd, canonicalizeDir(home))) {
+      return { dir: canonCwd, place: "the home directory" };
+    }
+  }
+  return null;
+}
+
 function detectPluginInstallCwd(
   env: NodeJS.ProcessEnv,
   currentCwd: string,
@@ -99,13 +149,12 @@ function buildApplyEditsToolDefinition(
     ? {
         type: "string",
         description:
-          'JSON array string of 1-50 files: [{"path","hunks"?:[{"target","replacement","startLine"?,"endLine"?,"replaceAll"?}],"create"?,"overwrite"?}].',
+          'JSON array string (1-50 files): [{"path","hunks"?:[{"target","replacement","startLine"?,"endLine"?,"replaceAll"?}],"create"?,"overwrite"?}]. Exact target in 1-based window (all if replaceAll). Nonempty hunks XOR full-file create. overwrite allows replacing via create. Native arrays also work, but call_mcp_tool can turn long ones into [].',
       }
     : {
         type: "array",
         minItems: 1,
         maxItems: 50,
-        description: "Files to edit/create (JSON array string also accepted).",
         items: {
           type: "object",
           properties: {
@@ -115,75 +164,46 @@ function buildApplyEditsToolDefinition(
               items: {
                 type: "object",
                 properties: {
-                  target: { type: "string", description: "Exact text to match." },
-                  replacement: { type: "string", description: "Replacement text." },
-                  startLine: {
-                    type: "integer",
-                    minimum: 1,
-                    description: "1-based start line.",
-                  },
-                  endLine: {
-                    type: "integer",
-                    minimum: 1,
-                    description: "1-based end line.",
-                  },
-                  replaceAll: {
-                    type: "boolean",
-                    description: "Replace all matches in range.",
-                  },
+                  target: { type: "string" },
+                  replacement: { type: "string" },
+                  startLine: { type: "integer", minimum: 1 },
+                  endLine: { type: "integer", minimum: 1 },
+                  replaceAll: { type: "boolean" },
                 },
                 required: ["target", "replacement"],
               },
             },
-            create: {
-              type: "string",
-              description: "Full content for new file (instead of hunks).",
-            },
-            overwrite: {
-              type: "boolean",
-              description: "Allow overwriting existing file with create.",
-            },
+            create: { type: "string" },
+            overwrite: { type: "boolean" },
           },
           required: ["path"],
         },
       };
 
+  const baseDesc = `Atomic multi-file edits. bestEffort writes valid files atomically per file, gives closest lines, skips verify on failure. dryRun=false (true validates only). verify shell in cwd after writes (60s/4000 chars default, agy drops at 180s). 8800 UTF-8 bytes total. Absolute cwd if no roots/list (Desktop 2.0 Hub).`;
+
   return {
     name: "apply_edits",
     description: preferStringEdits
-      ? "Atomically edit/create 1-50 files with multi-hunk replacements and optional verify. Pass 'edits' as a JSON array string."
-      : "Atomically edit/create 1-50 files with multi-hunk replacements and optional inline verify.",
+      ? baseDesc
+      : `${baseDesc} Exact target in 1-based window (all if replaceAll). Nonempty hunks XOR full-file create. overwrite allows replacing via create.`,
     inputSchema: {
       type: "object",
       properties: {
-        cwd: {
-          type: "string",
-          description: "Workspace root (required if roots/list is unavailable).",
-        },
+        cwd: { type: "string" },
         edits: editsSchema,
-        dryRun: {
-          type: "boolean",
-          description: "Validate without writing (default false).",
-        },
-        bestEffort: {
-          type: "boolean",
-          description: "Write valid files even if others fail; skips verify on failure.",
-        },
-        verify: {
-          type: "string",
-          description: "Shell command run after writing (e.g. 'npm run typecheck').",
-        },
+        dryRun: { type: "boolean" },
+        bestEffort: { type: "boolean" },
+        verify: { type: "string" },
         verifyTimeoutSec: {
           type: "integer",
           minimum: 1,
           maximum: MCP_CALL_BUDGET_SEC,
-          description: `Verify timeout in seconds (default 60, max ${MCP_CALL_BUDGET_SEC}).`,
         },
         maxVerifyChars: {
           type: "integer",
           minimum: 300,
           maximum: 7500,
-          description: "Verify output cap (default 4000, max 7500).",
         },
       },
       required: ["edits"],
@@ -206,7 +226,8 @@ export function createAgyFastServer(
 
   // agy starts plugin servers in the plugin directory; resolve omitted or relative
   // tool `cwd` values against the first valid workspace root without mutating process.cwd().
-  // Never silently fall back to the installed plugin directory when roots/list is unavailable.
+  // Never silently fall back to the installed plugin directory, the filesystem root or the
+  // home directory when roots/list is unavailable.
   let defaultCwd: string | undefined;
 
   const resolveToolArgs = <T extends { cwd?: string }>(
@@ -239,6 +260,13 @@ export function createAgyFastServer(
           error: `Error: 'cwd' is required because this host did not report a workspace root via MCP roots/list and the MCP server started inside the plugin directory (${pluginFallbackDir}). Pass the active workspace root explicitly in 'cwd'.`,
         };
       }
+      const nonWorkspace = detectNonWorkspaceCwd(env, getProcessCwd());
+      if (nonWorkspace) {
+        return {
+          ok: false,
+          error: `Error: 'cwd' is required because this host did not report a workspace root via MCP roots/list and the MCP server started in ${nonWorkspace.place} (${nonWorkspace.dir}), which is not a workspace. Pass the active workspace root explicitly in 'cwd'.`,
+        };
+      }
       return {
         ok: true,
         value: { ...args, cwd: undefined } as unknown as T,
@@ -260,6 +288,13 @@ export function createAgyFastServer(
         return {
           ok: false,
           error: `Error: 'cwd' must be an absolute workspace path because this host did not report a workspace root via MCP roots/list and the MCP server started inside the plugin directory (${pluginFallbackDir}). Received relative cwd: ${JSON.stringify(rawCwd)}.`,
+        };
+      }
+      const nonWorkspace = detectNonWorkspaceCwd(env, getProcessCwd());
+      if (nonWorkspace) {
+        return {
+          ok: false,
+          error: `Error: 'cwd' must be an absolute workspace path because this host did not report a workspace root via MCP roots/list and the MCP server started in ${nonWorkspace.place} (${nonWorkspace.dir}), which is not a workspace. Received relative cwd: ${JSON.stringify(rawCwd)}.`,
         };
       }
     }
@@ -305,19 +340,15 @@ export function createAgyFastServer(
     {
       name: "batch_search",
       description:
-        "Run read-only text/regex searches, globs, fuzzy path lookups, and read-only git queries concurrently with bounded output.",
+        "Parallel search: literal text, regex, fuzzy paths, glob (*/{a,b}, no |), read-only git. Absolute cwd if no roots/list (Desktop 2.0 Hub). path rel/abs file/dir; glob filters text/regex; fileType lang/ext (text/regex/fuzzy). multiline spans lines (dot too); count/file=lines or multiline occurrences. Defaults: outputMode=content, caseSensitive=true, contextLines=0, maxResults=40, maxChars=8500 (8800B UTF-8 max); glob sortBy=path (mtime newest).",
       inputSchema: {
         type: "object",
         properties: {
-          cwd: {
-            type: "string",
-            description: "Workspace root (required if roots/list is unavailable).",
-          },
+          cwd: { type: "string" },
           queries: {
             type: "array",
             minItems: 1,
             maxItems: 20,
-            description: "Queries to run concurrently.",
             items: {
               type: "object",
               properties: {
@@ -325,62 +356,24 @@ export function createAgyFastServer(
                   type: "string",
                   enum: ["text", "regex", "glob", "fuzzy", "git"],
                 },
-                pattern: {
-                  type: "string",
-                  description: "Text, regex, fuzzy path, glob (* / {a,b}), or read-only git args.",
-                },
-                path: {
-                  type: "string",
-                  description: "Subdirectory or file relative to cwd.",
-                },
-                glob: {
-                  type: "string",
-                  description: "File filter glob (e.g. '*.ts').",
-                },
-                multiline: {
-                  type: "boolean",
-                  description: "Match across lines.",
-                },
+                pattern: { type: "string" },
+                path: { type: "string" },
+                glob: { type: "string" },
+                multiline: { type: "boolean" },
                 outputMode: {
                   type: "string",
                   enum: ["content", "files_with_matches", "count"],
-                  description: "content (default), files_with_matches, or count.",
                 },
-                fileType: {
-                  type: "string",
-                  description: "Language/extension filter (e.g. ts, py).",
-                },
-                sortBy: {
-                  type: "string",
-                  enum: ["path", "mtime"],
-                  description: "Glob order: path (default) or mtime.",
-                },
-                caseSensitive: {
-                  type: "boolean",
-                  description: "Case-sensitive match (default true).",
-                },
-                contextLines: {
-                  type: "integer",
-                  minimum: 0,
-                  maximum: 5,
-                  description: "Context lines (0-5).",
-                },
-                maxResults: {
-                  type: "integer",
-                  minimum: 1,
-                  maximum: 200,
-                  description: "Max results (default 40).",
-                },
+                fileType: { type: "string" },
+                sortBy: { type: "string", enum: ["path", "mtime"] },
+                caseSensitive: { type: "boolean" },
+                contextLines: { type: "integer", minimum: 0, maximum: 5 },
+                maxResults: { type: "integer", minimum: 1, maximum: 200 },
               },
               required: ["type", "pattern"],
             },
           },
-          maxChars: {
-            type: "integer",
-            minimum: 500,
-            maximum: 8800,
-            description: "Output cap (default 8500, max 8800).",
-          },
+          maxChars: { type: "integer", minimum: 500, maximum: 8800 },
         },
         required: ["queries"],
       },
@@ -405,24 +398,19 @@ export function createAgyFastServer(
     {
       name: "read_slices",
       description:
-        "Batch-extract symbol/section outlines (TS/JS/HTML/Vue/Svelte/CSS/Python/GDScript/Go/Rust/Java/MD/JSON/YAML) across files (prefer 10-20 files/batch, max 40) in one call, plus optional tiny <=120-line slices. For reading >150 lines of known ranges, prefer parallel built-in read_file(StartLine, EndLine) (46KB/call inline, 0 remote check).",
+        "Batch outlines (TS/JS/HTML/Vue/Svelte/CSS/Py/GDScript/Go/Rust/Java/MD/JSON/YAML; prefer 10-20, max 40) + tiny <=120-line slices. For >150 known lines total, prefer parallel read_file(StartLine, EndLine) if available (agy: 46KB/call, no remote check). Absolute cwd if no roots/list (Desktop 2.0 Hub). slices: 1-based inclusive [start,end]; lineRanges: 'path:start-end,s2-e2'. maxChars default 8500; 8800 UTF-8 bytes total.",
       inputSchema: {
         type: "object",
         properties: {
-          cwd: {
-            type: "string",
-            description: "Workspace root directory for relative paths (required if the host does not report MCP roots/list, e.g. Desktop 2.0 Hub).",
-          },
+          cwd: { type: "string" },
           outlines: {
             type: "array",
             maxItems: 40,
             items: { type: "string" },
-            description: "File paths to extract top-level symbol/section line ranges from (prefer 10-20 per batch for fuller outlines; max 40).",
           },
           slices: {
             type: "array",
             maxItems: 30,
-            description: "Optional tiny 1-based inclusive [startLine, endLine] ranges to piggyback (total response hard-capped <= 8800 UTF-8 bytes). For flat shorthand, you may also pass 'lineRanges'.",
             items: {
               type: "object",
               properties: {
@@ -445,14 +433,8 @@ export function createAgyFastServer(
             type: "array",
             maxItems: 30,
             items: { type: "string" },
-            description: "Flat shorthand for tiny slices: 'path:start-end' or 'path:start1-end1,start2-end2' (e.g. 'src/server.ts:1-50,120-160').",
           },
-          maxChars: {
-            type: "integer",
-            minimum: 1000,
-            maximum: 8800,
-            description: "Total character cap (default 8500; hard inline UTF-8 cap <= 8800 bytes to prevent output.txt spills).",
-          },
+          maxChars: { type: "integer", minimum: 1000, maximum: 8800 },
         },
       },
     },
@@ -467,27 +449,18 @@ export function createAgyFastServer(
     {
       name: "quick_outline",
       description:
-        "Fast symbol/section outline extractor for unknown large files (TS/JS/HTML/Vue/Svelte/CSS/Python/GDScript/Go/Rust/Java/MD/JSON/YAML; prefer 10-20 files/batch, max 40). Flat paths-only schema for mapping line ranges before parallel built-in read_file(StartLine, EndLine).",
+        "Fast symbol/section line-range outlines for large files (TS/JS/HTML/Vue/Svelte/CSS/Py/GDScript/Go/Rust/Java/MD/JSON/YAML; prefer 10-20, max 40) before parallel ranged read_file(StartLine, EndLine). Flat paths-only schema. Absolute cwd if no roots/list (Desktop 2.0 Hub). maxChars default 8500; 8800 UTF-8 bytes total.",
       inputSchema: {
         type: "object",
         properties: {
-          cwd: {
-            type: "string",
-            description: "Workspace root directory for relative paths (required if the host does not report MCP roots/list, e.g. Desktop 2.0 Hub).",
-          },
+          cwd: { type: "string" },
           paths: {
             type: "array",
             minItems: 1,
             maxItems: 40,
             items: { type: "string" },
-            description: "File paths to extract top-level symbol/section line ranges from (prefer 10-20 per batch; max 40).",
           },
-          maxChars: {
-            type: "integer",
-            minimum: 1000,
-            maximum: 8800,
-            description: "Total character cap (default 8500; hard inline UTF-8 cap <= 8800 bytes).",
-          },
+          maxChars: { type: "integer", minimum: 1000, maximum: 8800 },
         },
         required: ["paths"],
       },
@@ -503,53 +476,30 @@ export function createAgyFastServer(
     {
       name: "run_checks",
       description:
-        "Run multiple independent non-interactive shell commands concurrently under one check (build/typecheck/lint/test with outputMode 'compact', or diagnostic/audit scripts with outputMode 'full').",
+        `Batch >=2 independent non-interactive shell commands concurrently (for 1 lightweight command, prefer run_command). outputMode 'compact' (default) hides pass logs, keeps failures; 'full' keeps passing stdout. concurrency default 4. Per-cmd timeoutSec default 60; shared ${MCP_CALL_BUDGET_SEC}s budget (agy drops results at 180s; commands that cannot start are marked not run). Absolute cwd if no roots/list (Desktop 2.0 Hub); command.cwd overrides; name is label. maxChars default 8000; 8800 UTF-8 bytes total.`,
       inputSchema: {
         type: "object",
         properties: {
-          cwd: {
-            type: "string",
-            description: "Workspace root directory for relative paths (required if the host does not report MCP roots/list, e.g. Desktop 2.0 Hub).",
-          },
+          cwd: { type: "string" },
           commands: {
             type: "array",
             minItems: 1,
             maxItems: 12,
-            description: "Commands to execute concurrently.",
             items: {
               type: "object",
               properties: {
-                name: { type: "string", description: "Short label (e.g. 'typecheck')." },
-                command: { type: "string", description: "Shell command to run." },
-                cwd: { type: "string", description: "Optional working directory override." },
+                name: { type: "string" },
+                command: { type: "string" },
+                cwd: { type: "string" },
                 timeoutSec: { type: "integer", minimum: 1, maximum: MCP_CALL_BUDGET_SEC },
               },
               required: ["command"],
             },
           },
-          concurrency: {
-            type: "integer",
-            minimum: 1,
-            maximum: 8,
-            description: "Max parallel commands (default 4).",
-          },
-          timeoutSec: {
-            type: "integer",
-            minimum: 1,
-            maximum: MCP_CALL_BUDGET_SEC,
-            description: `Default per-command timeout in seconds (default 60). All commands of one call share a ${MCP_CALL_BUDGET_SEC}s budget because agy drops MCP results after 180s; commands that cannot start within it are reported as not run.`,
-          },
-          outputMode: {
-            type: "string",
-            enum: ["compact", "full"],
-            description: "'compact' hides verbose pass logs (default); 'full' preserves stdout for diagnostic/inspection commands.",
-          },
-          maxChars: {
-            type: "integer",
-            minimum: 500,
-            maximum: 8800,
-            description: "Total character cap (default 8000; hard inline UTF-8 cap <= 8800 bytes).",
-          },
+          concurrency: { type: "integer", minimum: 1, maximum: 8 },
+          timeoutSec: { type: "integer", minimum: 1, maximum: MCP_CALL_BUDGET_SEC },
+          outputMode: { type: "string", enum: ["compact", "full"] },
+          maxChars: { type: "integer", minimum: 500, maximum: 8800 },
         },
         required: ["commands"],
       },
@@ -565,6 +515,20 @@ export function createAgyFastServer(
 }
 
 function main(): void {
+  if (process.argv[2] === "--cli") {
+    void runAgyFastCli(process.argv.slice(3))
+      .then((code) => {
+        process.exitCode = code;
+      })
+      .catch((err) => {
+        process.stderr.write(
+          `Error: ${err instanceof Error ? err.message : String(err)}\n`,
+        );
+        process.exitCode = 1;
+      });
+    return;
+  }
+
   const server = createAgyFastServer();
   let flushing = false;
   const exitImmediately = () => {

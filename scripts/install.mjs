@@ -3,6 +3,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -49,9 +50,26 @@ const OPTIONAL_DOC_FILES = [
 ];
 
 function getHomeDir() {
-  return process.platform === "win32"
-    ? process.env.USERPROFILE || process.env.HOME || os.homedir()
-    : process.env.HOME || process.env.USERPROFILE || os.homedir();
+  if (process.platform === "win32") {
+    const driveHome =
+      process.env.HOMEDRIVE && process.env.HOMEPATH
+        ? `${process.env.HOMEDRIVE}${process.env.HOMEPATH}`
+        : "";
+    return process.env.USERPROFILE || driveHome || process.env.HOME || os.homedir();
+  }
+  return process.env.HOME || process.env.USERPROFILE || os.homedir();
+}
+
+function compareSemverSimple(a, b) {
+  const pa = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(String(a || "").trim());
+  const pb = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(String(b || "").trim());
+  if (!pa || !pb) return null;
+  for (let i = 1; i <= 3; i++) {
+    const na = Number.parseInt(pa[i], 10);
+    const nb = Number.parseInt(pb[i], 10);
+    if (na !== nb) return na > nb ? 1 : -1;
+  }
+  return 0;
 }
 
 function getGlobalPluginDir() {
@@ -125,6 +143,8 @@ function parseArgs(argv) {
   let quiet = false;
   let showHelp = false;
   let checkOnly = false;
+  let promptUpdate = false;
+  let skipVersion = "";
   let force = false;
   let autoUpdate = "";
   let intervalHours = null;
@@ -149,6 +169,16 @@ function parseArgs(argv) {
       quiet = true;
     } else if (a === "--check") {
       checkOnly = true;
+    } else if (a === "--prompt" || a === "--interactive" || a === "-i") {
+      promptUpdate = true;
+    } else if (a === "--skip-version") {
+      const next = args[i + 1];
+      if (!next || next.startsWith("-")) {
+        throw new Error(
+          "Missing version after --skip-version (expected e.g. 0.3.0 or 'none' to clear)",
+        );
+      }
+      skipVersion = args[++i].trim();
     } else if (a === "--force") {
       force = true;
     } else if (a === "--auto-update") {
@@ -250,6 +280,8 @@ function parseArgs(argv) {
     quiet,
     showHelp,
     checkOnly,
+    promptUpdate,
+    skipVersion,
     force,
     autoUpdate,
     intervalHours,
@@ -282,6 +314,8 @@ Options:
   --no-enable                   Skip running 'agy plugin enable agy-fast'
   --no-acp                      Skip syncing isolated T3 Code ACP / GEMINI_HOME profiles
   --check                       (update) Check for newer versions without applying
+  --prompt, --interactive, -i   (update) Check GitHub and ask before updating ([y]es/[n]o/[s]kip)
+  --skip-version <ver|none>     (update) Skip notifications/auto-updates for a version ('none' clears)
   --force                       (update) Re-apply even if already on the same version
   --auto-update auto|notify|off Configure background auto-update mode
   --interval <hours>            Configure background check interval in hours (default 4)
@@ -1242,14 +1276,53 @@ async function runDoctor(targetDir, quiet = false, doctorOpts = {}) {
     console.log(
       `  - PreInvocation: ${quotaHookCheck.preInvocationOk ? "OK" : "FAILED"} (${quotaHookCheck.preInvocationMs}ms; threshold: ${effectiveAutoCompactTokens === 0 ? "off" : effectiveAutoCompactTokens})`,
     );
-    const checkSummary = updaterState.availableVersion
-      ? `update available: v${updaterState.availableVersion}`
-      : updaterState.lastCheckAt
-        ? `last check: ${updaterState.lastCheckAt}`
-        : "not checked yet";
+    const availCmp = updaterState.availableVersion
+      ? compareSemverSimple(updaterState.availableVersion, installedVersion)
+      : null;
+    const hasFreshSemverUpdate =
+      Boolean(updaterState.availableVersion) && (availCmp === null || availCmp > 0);
+    const skipCmp = updaterState.skippedVersion
+      ? compareSemverSimple(updaterState.skippedVersion, installedVersion)
+      : null;
+    const hasActiveSkip =
+      Boolean(updaterState.skippedVersion) && (skipCmp === null || skipCmp > 0);
+    const hasMainUpdate =
+      !updaterState.availableVersion &&
+      Boolean(updaterState.availableCommit) &&
+      updaterState.availableCommit !== updaterState.lastAppliedCommit;
+
+    const checkParts = [];
+    if (
+      hasFreshSemverUpdate &&
+      (!hasActiveSkip || updaterState.availableVersion !== updaterState.skippedVersion)
+    ) {
+      checkParts.push(`update available: v${updaterState.availableVersion}`);
+    } else if (hasMainUpdate) {
+      checkParts.push(
+        `update available: ${updaterState.availableRef || "main"} (${String(updaterState.availableCommit).slice(0, 7)})`,
+      );
+    } else if (hasActiveSkip) {
+      checkParts.push(`skipped: v${updaterState.skippedVersion}`);
+    }
+    if (updaterState.lastCheckAt) {
+      checkParts.push(`last check: ${updaterState.lastCheckAt}`);
+    } else if (checkParts.length === 0) {
+      checkParts.push("not checked yet");
+    }
+    if (updaterState.lastError) {
+      const compactErr = String(updaterState.lastError).replace(/\s+/g, " ").trim().slice(0, 120);
+      checkParts.push(`last error: ${compactErr}`);
+    }
     console.log(
-      `  - Auto-update : ${effectiveAutoMode} (interval: ${effectiveInterval}h, channel: ${effectiveChannel}; ${checkSummary})`,
+      `  - Auto-update : ${effectiveAutoMode} (interval: ${effectiveInterval}h, channel: ${effectiveChannel}; ${checkParts.join("; ")})`,
     );
+    if (
+      (hasFreshSemverUpdate || hasMainUpdate) &&
+      (!hasActiveSkip || updaterState.availableVersion !== updaterState.skippedVersion) &&
+      updaterState.availableReleaseUrl
+    ) {
+      console.log(`      Release: ${updaterState.availableReleaseUrl}`);
+    }
     if (hasAgy) {
       console.log(
         `  - agy validate: ${report.agyValidated ? "PASSED (--strict)" : "FAILED"}`,
@@ -1478,6 +1551,43 @@ async function runConfig(opts) {
   }
 }
 
+function invokeUpdaterJson(updaterPath, args) {
+  const res = spawnSync(process.execPath, [updaterPath, ...args, "--json"], {
+    encoding: "utf8",
+    timeout: 60_000,
+    windowsHide: true,
+  });
+  let parsed = null;
+  try {
+    parsed = JSON.parse((res.stdout || "").trim());
+  } catch {
+    // Non-JSON error output handled below
+  }
+  if (!parsed) {
+    const detail = (res.stderr || res.stdout || res.error?.message || "updater failed").trim();
+    throw new Error(detail);
+  }
+  return parsed;
+}
+
+async function promptUpdateDecision(question) {
+  const rl = createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  try {
+    const raw = await rl.question(question);
+    const ans = raw.trim().toLowerCase();
+    if (ans === "y" || ans === "yes") return "yes";
+    if (ans === "s" || ans === "skip") return "skip";
+    return "no";
+  } catch {
+    return "no";
+  } finally {
+    rl.close();
+  }
+}
+
 async function runUpdate(opts) {
   checkNodeVersion();
   const resolvedDst = path.resolve(opts.targetDir);
@@ -1503,44 +1613,129 @@ async function runUpdate(opts) {
     await writeUpdaterConfigFile(patch);
   }
 
-  const installedUpdater = path.join(resolvedDst, "dist", "updater.mjs");
+  // Prefer the updater paired with this install.mjs so new CLI flags (e.g. --skip-version)
+  // are never sent to an older installed dist/updater.mjs that might ignore unknown flags.
   const repoUpdater = path.join(REPO_ROOT, "dist", "updater.mjs");
-  const updaterPath = (await pathExists(installedUpdater))
-    ? installedUpdater
-    : repoUpdater;
+  const installedUpdater = path.join(resolvedDst, "dist", "updater.mjs");
+  const updaterPath = (await pathExists(repoUpdater))
+    ? repoUpdater
+    : installedUpdater;
   if (!(await pathExists(updaterPath))) {
     throw new Error("Missing dist/updater.mjs. Run 'npm run build' or reinstall agy-fast.");
   }
 
-  const updaterArgs = [updaterPath, "--plugin-dir", resolvedDst, "--json"];
-  if (opts.checkOnly) updaterArgs.push("--check");
-  if (opts.force) updaterArgs.push("--force");
-  if (opts.channel) updaterArgs.push("--channel", opts.channel);
-  if (opts.repoUrl) updaterArgs.push("--repo", opts.repoUrl);
+  const runSkipCommand = (rawVer) => {
+    const lower = rawVer.toLowerCase();
+    const isClear = lower === "none" || lower === "clear";
+    const expectedStatus = isClear ? "cleared-skip" : "skipped-version";
+    const skipArgs = isClear
+      ? ["--plugin-dir", resolvedDst, "--clear-skip"]
+      : ["--plugin-dir", resolvedDst, "--skip-version", rawVer];
+    const skipParsed = invokeUpdaterJson(updaterPath, skipArgs);
+    if (skipParsed.status === "error") {
+      throw new Error(skipParsed.error || skipParsed.message || "Failed to update skip preference.");
+    }
+    if (skipParsed.status !== expectedStatus) {
+      throw new Error(
+        `Updater at ${updaterPath} does not support --skip-version (returned status: '${skipParsed.status}').`,
+      );
+    }
+    if (!opts.quiet) {
+      console.log(skipParsed.message);
+    }
+  };
 
-  const res = spawnSync(process.execPath, updaterArgs, {
-    encoding: "utf8",
-    timeout: 60_000,
-    windowsHide: true,
-  });
+  if (opts.skipVersion) {
+    runSkipCommand(opts.skipVersion);
+    return;
+  }
+
+  const baseArgs = ["--plugin-dir", resolvedDst];
+  if (opts.channel) baseArgs.push("--channel", opts.channel);
+  if (opts.repoUrl) baseArgs.push("--repo", opts.repoUrl);
+
+  const installerScriptPath = path.join(resolvedDst, "scripts", "install.mjs");
+  let parsed = null;
+
+  if (opts.promptUpdate && !opts.checkOnly) {
+    const checkArgs = [...baseArgs, "--check"];
+    if (opts.force) checkArgs.push("--force");
+    const checkParsed = invokeUpdaterJson(updaterPath, checkArgs);
+    if (checkParsed.status === "error") {
+      if (!opts.quiet) console.log(checkParsed.message);
+      throw new Error(checkParsed.error || checkParsed.message);
+    }
+    if (checkParsed.status !== "available") {
+      // Reuse checkParsed without returning early so --tool-loading and isolated ACP sync still run on up-to-date
+      parsed = checkParsed;
+    } else {
+      if (!opts.quiet) {
+        console.log(checkParsed.message);
+        if (checkParsed.releaseUrl) {
+          console.log(`Release notes: ${checkParsed.releaseUrl}`);
+        }
+        if (checkParsed.publishedAt) {
+          console.log(`Published at : ${checkParsed.publishedAt}`);
+        }
+      }
+
+      const targetLabel = checkParsed.latestVersion
+        ? `v${checkParsed.currentVersion} -> v${checkParsed.latestVersion}`
+        : `branch '${checkParsed.latestRef || "main"}'`;
+      const isManagedUpdate =
+        checkParsed.installKind === "copied" || checkParsed.installKind === "git-clone";
+      const question = isManagedUpdate
+        ? `Update agy-fast ${targetLabel} now? [y]es / [n]o / [s]kip this version (default: n): `
+        : `This install (${checkParsed.installKind}) requires manual git pull/build. Skip notifications for ${targetLabel}? [s]kip / [n]o (default: n): `;
+
+      const decision = await promptUpdateDecision(question);
+      if (decision === "skip") {
+        if (checkParsed.latestVersion) {
+          runSkipCommand(checkParsed.latestVersion);
+        } else if (!opts.quiet) {
+          console.log("Skipped for now (no semver version tag to persist).");
+        }
+        return;
+      }
+      if (decision !== "yes" || !isManagedUpdate) {
+        if (!opts.quiet) {
+          console.log(
+            isManagedUpdate
+              ? `Update declined. Run \`node "${installerScriptPath}" update\` whenever you are ready.`
+              : "No changes made.",
+          );
+        }
+        return;
+      }
+    }
+  }
+
+  if (!parsed) {
+    const updaterArgs = [...baseArgs];
+    if (opts.checkOnly) updaterArgs.push("--check");
+    if (opts.force) updaterArgs.push("--force");
+    parsed = invokeUpdaterJson(updaterPath, updaterArgs);
+  }
   if (opts.toolLoading && !opts.checkOnly) {
     await applyToolLoadingToCopiedPluginDir(resolvedDst, opts.toolLoading);
   }
 
-  let parsed = null;
-  try {
-    parsed = JSON.parse((res.stdout || "").trim());
-  } catch {
-    // Non-JSON error output handled below
-  }
-
-  if (!parsed) {
-    const detail = (res.stderr || res.stdout || res.error?.message || "updater failed").trim();
-    throw new Error(detail);
-  }
-
   if (!opts.quiet) {
     console.log(parsed.message);
+    if (opts.checkOnly && parsed.status === "available") {
+      if (parsed.releaseUrl) {
+        console.log(`Release notes: ${parsed.releaseUrl}`);
+      }
+      console.log(`  - Update now : node "${installerScriptPath}" update`);
+      if (parsed.latestVersion) {
+        console.log(
+          `  - Skip v${parsed.latestVersion}: node "${installerScriptPath}" update --skip-version ${parsed.latestVersion}`,
+        );
+      }
+      console.log(
+        `  - Notify-only: node "${installerScriptPath}" config --auto-update notify`,
+      );
+    }
   }
 
   if (parsed.status === "error") {

@@ -46,6 +46,26 @@ export async function readStdin(
     let totalBytes = 0;
     let settled = false;
 
+    const endsWithCloseBrace = (buf: Buffer): boolean => {
+      for (let i = buf.length - 1; i >= 0; i--) {
+        const b = buf[i]!;
+        if (b === 0x20 || b === 0x09 || b === 0x0a || b === 0x0d) continue;
+        return b === 0x7d;
+      }
+      return false;
+    };
+
+    const hasCompleteJsonObject = (): boolean => {
+      const text = Buffer.concat(chunks).toString("utf8").trim();
+      if (!text.startsWith("{") || !text.endsWith("}")) return false;
+      try {
+        const parsed = JSON.parse(text) as unknown;
+        return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed);
+      } catch {
+        return false;
+      }
+    };
+
     const onData = (chunk: Buffer | string) => {
       if (settled) return;
       const buf = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
@@ -61,6 +81,11 @@ export async function readStdin(
       } else {
         chunks.push(buf);
         totalBytes += buf.length;
+        // Return immediately once a complete JSON object arrives instead of waiting
+        // the full readStdin timeout when a host keeps stdin open without EOF.
+        if (endsWithCloseBrace(buf) && hasCompleteJsonObject()) {
+          finish();
+        }
       }
     };
 

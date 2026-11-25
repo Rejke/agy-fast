@@ -35,6 +35,24 @@ async function readStdin(timeoutMs = 1500, maxBytes = DEFAULT_MAX_STDIN_BYTES) {
     const chunks = [];
     let totalBytes = 0;
     let settled = false;
+    const endsWithCloseBrace = (buf) => {
+      for (let i = buf.length - 1; i >= 0; i--) {
+        const b = buf[i];
+        if (b === 32 || b === 9 || b === 10 || b === 13) continue;
+        return b === 125;
+      }
+      return false;
+    };
+    const hasCompleteJsonObject = () => {
+      const text = Buffer.concat(chunks).toString("utf8").trim();
+      if (!text.startsWith("{") || !text.endsWith("}")) return false;
+      try {
+        const parsed = JSON.parse(text);
+        return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed);
+      } catch {
+        return false;
+      }
+    };
     const onData = (chunk) => {
       if (settled) return;
       const buf = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
@@ -50,6 +68,9 @@ async function readStdin(timeoutMs = 1500, maxBytes = DEFAULT_MAX_STDIN_BYTES) {
       } else {
         chunks.push(buf);
         totalBytes += buf.length;
+        if (endsWithCloseBrace(buf) && hasCompleteJsonObject()) {
+          finish();
+        }
       }
     };
     const onEnd = () => finish();

@@ -2547,7 +2547,8 @@ function extractSymbolsFromLines(filePath: string, lines: string[]): SymbolEntry
 }
 
 export function extractSymbols(filePath: string, content: string): SymbolEntry[] {
-  const lines = content.replace(/\r\n/g, "\n").split("\n");
+  const normalized = content.startsWith("\uFEFF") ? content.slice(1) : content;
+  const lines = normalized.replace(/\r\n/g, "\n").split("\n");
   return extractSymbolsFromLines(filePath, lines);
 }
 

@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
+import os from "node:os";
 import path from "node:path";
 
 export interface ExecResult {
@@ -110,8 +111,9 @@ function getWindowsFallbackEncoding(): string | null {
 
 /**
  * Decodes child-process stdout/stderr buffers as UTF-8 first, falling back to
- * the Windows active console codepage (e.g. `gb18030` for CP936) only when
- * non-UTF-8 bytes are present.
+ * the Windows active console codepage (e.g. `gb18030` for CP936) per line when
+ * non-UTF-8 bytes are present so valid UTF-8 lines in mixed-encoding output do
+ * not turn into mojibake.
  */
 export function decodeProcessOutput(
   buf: Buffer,
@@ -129,16 +131,37 @@ export function decodeProcessOutput(
     if (!label || label === "utf-8") {
       return buf.toString("utf8");
     }
+    let decoder: TextDecoder;
     try {
-      let decoder = fallbackDecoderCache.get(label);
-      if (!decoder) {
+      const cached = fallbackDecoderCache.get(label);
+      if (cached) {
+        decoder = cached;
+      } else {
         decoder = new TextDecoder(label);
         fallbackDecoderCache.set(label, decoder);
       }
-      return decoder.decode(buf);
     } catch {
       return buf.toString("utf8");
     }
+    if (buf.indexOf(0x0a) === -1) {
+      return decoder.decode(buf);
+    }
+    const parts: string[] = [];
+    let offset = 0;
+    while (offset < buf.length) {
+      const nl = buf.indexOf(0x0a, offset);
+      const end = nl === -1 ? buf.length : nl + 1;
+      const line = buf.subarray(offset, end);
+      const lineCandidate =
+        truncated && end === buf.length ? stripTrailingIncompleteUtf8(line) : line;
+      try {
+        parts.push(strictUtf8Decoder.decode(lineCandidate));
+      } catch {
+        parts.push(decoder.decode(line));
+      }
+      offset = end;
+    }
+    return parts.join("");
   }
 }
 
@@ -149,8 +172,8 @@ export function decodeProcessOutput(
  */
 export const MCP_CALL_BUDGET_SEC = 170;
 
-function killChildTree(pid: number | undefined, detached: boolean): void {
-  if (!pid) return;
+function killChildTree(pid: number | undefined, detached: boolean): NodeJS.Timeout | null {
+  if (!pid) return null;
   if (process.platform === "win32") {
     const fallbackKill = (): void => {
       try {
@@ -171,7 +194,7 @@ function killChildTree(pid: number | undefined, detached: boolean): void {
     } catch {
       fallbackKill();
     }
-    return;
+    return null;
   }
 
   try {
@@ -183,7 +206,7 @@ function killChildTree(pid: number | undefined, detached: boolean): void {
   } catch {
     // Process may already have exited
   }
-  setTimeout(() => {
+  const sigkillTimer = setTimeout(() => {
     try {
       if (detached) {
         process.kill(-pid, "SIGKILL");
@@ -193,7 +216,9 @@ function killChildTree(pid: number | undefined, detached: boolean): void {
     } catch {
       // Already exited
     }
-  }, 400).unref();
+  }, 400);
+  sigkillTimer.unref();
+  return sigkillTimer;
 }
 
 export function execBinaryAsync(
@@ -390,7 +415,7 @@ function stripQuotedSpans(command: string, stripDoubleQuotes: boolean): string {
       continue;
     }
     if (quote === '"') {
-      if ((ch === "\\" || ch === "`") && next === '"') {
+      if ((ch === "\\" || ch === "`") && (next === ch || next === '"')) {
         i++;
         if (!stripDoubleQuotes) out += ch + next;
         continue;
@@ -469,11 +494,11 @@ export function formatPowerShellCommand(command: string): string {
         continue;
       }
       const afterQuote = trimmed.slice(idx + 1);
-      if (!/^\s+/.test(afterQuote)) {
+      const rest = afterQuote.replace(/^[ \t]+/, "");
+      if (rest.length === afterQuote.length || !rest || /^[\r\n]/.test(rest)) {
         return command;
       }
-      const rest = afterQuote.trimStart();
-      if (rest && !PS_NON_INVOCATION_TAIL_RE.test(rest)) {
+      if (!PS_NON_INVOCATION_TAIL_RE.test(rest)) {
         return `& ${trimmed}`;
       }
       return command;
@@ -568,10 +593,44 @@ export function resetWindowsShellCache(): void {
   pendingWindowsPowerShellProbe = null;
 }
 
+function hasDefinedEnvKey(
+  env: NodeJS.ProcessEnv,
+  key: string,
+  platform: NodeJS.Platform,
+): boolean {
+  if (env[key] !== undefined) return true;
+  if (platform !== "win32") return false;
+  const upper = key.toUpperCase();
+  for (const existing of Object.keys(env)) {
+    if (existing.toUpperCase() === upper && env[existing] !== undefined) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function withNonInteractiveGitEnv(
+  baseEnv: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): NodeJS.ProcessEnv {
+  const result: NodeJS.ProcessEnv = { ...baseEnv };
+  if (!hasDefinedEnvKey(baseEnv, "GIT_TERMINAL_PROMPT", platform)) {
+    result.GIT_TERMINAL_PROMPT = "0";
+  }
+  if (!hasDefinedEnvKey(baseEnv, "GCM_INTERACTIVE", platform)) {
+    result.GCM_INTERACTIVE = "never";
+  }
+  return result;
+}
+
 export async function runShellCommandAsync(
   command: string,
   options: ExecOptions,
 ): Promise<ExecResult> {
+  const effectiveOptions: ExecOptions = {
+    ...options,
+    env: withNonInteractiveGitEnv(options.env),
+  };
   if (process.platform === "win32") {
     const effectiveCommand = unwrapTrivialWindowsPowerShellCommand(command);
     if (needsPowerShellOnWindows(effectiveCommand)) {
@@ -582,13 +641,13 @@ export async function runShellCommandAsync(
           cachedWindowsPowerShellExecPath ?? psBin,
           ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", utf8Command],
           false,
-          options,
+          effectiveOptions,
         );
       }
     }
-    return spawnAndCollect(effectiveCommand, [], true, options);
+    return spawnAndCollect(effectiveCommand, [], true, effectiveOptions);
   }
-  return spawnAndCollect(command, [], true, options);
+  return spawnAndCollect(command, [], true, effectiveOptions);
 }
 
 function spawnAndCollect(
@@ -637,9 +696,10 @@ function spawnAndCollect(
     }
 
     let settleFallbackTimer: NodeJS.Timeout | null = null;
+    let sigkillTimer: NodeJS.Timeout | null = null;
     const timer = setTimeout(() => {
       timedOut = true;
-      killChildTree(child.pid, detached);
+      sigkillTimer = killChildTree(child.pid, detached);
       settleFallbackTimer = setTimeout(() => {
         child.stdout?.destroy();
         child.stderr?.destroy();
@@ -657,6 +717,7 @@ function spawnAndCollect(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (sigkillTimer) clearTimeout(sigkillTimer);
       if (settleFallbackTimer) clearTimeout(settleFallbackTimer);
       resolve({
         exitCode,
@@ -713,18 +774,37 @@ function spawnAndCollect(
 }
 
 let cachedRgAvailable: boolean | null = null;
+let pendingRgProbe: Promise<boolean> | null = null;
 
 export async function isRipgrepAvailable(): Promise<boolean> {
   if (cachedRgAvailable !== null) return cachedRgAvailable;
-  const res = await execBinaryAsync("rg", ["--version"], {
-    cwd: process.cwd(),
-    timeoutMs: 2000,
-    maxOutputBytes: 4096,
-  });
-  cachedRgAvailable = !res.error && res.exitCode === 0;
-  return cachedRgAvailable;
+  if (pendingRgProbe) return pendingRgProbe;
+
+  let probe: Promise<boolean> | null = null;
+  probe = (async () => {
+    try {
+      const res = await execBinaryAsync("rg", ["--version"], {
+        cwd: os.tmpdir(),
+        timeoutMs: 2000,
+        maxOutputBytes: 4096,
+      });
+      const available = !res.error && !res.timedOut && res.exitCode === 0;
+      if (!res.timedOut && pendingRgProbe === probe) {
+        cachedRgAvailable = available;
+      }
+      return available;
+    } finally {
+      if (pendingRgProbe === probe) {
+        pendingRgProbe = null;
+      }
+    }
+  })();
+
+  pendingRgProbe = probe;
+  return probe;
 }
 
 export function resetRipgrepCache(): void {
   cachedRgAvailable = null;
+  pendingRgProbe = null;
 }

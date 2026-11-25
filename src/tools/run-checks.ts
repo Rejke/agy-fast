@@ -13,6 +13,7 @@ import {
   computeWaterFillBudgets,
   fitSectionsToByteBudget,
   formatCompactCommandOutput,
+  formatExitFailureLabel,
   normalizeTerminalOutput,
   prepareCompactCommandOutput,
   renderPreparedCompactCommandOutput,
@@ -346,7 +347,7 @@ export async function runChecks(
           ? "TIMEOUT"
           : passed
             ? "PASS"
-            : `FAIL (exit ${result.exitCode ?? "err"})`;
+            : `FAIL (${formatExitFailureLabel(result.exitCode, result.signal)})`;
       const headerLine = `## [${badge}] ${spec.name} (${result.durationMs}ms)`;
       const fullPrefix = `${headerLine}\n$ ${spec.command}\n`;
       const combined = [
@@ -466,7 +467,7 @@ export async function runChecks(
         ? "ERROR"
         : result.timedOut
           ? "TIMEOUT"
-          : `FAIL (exit ${result.exitCode ?? "err"})`;
+          : `FAIL (${formatExitFailureLabel(result.exitCode, result.signal)})`;
       const badgeLine = `## [${badge} ${result.durationMs}ms] ${spec.name}`;
       const header = `${badgeLine}\n$ ${spec.command}\n`;
 
@@ -475,6 +476,7 @@ export async function runChecks(
         stdout: result.stdout,
         stderr: result.stderr,
         exitCode: result.exitCode,
+        signal: result.signal,
         timedOut: result.timedOut,
         error: result.error,
       });

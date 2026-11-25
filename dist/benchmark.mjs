@@ -17,6 +17,8 @@ var BLOCKING_TOOLS = /* @__PURE__ */ new Set([
   "manage_subagents",
   "wait_for_subagents"
 ]);
+var PLAN_MODE_TOOLS = /* @__PURE__ */ new Set(["enter_plan_mode", "exit_plan_mode"]);
+var PLAN_MODE_NOTICE_RE = /\[plan review(?: due)?\]|Plan mode is (?:on|off):/i;
 var READONLY_SIMPLE_CMDS = /* @__PURE__ */ new Set([
   "rg",
   "grep",
@@ -29,8 +31,16 @@ var READONLY_SIMPLE_CMDS = /* @__PURE__ */ new Set([
   "tail",
   "cat",
   "stat",
-  "file"
+  "file",
+  "get-childitem",
+  "gci",
+  "select-string",
+  "sls",
+  "get-content",
+  "gc",
+  "test-path"
 ]);
+var NULL_REDIRECT_TARGET_RE = /^(?:\/dev\/null|nul|\$null)$/i;
 var BENIGN_GLUE_CMDS = /* @__PURE__ */ new Set([
   "cd",
   "true",
@@ -321,7 +331,7 @@ function parseSafeShellSegments(cmd) {
         i += cmd[i + 2] === ">" ? 3 : 2;
         while (i < len && (cmd[i] === " " || cmd[i] === "	")) i += 1;
         const target = readWord();
-        if (!target || target.value !== "/dev/null") return null;
+        if (!target || !NULL_REDIRECT_TARGET_RE.test(target.value)) return null;
         continue;
       }
       return null;
@@ -352,7 +362,7 @@ function parseSafeShellSegments(cmd) {
       if (cmd[i] === ">" || cmd[i] === "|") i += 1;
       while (i < len && (cmd[i] === " " || cmd[i] === "	")) i += 1;
       const target = readWord();
-      if (!target || target.value !== "/dev/null") return null;
+      if (!target || !NULL_REDIRECT_TARGET_RE.test(target.value)) return null;
       continue;
     }
     if (op === "<") {
@@ -582,8 +592,11 @@ function classifyShellSegment(tokens) {
     if (idx >= tokens.length) return "other";
   }
   const cmdName = normalizeCommandName(tokens[idx].value);
+  const lowerCmd = cmdName.toLowerCase();
   const args = tokens.slice(idx + 1).map((t) => t.value);
-  if (READONLY_SIMPLE_CMDS.has(cmdName)) return "readonly_search";
+  if (READONLY_SIMPLE_CMDS.has(cmdName) || READONLY_SIMPLE_CMDS.has(lowerCmd)) {
+    return "readonly_search";
+  }
   if (cmdName === "find") {
     return args.some((a) => FIND_MUTATING_ARGS.has(a)) ? "other" : "readonly_search";
   }
@@ -633,6 +646,67 @@ function parseTranscriptJsonl(content) {
   }
   return steps;
 }
+var AGY_FAST_CLI_SEGMENT_RE = /^\s*(?:(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s;&|]+)\s+)*)(?:(?:"[^"]*[/\\]?node(?:\.exe)?"|'[^']*[/\\]?node(?:\.exe)?'|(?:[^\s"']*[/\\])?node(?:\.exe)?)\s+)(?:--\S+\s+)*(?:"[^"]*[/\\]?mcp-server\.mjs"|'[^']*[/\\]?mcp-server\.mjs'|(?:[^\s"']*[/\\])?mcp-server\.mjs)\s+--cli\s+(search|batch_search|outline|quick_outline|slice|slices|read_slices|edit|apply_edits|check|checks|run_checks)(?=\s|$)/i;
+var AGY_FAST_CLI_ALIAS_MAP = {
+  search: "batch_search",
+  batch_search: "batch_search",
+  outline: "quick_outline",
+  quick_outline: "quick_outline",
+  slice: "read_slices",
+  slices: "read_slices",
+  read_slices: "read_slices",
+  edit: "apply_edits",
+  apply_edits: "apply_edits",
+  check: "run_checks",
+  checks: "run_checks",
+  run_checks: "run_checks"
+};
+function splitUnquotedShellSegments(cmd) {
+  const out = [];
+  let start = 0;
+  let quote = null;
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i];
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === "\\" && i + 1 < cmd.length) {
+        i += 1;
+        continue;
+      }
+      if (ch === '"') quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (ch === "\\" && i + 1 < cmd.length) {
+      i += 1;
+      continue;
+    }
+    if (ch === ";" || ch === "\n" || ch === "|" || ch === "&") {
+      out.push(cmd.slice(start, i));
+      if ((ch === "|" || ch === "&") && cmd[i + 1] === ch) i += 1;
+      start = i + 1;
+    }
+  }
+  out.push(cmd.slice(start));
+  return out;
+}
+function extractAgyFastCliToolName(cmd) {
+  if (!cmd || !cmd.includes("--cli")) return null;
+  for (const seg of splitUnquotedShellSegments(cmd)) {
+    if (!seg.includes("--cli")) continue;
+    const m = AGY_FAST_CLI_SEGMENT_RE.exec(seg);
+    if (m?.[1]) {
+      return AGY_FAST_CLI_ALIAS_MAP[m[1].toLowerCase()] ?? null;
+    }
+  }
+  return null;
+}
 function extractAgyFastToolName(call) {
   const name = call.name ?? "";
   if (name === "call_mcp_tool") {
@@ -646,6 +720,9 @@ function extractAgyFastToolName(call) {
     const isFastServer = !serverName || /(?:^|[_:/-])fast$/i.test(serverName) || /agy-fast/i.test(serverName);
     const m2 = isFastServer ? AGY_FAST_TOOL_RE.exec(toolName) : null;
     return m2?.[1] ?? null;
+  }
+  if (name === "run_command") {
+    return extractAgyFastCliToolName(getCommandString(getCallArgs(call)));
   }
   const m = AGY_FAST_TOOL_RE.exec(name);
   return m?.[1] ?? null;
@@ -693,6 +770,10 @@ function maybeParseJsonValue(val) {
 }
 function getCanonicalToolName(call) {
   const name = call.name ?? "";
+  if (name === "run_command") {
+    const cliTool = extractAgyFastCliToolName(getCommandString(getCallArgs(call)));
+    return cliTool ? `agy-fast-cli:${cliTool}` : name;
+  }
   if (name !== "call_mcp_tool") return name;
   const callArgs = getCallArgs(call);
   const serverName = unwrapJsonString(
@@ -739,10 +820,16 @@ function hasCorruptedAgyFastArgs(call, fastTool) {
     if (Array.isArray(outlines) && outlines.some((p) => typeof p !== "string")) {
       return true;
     }
+    const lineRanges = maybeParseJsonValue(inner.lineRanges);
+    if (typeof lineRanges === "boolean" || lineRanges === null) return true;
+    if (Array.isArray(lineRanges) && lineRanges.some((lr) => typeof lr !== "string" || lr.trim().length === 0)) {
+      return true;
+    }
     const slices = maybeParseJsonValue(inner.slices);
     if (typeof slices === "boolean" || slices === null) return true;
     if (Array.isArray(slices)) {
       return slices.some((s) => {
+        if (typeof s === "string") return s.trim().length === 0;
         if (!isPlainRecord(s)) return true;
         if (s.ranges !== void 0) {
           const ranges = maybeParseJsonValue(s.ranges);
@@ -814,6 +901,52 @@ function filterStepsByTime(steps, sinceMs, untilMs) {
   fullSessionStepsMap.set(out, fullSessionStepsMap.get(steps) ?? steps);
   return out;
 }
+var HOST_METADATA_PREFIX_RE = /^(?:(?:Created At|Completed At):[^\r\n]*(?:\r?\n|$)|\r?\n)+/;
+var HOST_SPILL_FIRST_LINE_RE = /^(?:The output was large and was saved to:|(?:The (?:tool's |command's )?|Tool |Command )?output was truncated\b[^\r\n]*output\.txt)/i;
+var HOST_SPILL_MULTILINE_HEAD_RE = /^(?:The (?:tool's |command's )?|Tool |Command )?output was truncated\b/i;
+var AGY_BUDGET_TRUNCATED_RE = /(?:^|\n)\.\.\.\s*\[truncated:/;
+var AGY_MAX_RESULTS_CAPPED_RE = /(?:^|\n)\.\.\.\s*\[truncated(?: at \d+|; showing )/;
+var AGY_ERROR_HEAD_RE = /^(?:Encountered error in step execution|Error invalid tool call|Partial edit applied|Atomic edit aborted)\b/;
+var AGY_VERIFY_FAILED_RE = /(?:^|\n)Verify \[(?:FAIL\b|TIMEOUT\b|ERROR\b)/;
+function stripHostMetadataPrefix(resText) {
+  return resText.replace(HOST_METADATA_PREFIX_RE, "");
+}
+function isHostSpillBody(body) {
+  const headLines = body.split(/\r?\n/, 3);
+  const firstLine = headLines[0] ?? "";
+  if (HOST_SPILL_FIRST_LINE_RE.test(firstLine)) return true;
+  if (HOST_SPILL_MULTILINE_HEAD_RE.test(firstLine) && headLines.join("\n").includes("output.txt")) {
+    return true;
+  }
+  return false;
+}
+function getToolCallId(obj) {
+  for (const val of [obj.tool_call_id, obj.call_id, obj.id]) {
+    if (typeof val === "string" && val.trim().length > 0) {
+      return val.trim();
+    }
+  }
+  return null;
+}
+function pairToolCallResult(plannerStep, call, callIdx, totalCalls, genericSteps, genericById, genericByIndex, anyGenericHasToolCallId) {
+  const callId = getToolCallId(call);
+  if (callId !== null) {
+    const byId = genericById.get(callId);
+    if (byId) return byId;
+    if (anyGenericHasToolCallId) return void 0;
+  }
+  const plannerIdx = plannerStep.step_index;
+  if (typeof plannerIdx === "number" && Number.isInteger(plannerIdx)) {
+    if (genericByIndex.size > 0) {
+      return genericByIndex.get(plannerIdx + 1 + callIdx);
+    }
+    return void 0;
+  }
+  if (plannerIdx === void 0 && genericByIndex.size === 0 && genericSteps.length === totalCalls) {
+    return genericSteps[callIdx];
+  }
+  return void 0;
+}
 function analyzeTranscriptSessions(sessions) {
   let validSessions = 0;
   let sessionsWithAgyFast = 0;
@@ -839,15 +972,23 @@ function analyzeTranscriptSessions(sessions) {
     quick_outline: 0,
     run_checks: 0
   };
+  let agyEagerCalls = 0;
+  let agyLazyCalls = 0;
+  let agyCliCalls = 0;
   let mcpSpillCalls = 0;
   let agyTruncatedCalls = 0;
+  let agyMaxResultsCappedCalls = 0;
   let agyErrorCalls = 0;
+  let agyVerifyFailedCalls = 0;
+  let agyUnpairedResultCalls = 0;
   let agyCorruptedArgCalls = 0;
   let agyCorruptedArgWastedSec = 0;
   let agyCorruptedArgWastedOutTokens = 0;
   let swarmWorkerSessions = 0;
   let swarmWorkerSessionsWithAgyFast = 0;
   let multiMcpTurns = 0;
+  let multiSameMcpTurns = 0;
+  let multiDiffMcpTurns = 0;
   let multiRunCommandTurns = 0;
   let mediaLoadedCount = 0;
   let multimodalHighCtxTurns = 0;
@@ -858,6 +999,21 @@ function analyzeTranscriptSessions(sessions) {
   let cacheHitCount = 0;
   let turnGapsTotal = 0;
   let turnGapsOver60s = 0;
+  const cacheMissAttribution = {
+    total: 0,
+    planModeSwitch: 0,
+    modelSwitch: 0,
+    errorRetry: 0,
+    activeSlowGap: 0,
+    idleOrWaitGap: 0,
+    asyncWakeupFast: 0,
+    fastReplicaOrPrefixMiss: 0,
+    compactionResets: 0,
+    contextDilutionTurns: 0,
+    sustainedCollapseRuns: 0,
+    sustainedCollapseTurns: 0,
+    maxConsecutiveMisses: 0
+  };
   for (const steps of sessions) {
     if (steps.length === 0) continue;
     let hasPlanner = false;
@@ -867,6 +1023,24 @@ function analyzeTranscriptSessions(sessions) {
     let prevPlannerMs = null;
     let prevTurnHadUserInputBetween = false;
     let prevTurnHadCalls = false;
+    let prevCacheCtxTok = null;
+    let prevCachePlannerMs = null;
+    let prevCacheModel = null;
+    let prevCacheHadCalls = false;
+    let prevCacheHadBlockingTool = false;
+    let prevCacheHadPlanSwitch = false;
+    let betweenCacheUserInput = false;
+    let betweenCacheSysMsg = false;
+    let betweenCachePlanNotice = false;
+    let betweenCacheError = false;
+    let missStreak = 0;
+    const flushMissStreak = () => {
+      if (missStreak >= 3) {
+        cacheMissAttribution.sustainedCollapseRuns += 1;
+        cacheMissAttribution.sustainedCollapseTurns += missStreak;
+      }
+      missStreak = 0;
+    };
     for (let i = 0; i < steps.length; i++) {
       const step = steps[i];
       if (Array.isArray(step.media) && step.media.length > 0) {
@@ -876,13 +1050,22 @@ function analyzeTranscriptSessions(sessions) {
         prevSingleToolName = null;
         prevTurnHadUserInputBetween = true;
         prevTurnHadCalls = false;
+        betweenCacheUserInput = true;
         continue;
       }
       if (step.type === "SYSTEM_MESSAGE") {
+        betweenCacheSysMsg = true;
+        if (typeof step.content === "string" && PLAN_MODE_NOTICE_RE.test(step.content)) {
+          betweenCachePlanNotice = true;
+        }
         if (!prevTurnHadCalls) {
           prevSingleToolName = null;
           prevTurnHadUserInputBetween = true;
         }
+        continue;
+      }
+      if (step.type === "ERROR_MESSAGE") {
+        betweenCacheError = true;
         continue;
       }
       if (step.type !== "PLANNER_RESPONSE") continue;
@@ -904,7 +1087,17 @@ function analyzeTranscriptSessions(sessions) {
       }
       const inTok = Number(step.input_tokens ?? 0);
       const cacheTok = Number(step.cache_read_tokens ?? 0);
-      const ctxTok = (Number.isFinite(inTok) ? inTok : 0) + (Number.isFinite(cacheTok) ? cacheTok : 0);
+      const safeInTok = Number.isFinite(inTok) && inTok > 0 ? inTok : 0;
+      const safeCacheTok = Number.isFinite(cacheTok) && cacheTok > 0 ? cacheTok : 0;
+      const ctxTok = safeInTok + safeCacheTok;
+      const curModel = typeof step.model === "string" && step.model.trim() ? step.model.trim() : null;
+      const calls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
+      const hasBlockingTool = calls.some(
+        (c) => typeof c.name === "string" && BLOCKING_TOOLS.has(c.name)
+      );
+      const hasPlanModeTool = calls.some(
+        (c) => typeof c.name === "string" && PLAN_MODE_TOOLS.has(c.name)
+      );
       if (ctxTok > 0) {
         contextSum += ctxTok;
         contextCount += 1;
@@ -913,15 +1106,78 @@ function analyzeTranscriptSessions(sessions) {
           multimodalHighCtxTurns += 1;
         }
         if (ctxTok >= 1e4) {
-          cacheHitSum += cacheTok / ctxTok;
+          cacheHitSum += safeCacheTok / ctxTok;
           cacheHitCount += 1;
         }
+        if (prevCacheCtxTok !== null) {
+          const isCompacted = prevCacheCtxTok >= 3e4 && ctxTok < prevCacheCtxTok * 0.78;
+          if (isCompacted) {
+            flushMissStreak();
+            cacheMissAttribution.compactionResets += 1;
+          } else if (prevCacheCtxTok >= 1e4 && ctxTok >= 1e4) {
+            const hitRate = safeCacheTok / ctxTok;
+            const retainedRatio = safeCacheTok / prevCacheCtxTok;
+            if (hitRate < 0.5 && retainedRatio < 0.75) {
+              cacheMissAttribution.total += 1;
+              missStreak += 1;
+              if (missStreak > cacheMissAttribution.maxConsecutiveMisses) {
+                cacheMissAttribution.maxConsecutiveMisses = missStreak;
+              }
+              const rawGapSec = prevCachePlannerMs !== null && tPlanner !== null ? (tPlanner - prevCachePlannerMs) / 1e3 : null;
+              const validGapSec = rawGapSec !== null && rawGapSec >= 0 ? rawGapSec : null;
+              if (prevCacheHadPlanSwitch || betweenCachePlanNotice) {
+                cacheMissAttribution.planModeSwitch += 1;
+              } else if (prevCacheModel && curModel && prevCacheModel !== curModel) {
+                cacheMissAttribution.modelSwitch += 1;
+              } else if (betweenCacheError) {
+                cacheMissAttribution.errorRetry += 1;
+              } else if (validGapSec !== null && validGapSec >= 60) {
+                if (betweenCacheUserInput || !prevCacheHadCalls || prevCacheHadBlockingTool) {
+                  cacheMissAttribution.idleOrWaitGap += 1;
+                } else {
+                  cacheMissAttribution.activeSlowGap += 1;
+                }
+              } else if (!prevCacheHadCalls && (betweenCacheSysMsg || betweenCacheUserInput)) {
+                cacheMissAttribution.asyncWakeupFast += 1;
+              } else {
+                cacheMissAttribution.fastReplicaOrPrefixMiss += 1;
+              }
+            } else {
+              flushMissStreak();
+              if (hitRate < 0.5 && retainedRatio >= 0.75) {
+                cacheMissAttribution.contextDilutionTurns += 1;
+              }
+            }
+          } else {
+            flushMissStreak();
+          }
+        }
+        prevCacheCtxTok = ctxTok;
+        prevCachePlannerMs = tPlanner;
+        prevCacheModel = curModel;
+        prevCacheHadCalls = calls.length > 0;
+        prevCacheHadBlockingTool = hasBlockingTool;
+        prevCacheHadPlanSwitch = hasPlanModeTool;
+        betweenCacheUserInput = false;
+        betweenCacheSysMsg = false;
+        betweenCachePlanNotice = false;
+        betweenCacheError = step.status === "ERROR";
+      } else if (step.status === "ERROR") {
+        betweenCacheError = true;
+      } else {
+        flushMissStreak();
+        prevCacheCtxTok = null;
+        prevCachePlannerMs = null;
+        prevCacheModel = null;
+        prevCacheHadCalls = false;
+        prevCacheHadBlockingTool = false;
+        prevCacheHadPlanSwitch = false;
+        betweenCacheUserInput = false;
+        betweenCacheSysMsg = false;
+        betweenCachePlanNotice = false;
+        betweenCacheError = false;
       }
-      const calls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
-      const hasBlockingTool = calls.some(
-        (c) => typeof c.name === "string" && BLOCKING_TOOLS.has(c.name)
-      );
-      const agyCallIndices = [];
+      const agyCallsThisTurn = [];
       let turnCorruptedAgyCalls = 0;
       if (calls.length > 0) {
         toolTurns += 1;
@@ -937,6 +1193,7 @@ function analyzeTranscriptSessions(sessions) {
           prevSingleToolName = null;
         }
         const editedFilesThisTurn = /* @__PURE__ */ new Map();
+        const agyToolsThisTurn = /* @__PURE__ */ new Map();
         let mcpCallsThisTurn = 0;
         let runCmdCallsThisTurn = 0;
         for (let callIdx = 0; callIdx < calls.length; callIdx++) {
@@ -952,19 +1209,38 @@ function analyzeTranscriptSessions(sessions) {
               if (cnt > 1) redundantSameTurnEditFileCalls += 1;
             }
           } else if (name === "run_command") {
-            runCommandCalls += 1;
-            runCmdCallsThisTurn += 1;
             const cmd = getCommandString(callArgs);
-            if (isReadonlySearchShell(cmd)) {
-              readonlySearchRunCommandCalls += 1;
+            const cliFastTool = extractAgyFastCliToolName(cmd);
+            if (cliFastTool && agyFastToolCalls[cliFastTool] !== void 0) {
+              agyFastToolCalls[cliFastTool] = (agyFastToolCalls[cliFastTool] ?? 0) + 1;
+              agyCliCalls += 1;
+              sessionFastCalls += 1;
+              mcpCallsThisTurn += 1;
+              agyToolsThisTurn.set(
+                cliFastTool,
+                (agyToolsThisTurn.get(cliFastTool) ?? 0) + 1
+              );
+              agyCallsThisTurn.push({ callIdx, call, fastTool: cliFastTool });
+            } else {
+              runCommandCalls += 1;
+              runCmdCallsThisTurn += 1;
+              if (isReadonlySearchShell(cmd)) {
+                readonlySearchRunCommandCalls += 1;
+              }
             }
           } else {
             const fastTool = extractAgyFastToolName(call);
             if (fastTool && agyFastToolCalls[fastTool] !== void 0) {
               agyFastToolCalls[fastTool] = (agyFastToolCalls[fastTool] ?? 0) + 1;
+              if (name === "call_mcp_tool") {
+                agyLazyCalls += 1;
+              } else {
+                agyEagerCalls += 1;
+              }
               sessionFastCalls += 1;
               mcpCallsThisTurn += 1;
-              agyCallIndices.push(callIdx);
+              agyToolsThisTurn.set(fastTool, (agyToolsThisTurn.get(fastTool) ?? 0) + 1);
+              agyCallsThisTurn.push({ callIdx, call, fastTool });
               if (hasCorruptedAgyFastArgs(call, fastTool)) {
                 agyCorruptedArgCalls += 1;
                 turnCorruptedAgyCalls += 1;
@@ -972,7 +1248,21 @@ function analyzeTranscriptSessions(sessions) {
             }
           }
         }
-        if (mcpCallsThisTurn >= 2) multiMcpTurns += 1;
+        if (mcpCallsThisTurn >= 2) {
+          multiMcpTurns += 1;
+          let hasSameToolDuplicate = false;
+          for (const cnt of agyToolsThisTurn.values()) {
+            if (cnt >= 2) {
+              hasSameToolDuplicate = true;
+              break;
+            }
+          }
+          if (hasSameToolDuplicate) {
+            multiSameMcpTurns += 1;
+          } else {
+            multiDiffMcpTurns += 1;
+          }
+        }
         if (runCmdCallsThisTurn >= 2) multiRunCommandTurns += 1;
       } else {
         prevSingleToolName = null;
@@ -995,25 +1285,92 @@ function analyzeTranscriptSessions(sessions) {
           if (gt !== null) genericTimes.push(gt);
         }
       }
-      for (const callIdx of agyCallIndices) {
-        const resStep = genericSteps[callIdx];
-        if (!resStep) continue;
-        const resText = typeof resStep.content === "string" ? resStep.content : "";
-        const isSpill = resText.includes("The output was large and was saved to:") || /output was truncated/i.test(resText) && resText.includes("output.txt");
-        if (isSpill) {
-          mcpSpillCalls += 1;
-        } else if (resText.includes("[truncated:") || resText.includes("[truncated at ") || resText.includes("[truncated; showing ")) {
-          agyTruncatedCalls += 1;
+      if (agyCallsThisTurn.length > 0) {
+        const callIds = /* @__PURE__ */ new Set();
+        for (const c of calls) {
+          const cid = getToolCallId(c);
+          if (cid !== null) callIds.add(cid);
         }
-        if (resStep.status === "ERROR" || resText.includes("Encountered error in step execution") || resText.includes("Partial edit applied") || resText.includes("Atomic edit aborted")) {
-          agyErrorCalls += 1;
+        const genericById = /* @__PURE__ */ new Map();
+        const genericByIndex = /* @__PURE__ */ new Map();
+        let anyGenericHasExplicitCallId = false;
+        let anyGenericMatchesCallId = false;
+        for (const gs of genericSteps) {
+          if (typeof gs.tool_call_id === "string" && gs.tool_call_id.trim().length > 0 || typeof gs.call_id === "string" && gs.call_id.trim().length > 0) {
+            anyGenericHasExplicitCallId = true;
+          }
+          const gid = getToolCallId(gs);
+          if (gid !== null) {
+            if (!genericById.has(gid)) genericById.set(gid, gs);
+            if (callIds.has(gid)) anyGenericMatchesCallId = true;
+          }
+          if (typeof gs.step_index === "number" && Number.isInteger(gs.step_index)) {
+            if (!genericByIndex.has(gs.step_index)) {
+              genericByIndex.set(gs.step_index, gs);
+            }
+          }
+        }
+        const anyGenericHasToolCallId = anyGenericHasExplicitCallId || anyGenericMatchesCallId;
+        for (const { callIdx, call, fastTool } of agyCallsThisTurn) {
+          const resStep = pairToolCallResult(
+            step,
+            call,
+            callIdx,
+            calls.length,
+            genericSteps,
+            genericById,
+            genericByIndex,
+            anyGenericHasToolCallId
+          );
+          if (!resStep) {
+            agyUnpairedResultCalls += 1;
+            continue;
+          }
+          const resText = typeof resStep.content === "string" ? resStep.content : "";
+          const rawBody = stripHostMetadataPrefix(resText);
+          let cliExitCode = null;
+          let body = rawBody;
+          if ((call.name ?? "") === "run_command") {
+            const exitMatch = /^Command exited with code (\d+)\.\s*(?:\r?\n)+(?:Command output:\r?\n)?/.exec(
+              rawBody
+            );
+            if (exitMatch) {
+              cliExitCode = Number.parseInt(exitMatch[1], 10);
+              body = rawBody.slice(exitMatch[0].length);
+            }
+          }
+          const isSpill = isHostSpillBody(body);
+          if (isSpill) {
+            mcpSpillCalls += 1;
+          } else {
+            if (AGY_BUDGET_TRUNCATED_RE.test(body)) {
+              agyTruncatedCalls += 1;
+            }
+            if (AGY_MAX_RESULTS_CAPPED_RE.test(body)) {
+              agyMaxResultsCappedCalls += 1;
+            }
+          }
+          const isVerifyFailure = fastTool === "apply_edits" && !isSpill && AGY_VERIFY_FAILED_RE.test(body);
+          const isNormalFailedCheckRun = fastTool === "run_checks" && cliExitCode !== null && cliExitCode !== 0 && /^Checks:\s+\d+\/\d+\s+passed,/.test(body);
+          const isCliError = cliExitCode !== null && cliExitCode !== 0 && !isVerifyFailure && !isNormalFailedCheckRun;
+          const isError = resStep.status === "ERROR" || resStep.status === "INVALID" || isCliError || AGY_ERROR_HEAD_RE.test(body) || (call.name ?? "") === "run_command" && !isVerifyFailure && !isNormalFailedCheckRun && /^Error:/.test(body);
+          if (isError) {
+            agyErrorCalls += 1;
+          } else if (isVerifyFailure) {
+            agyVerifyFailedCalls += 1;
+          }
         }
       }
       let turnActiveSec = 0;
       if (tPlanner !== null && !hasBlockingTool) {
         if (genericTimes.length > 0) {
-          const firstGeneric = genericTimes[0];
-          const lastGeneric = genericTimes[genericTimes.length - 1];
+          let firstGeneric = genericTimes[0];
+          let lastGeneric = genericTimes[0];
+          for (let k = 1; k < genericTimes.length; k++) {
+            const gt = genericTimes[k];
+            if (gt < firstGeneric) firstGeneric = gt;
+            if (gt > lastGeneric) lastGeneric = gt;
+          }
           const llmSec = Math.max(0, (firstGeneric - tPlanner) / 1e3);
           const spreadSec = Math.max(0, (lastGeneric - firstGeneric) / 1e3);
           const execSec = nextPlannerMs !== null ? Math.max(0, (nextPlannerMs - lastGeneric) / 1e3) : 0;
@@ -1048,6 +1405,7 @@ function analyzeTranscriptSessions(sessions) {
         }
       }
     }
+    flushMissStreak();
     if (hasPlanner) {
       validSessions += 1;
       mediaLoadedCount += sessionMediaCount;
@@ -1079,22 +1437,31 @@ function analyzeTranscriptSessions(sessions) {
     runCommandCalls,
     readonlySearchRunCommandCalls,
     agyFastToolCalls,
+    agyEagerCalls,
+    agyLazyCalls,
+    agyCliCalls,
     mcpSpillCalls,
     agyTruncatedCalls,
+    agyMaxResultsCappedCalls,
     agyErrorCalls,
+    agyVerifyFailedCalls,
+    agyUnpairedResultCalls,
     agyCorruptedArgCalls,
     agyCorruptedArgWastedSec: round2(agyCorruptedArgWastedSec),
     agyCorruptedArgWastedOutTokens,
     swarmWorkerSessions,
     swarmWorkerSessionsWithAgyFast,
     multiMcpTurns,
+    multiSameMcpTurns,
+    multiDiffMcpTurns,
     multiRunCommandTurns,
     mediaLoadedCount,
     multimodalHighCtxTurns,
     avgContextTokens: contextCount > 0 ? Math.round(contextSum / contextCount) : 0,
     over150kContextRatio: contextCount > 0 ? over150kCount / contextCount : 0,
     avgCacheHitRate: cacheHitCount > 0 ? cacheHitSum / cacheHitCount : 0,
-    over60sGapRatio: turnGapsTotal > 0 ? turnGapsOver60s / turnGapsTotal : 0
+    over60sGapRatio: turnGapsTotal > 0 ? turnGapsOver60s / turnGapsTotal : 0,
+    cacheMissAttribution
   };
 }
 function round2(n) {
@@ -1331,17 +1698,38 @@ function formatMetricsMarkdown(m) {
     `| Turns >= 150k context | ${pct(m.over150kContextRatio)} |`,
     `| Average Prompt Cache hit rate | ${pct(m.avgCacheHitRate)} |`,
     `| Turn gaps > 60s | ${pct(m.over60sGapRatio)} |`,
-    `| agy-fast tool calls | ${fastTotal} (search:${m.agyFastToolCalls.batch_search}, edit:${m.agyFastToolCalls.apply_edits}, slice:${m.agyFastToolCalls.read_slices}, outline:${m.agyFastToolCalls.quick_outline ?? 0}, check:${m.agyFastToolCalls.run_checks}) |`,
-    `| agy-fast health (spills / truncs / errs) | ${m.mcpSpillCalls} / ${m.agyTruncatedCalls} / ${m.agyErrorCalls} |`,
+    ...formatCacheMissRows(m.cacheMissAttribution),
+    `| agy-fast tool calls | ${fastTotal} (search:${m.agyFastToolCalls.batch_search}, edit:${m.agyFastToolCalls.apply_edits}, slice:${m.agyFastToolCalls.read_slices}, outline:${m.agyFastToolCalls.quick_outline ?? 0}, check:${m.agyFastToolCalls.run_checks}; eager:${m.agyEagerCalls}, lazy:${m.agyLazyCalls}${m.agyCliCalls > 0 ? `, cli:${m.agyCliCalls}` : ""}) |`,
+    `| agy-fast health (spills / budget-truncs / max-results / errs / verify-fails) | ${m.mcpSpillCalls} / ${m.agyTruncatedCalls} / ${m.agyMaxResultsCappedCalls} / ${m.agyErrorCalls} / ${m.agyVerifyFailedCalls} |`,
+    ...m.agyUnpairedResultCalls > 0 ? [`| agy-fast unpaired results | ${m.agyUnpairedResultCalls} |`] : [],
     ...m.agyCorruptedArgCalls > 0 ? [
       `| agy-fast corrupted-arg calls | ${m.agyCorruptedArgCalls} (wasted ${m.agyCorruptedArgWastedSec.toFixed(1)}s, ${m.agyCorruptedArgWastedOutTokens.toLocaleString("en-US")} out tok) |`
     ] : [],
     ...m.swarmWorkerSessions > 0 ? [
       `| Swarm worker coverage | ${m.swarmWorkerSessionsWithAgyFast}/${m.swarmWorkerSessions} using agy-fast |`
     ] : [],
-    `| Parallel batching leaks (multi-MCP / multi-run_command turns) | ${m.multiMcpTurns} / ${m.multiRunCommandTurns} |`,
+    `| Parallel batching leaks (same-MCP (diff-MCP) / multi-run_command) | ${m.multiSameMcpTurns} (${m.multiDiffMcpTurns}) / ${m.multiRunCommandTurns} |`,
     `| Multimodal >=180k turns (media loaded) | ${m.multimodalHighCtxTurns} (${m.mediaLoadedCount} media) |`
   ].join("\n");
+}
+function formatCacheMissRows(a) {
+  const rows = [];
+  if (a.total > 0 || a.compactionResets > 0 || a.contextDilutionTurns > 0) {
+    const extras = [];
+    if (a.modelSwitch > 0) extras.push(`model:${a.modelSwitch}`);
+    if (a.compactionResets > 0) extras.push(`compact:${a.compactionResets}`);
+    if (a.contextDilutionTurns > 0) extras.push(`dilute:${a.contextDilutionTurns}`);
+    const extraSuffix = extras.length > 0 ? `; ${extras.join(", ")}` : "";
+    rows.push(
+      `| Prompt Cache misses (active>=60s / idle>=60s / plan / err / async<60s / fast-other) | ${a.total} (${a.activeSlowGap} / ${a.idleOrWaitGap} / ${a.planModeSwitch} / ${a.errorRetry} / ${a.asyncWakeupFast} / ${a.fastReplicaOrPrefixMiss}${extraSuffix}) |`
+    );
+  }
+  if (a.sustainedCollapseRuns > 0) {
+    rows.push(
+      `| Sustained cache collapse (>=3 consecutive misses) | ${a.sustainedCollapseRuns} runs (${a.sustainedCollapseTurns} turns, max streak: ${a.maxConsecutiveMisses}) |`
+    );
+  }
+  return rows;
 }
 function formatDelta(before, after) {
   if (before === 0) return after === 0 ? "0.0%" : "n/a";
@@ -1364,8 +1752,19 @@ function formatCompareMarkdown(before, after) {
     `| Average context (tokens) | ${before.avgContextTokens} | ${after.avgContextTokens} | ${formatDelta(before.avgContextTokens, after.avgContextTokens)} |`,
     `| Prompt Cache hit rate | ${pct(before.avgCacheHitRate)} | ${pct(after.avgCacheHitRate)} | ${formatDelta(before.avgCacheHitRate, after.avgCacheHitRate)} |`,
     `| Turn gaps > 60s | ${pct(before.over60sGapRatio)} | ${pct(after.over60sGapRatio)} | ${formatDelta(before.over60sGapRatio, after.over60sGapRatio)} |`,
+    ...before.cacheMissAttribution.total > 0 || after.cacheMissAttribution.total > 0 ? [
+      `| Prompt Cache misses (non-compact) | ${before.cacheMissAttribution.total} | ${after.cacheMissAttribution.total} | ${formatDelta(before.cacheMissAttribution.total, after.cacheMissAttribution.total)} |`
+    ] : [],
+    ...before.cacheMissAttribution.sustainedCollapseRuns > 0 || after.cacheMissAttribution.sustainedCollapseRuns > 0 ? [
+      `| Sustained cache collapse (>=3 misses) | ${before.cacheMissAttribution.sustainedCollapseRuns} runs (${before.cacheMissAttribution.sustainedCollapseTurns}t) | ${after.cacheMissAttribution.sustainedCollapseRuns} runs (${after.cacheMissAttribution.sustainedCollapseTurns}t) | - |`
+    ] : [],
     `| agy-fast MCP spills (output.txt) | ${before.mcpSpillCalls} | ${after.mcpSpillCalls} | ${formatDelta(before.mcpSpillCalls, after.mcpSpillCalls)} |`,
-    `| agy-fast internal truncations | ${before.agyTruncatedCalls} | ${after.agyTruncatedCalls} | ${formatDelta(before.agyTruncatedCalls, after.agyTruncatedCalls)} |`,
+    `| agy-fast budget truncations | ${before.agyTruncatedCalls} | ${after.agyTruncatedCalls} | ${formatDelta(before.agyTruncatedCalls, after.agyTruncatedCalls)} |`,
+    `| agy-fast maxResults caps | ${before.agyMaxResultsCappedCalls} | ${after.agyMaxResultsCappedCalls} | ${formatDelta(before.agyMaxResultsCappedCalls, after.agyMaxResultsCappedCalls)} |`,
+    `| agy-fast tool errors | ${before.agyErrorCalls} | ${after.agyErrorCalls} | ${formatDelta(before.agyErrorCalls, after.agyErrorCalls)} |`,
+    `| agy-fast verify failures | ${before.agyVerifyFailedCalls} | ${after.agyVerifyFailedCalls} | ${formatDelta(before.agyVerifyFailedCalls, after.agyVerifyFailedCalls)} |`,
+    before.agyCliCalls > 0 || after.agyCliCalls > 0 ? `| agy-fast dispatch (eager / lazy / cli) | ${before.agyEagerCalls} / ${before.agyLazyCalls} / ${before.agyCliCalls} | ${after.agyEagerCalls} / ${after.agyLazyCalls} / ${after.agyCliCalls} | - |` : `| agy-fast dispatch (eager / lazy) | ${before.agyEagerCalls} / ${before.agyLazyCalls} | ${after.agyEagerCalls} / ${after.agyLazyCalls} | - |`,
+    `| Parallel leaks (same-MCP (diff-MCP) / multi-run_command) | ${before.multiSameMcpTurns} (${before.multiDiffMcpTurns}) / ${before.multiRunCommandTurns} | ${after.multiSameMcpTurns} (${after.multiDiffMcpTurns}) / ${after.multiRunCommandTurns} | - |`,
     `| Multimodal >=180k turns | ${before.multimodalHighCtxTurns} | ${after.multimodalHighCtxTurns} | ${formatDelta(before.multimodalHighCtxTurns, after.multimodalHighCtxTurns)} |`
   ].join("\n");
 }
@@ -1392,15 +1791,24 @@ function formatUsageSplitMarkdown(split) {
     `| Average context (tokens) | ${overall.avgContextTokens.toLocaleString("en-US")} | ${wo.avgContextTokens.toLocaleString("en-US")} | ${wf.avgContextTokens.toLocaleString("en-US")} | ${formatDelta(wo.avgContextTokens, wf.avgContextTokens)} |`,
     `| Prompt Cache hit rate | ${pct(overall.avgCacheHitRate)} | ${pct(wo.avgCacheHitRate)} | ${pct(wf.avgCacheHitRate)} | ${formatDelta(wo.avgCacheHitRate, wf.avgCacheHitRate)} |`,
     `| Turn gaps > 60s | ${pct(overall.over60sGapRatio)} | ${pct(wo.over60sGapRatio)} | ${pct(wf.over60sGapRatio)} | ${formatDelta(wo.over60sGapRatio, wf.over60sGapRatio)} |`,
-    `| agy-fast tool calls | ${fastSum(overall)} | 0 | ${fastSum(wf)} (search:${wf.agyFastToolCalls.batch_search}, edit:${wf.agyFastToolCalls.apply_edits}, slice:${wf.agyFastToolCalls.read_slices}, outline:${wf.agyFastToolCalls.quick_outline ?? 0}, check:${wf.agyFastToolCalls.run_checks}) | - |`,
-    `| agy-fast health (spills / truncs / errs) | ${overall.mcpSpillCalls} / ${overall.agyTruncatedCalls} / ${overall.agyErrorCalls} | 0 / 0 / 0 | ${wf.mcpSpillCalls} / ${wf.agyTruncatedCalls} / ${wf.agyErrorCalls} | - |`,
+    ...overall.cacheMissAttribution.total > 0 ? [
+      `| Prompt Cache misses (non-compact) | ${overall.cacheMissAttribution.total} | ${wo.cacheMissAttribution.total} | ${wf.cacheMissAttribution.total} | ${formatDelta(wo.cacheMissAttribution.total, wf.cacheMissAttribution.total)} |`
+    ] : [],
+    ...overall.cacheMissAttribution.sustainedCollapseRuns > 0 ? [
+      `| Sustained cache collapse (>=3 misses) | ${overall.cacheMissAttribution.sustainedCollapseRuns} runs (${overall.cacheMissAttribution.sustainedCollapseTurns}t) | ${wo.cacheMissAttribution.sustainedCollapseRuns} runs (${wo.cacheMissAttribution.sustainedCollapseTurns}t) | ${wf.cacheMissAttribution.sustainedCollapseRuns} runs (${wf.cacheMissAttribution.sustainedCollapseTurns}t) | - |`
+    ] : [],
+    `| agy-fast tool calls | ${fastSum(overall)} (eager:${overall.agyEagerCalls}, lazy:${overall.agyLazyCalls}${overall.agyCliCalls > 0 ? `, cli:${overall.agyCliCalls}` : ""}) | 0 | ${fastSum(wf)} (search:${wf.agyFastToolCalls.batch_search}, edit:${wf.agyFastToolCalls.apply_edits}, slice:${wf.agyFastToolCalls.read_slices}, outline:${wf.agyFastToolCalls.quick_outline ?? 0}, check:${wf.agyFastToolCalls.run_checks}; eager:${wf.agyEagerCalls}, lazy:${wf.agyLazyCalls}${wf.agyCliCalls > 0 ? `, cli:${wf.agyCliCalls}` : ""}) | - |`,
+    `| agy-fast health (spills / budget-truncs / max-results / errs / verify-fails) | ${overall.mcpSpillCalls} / ${overall.agyTruncatedCalls} / ${overall.agyMaxResultsCappedCalls} / ${overall.agyErrorCalls} / ${overall.agyVerifyFailedCalls} | 0 / 0 / 0 / 0 / 0 | ${wf.mcpSpillCalls} / ${wf.agyTruncatedCalls} / ${wf.agyMaxResultsCappedCalls} / ${wf.agyErrorCalls} / ${wf.agyVerifyFailedCalls} | - |`,
+    ...overall.agyUnpairedResultCalls > 0 ? [
+      `| agy-fast unpaired results | ${overall.agyUnpairedResultCalls} | 0 | ${wf.agyUnpairedResultCalls} | - |`
+    ] : [],
     ...overall.agyCorruptedArgCalls > 0 ? [
       `| agy-fast corrupted-arg calls | ${overall.agyCorruptedArgCalls} (${overall.agyCorruptedArgWastedSec.toFixed(1)}s) | 0 | ${wf.agyCorruptedArgCalls} (${wf.agyCorruptedArgWastedSec.toFixed(1)}s) | - |`
     ] : [],
     ...overall.swarmWorkerSessions > 0 ? [
       `| Swarm worker sessions | ${overall.swarmWorkerSessions} | ${wo.swarmWorkerSessions} | ${wf.swarmWorkerSessions} | - |`
     ] : [],
-    `| Parallel leaks (multi-MCP / multi-run_command) | ${overall.multiMcpTurns} / ${overall.multiRunCommandTurns} | ${wo.multiMcpTurns} / ${wo.multiRunCommandTurns} | ${wf.multiMcpTurns} / ${wf.multiRunCommandTurns} | - |`,
+    `| Parallel leaks (same-MCP (diff-MCP) / multi-run_command) | ${overall.multiSameMcpTurns} (${overall.multiDiffMcpTurns}) / ${overall.multiRunCommandTurns} | ${wo.multiSameMcpTurns} (${wo.multiDiffMcpTurns}) / ${wo.multiRunCommandTurns} | ${wf.multiSameMcpTurns} (${wf.multiDiffMcpTurns}) / ${wf.multiRunCommandTurns} | - |`,
     `| Multimodal >=180k turns (media) | ${overall.multimodalHighCtxTurns} (${overall.mediaLoadedCount}) | ${wo.multimodalHighCtxTurns} (${wo.mediaLoadedCount}) | ${wf.multimodalHighCtxTurns} (${wf.mediaLoadedCount}) | - |`
   ].join("\n");
 }

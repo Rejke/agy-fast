@@ -5,6 +5,108 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ---
 
+## [0.3.1] - 2026-11-24
+
+### Added
+
+- **Interactive release updates, version skipping, and no-git GitHub API fallback (`src/updater-core.ts`, `scripts/install.mjs`, `src/session-start.ts`, #58, thanks `@wathing-wind`)**
+  - Added interactive confirmation (`update --prompt`), persistent `--skip-version <ver|none>`, compact `<=185B` `SessionStart` update notices, and hardened GitHub Releases API fallback for environments without `git` (with strict zero-tag fallback guards, safe GitHub URL sanitization, and stale-state cleanup in `doctor`).
+- **Fatal signal, OOM, and Windows crash diagnostics (`src/utils/output-filter.ts`, `src/tools/run-checks.ts`, `src/tools/apply-edits.ts`, #46, thanks `@wathing-wind`)**
+  - Surfaced fatal POSIX signal names (`SIGKILL - possible OOM`, `SIGSEGV - segmentation fault`, `SIGABRT - process aborted`, `SIGTERM`), portable shell `128+N` exit codes (`134`/`137`/`139`), and Windows NTSTATUS crash codes (`0xC0000005` / `0xC00000FD` / `0xC0000409`) across `run_checks` and `apply_edits` inline `verify` while keeping timeout/spawn-error precedence and `--cli` non-zero exit detection intact.
+- **Expanded macOS & Node.js 20/22/24 CI coverage (`.github/workflows/ci.yml`, #37, thanks `@0x7b1e`)**
+  - Added `macos-latest` and Node 20/22/24 verification jobs plus `sh -n install.sh` POSIX syntax checks to CI.
+
+### Performance & Reliability
+
+- **Compact MCP tool schemas `<=1280B` to prevent eager tool eviction (`src/mcp-server.ts`, #57, thanks `@kf953741`)**
+  - Compacted tool descriptions and parameter schemas within tight host per-tool budgets and removed array-mode JSON-string hints so Antigravity keeps all 5 tools eagerly loaded.
+- **Refuse silent `$HOME`/`/` fallback on omitted `cwd` (`src/mcp-server.ts`, #66, thanks `@OnurrUgur`)**
+  - Prevented omitted `cwd` (common on Desktop 2.0 / Hub hosts when `roots/list` is unavailable) from silently scanning the user's home directory or filesystem root—including Windows `HOMEDRIVE+HOMEPATH` and MSYS2 path guards—while still allowing explicit `cwd: "~"`.
+- **Fast-path `$HOME` snapshots & instant JSON stdin exit (`src/utils/snapshot.ts`, `src/session-start.ts`, `rules/AGENTS.md`, `docs/ANALYSIS_REPORT.zh-CN.md`, #62, thanks `@757530253`)**
+  - Skipped depth-2 directory scans and child subproject manifest probes when `SessionStart` runs in `$HOME`, returned immediately on complete JSON stdin objects (eliminating the 1,500ms stall when a host keeps stdin open without EOF), tightened `/compact` guidance (`~100k–150k` tokens), and documented Windows cold-start behavior.
+- **Updater, search, snapshot, and filesystem hardening (`src/updater-core.ts`, `src/tools/batch-search.ts`, `src/utils/snapshot.ts`, `src/utils/fs-utils.ts`, `src/utils/exec-utils.ts`, #28, thanks `@3956418278-dotcom`)**
+  - Blocked `repoUrl` option injection and `release -> main` error fallback in the updater; added Node fallback buffer/file prechecks, fixed `rg` glob precedence, symlinked-workspace (`/var -> /private/var`) anchored globs, and ES2025 inline `(?-m:...)` precheck guards; halved snapshot git spawns and prevented false clean status on timeout; bound drive-less Windows paths, capped `walkFiles` FD concurrency, eliminated `globToRegExp` ReDoS, canceled POSIX `SIGKILL` timers on exit, and deduped `rg` probing.
+
+### Fixed
+
+- **`apply_edits` safety, fidelity, and no-op hygiene (#39, #40, #47, #51, #52, thanks `@wathing-wind`)**
+  - Rejected overwriting existing binary or UTF-16 files on `create` + `overwrite: true` (peeking `>8KB` binaries without full reads).
+  - Preserved UTF-8 BOM across outlines and edits and clarified UTF-16 diagnostics.
+  - Preserved mixed CRLF/LF line endings byte-for-byte on untouched lines and matched local span EOL.
+  - Removed orphaned newly created parent directories on atomic rollback and used short temp filenames to prevent `ENAMETOOLONG` on long CJK/UTF-8 names.
+  - Skipped redundant disk writes for no-op hunks (preserving `mtime`/inode and short-circuiting hot-path mixed-EOL/UTF-8 buffer work), reported `unchanged` status, and kept byte-budget truncation footers accurate when `noOpCount > 0`.
+- **CJK git filenames & mixed-encoding process output (#45, thanks `@wathing-wind`; #55, thanks `@ErrantSnow`)**
+  - Passed `-c core.quotePath=false` in `snapshot.ts` and `batch_search` git queries so CJK/non-ASCII paths render cleanly without octal escapes.
+  - Decoded mixed UTF-8 and legacy codepage process output line-by-line in `exec-utils.ts`.
+- **`--cli` flag parsing & rules clarity (#56, thanks `@ErrantSnow`; #60, thanks `@gaofeng21cn`, Refs #59; #63, thanks `@anhnt256`, Refs #61)**
+  - Supported `--flag=value`, `--pattern`, and `--type` with properly scoped positional modifiers in `--cli search`.
+  - Sharpened Swarm worker & `run_checks` hygiene and documented the host-injected `toolSummary` field in `rules/AGENTS.md`.
+
+### 简体中文摘要（v0.3.1）
+
+- **交互式更新确认、跳过版本与无 `git` API 回退（#58，感谢 `@wathing-wind`）**：新增 `update --prompt` 交互确认、`--skip-version <ver|none>` 持久化跳过、`SessionStart` 紧凑更新提示（`≤185B`）以及无 `git` 环境的 GitHub Releases API 安全回退。
+- **宿主机急加载防驱逐与 Hub 防误扫 `$HOME`（#57 感谢 `@kf953741`；#66 感谢 `@OnurrUgur`）**：将 5 个 MCP 工具 Schema 压缩至 `≤1280B` 防止宿主机预算紧时被驱逐；禁止漏传 `cwd` 时静默回落扫描 `$HOME` 或根目录（兼容 Windows `HOMEDRIVE+HOMEPATH` 且保留显式 `cwd: "~"`）。
+- **`SessionStart` 冷启动与 Windows 体验优化（#62，感谢 `@757530253`）**：`$HOME` 快照跳过二级目录与子项目清单探针；收到完整 JSON stdin 后立即返回（消除宿主不关 stdin 时的 1500ms 卡顿）；收紧 `rules/AGENTS.md` 的 `/compact` 阈值与 Windows 实践说明。
+- **`apply_edits` 五连加固（#39、#40、#47、#51、#52，感谢 `@wathing-wind`）**：禁止 `create+overwrite` 覆盖二进制/UTF-16 文件；全程保留 UTF-8 BOM 并优化 UTF-16 报错；保留未改动行的混合 CRLF/LF 换行符；原子回滚清理新建空目录并用短临时名避免超长中文文件名 `ENAMETOOLONG`；无变化 hunk 跳过写盘保 `mtime`/inode 且精准汇报 `written/unchanged` 截断统计。
+- **搜索、编码、致命信号诊断与 CI 全面补强（#28 感谢 `@3956418278-dotcom`；#45/#46 感谢 `@wathing-wind`；#55/#56 感谢 `@ErrantSnow`；#60 感谢 `@gaofeng21cn`；#63 感谢 `@anhnt256`；#37 感谢 `@0x7b1e`）**：加固更新器与 `batch_search`（Node 预检、glob 优先级、macOS 软链工作区与 ReDoS 防护）；支持 CJK git 路径无八进制转义与混合编码逐行解码；在 `run_checks`/`apply_edits` 输出 OOM/段错误/信号名与 Windows NTSTATUS 崩溃码；修复 `--cli search` 参数解析与规则文档；CI 新增 macOS + Node 20/22/24 矩阵。
+
+---
+
+## [0.3.0] - 2026-11-23
+
+### Added
+
+- **Direct `--cli` invocation mode for Swarm workers & non-MCP environments (`src/cli-runner.ts`, #31, thanks `@wathing-wind`)**
+  - Added `node dist/mcp-server.mjs --cli <search|outline|slice|edit|check>` so Antigravity Swarm workers (where MCP servers, `user_rules`, and `SessionStart` are not mounted) and shell environments can still batch searches, symbol outlines, atomic multi-hunk edits, and concurrent checks within the same `≤8.8 KB` UTF-8 budget.
+  - Hardened `--cli` exit codes (failing reliably on `Checks:` failures/not-run, `Verify [FAIL|TIMEOUT|ERROR]`, and `Error:` lines), per-query search modifier scoping, `--flag=value` parsing, literal `--help` search, and `--cli` tracking in `benchmark-core.ts` (`Swarm worker coverage` + `cli:N` dispatch breakdown).
+- **Prompt Cache miss attribution & sustained-collapse diagnostics (`src/benchmark-core.ts`, `rules/AGENTS.md`)**
+  - Added structured `cacheMissAttribution` to `benchmark.mjs analyze` / `compare` / `--split-usage`, distinguishing true prefix misses (`activeSlowGap`, `idleOrWaitGap`, `planModeSwitch`, `errorRetry`, `asyncWakeupFast`, `modelSwitch`, `fastReplicaOrPrefixMiss`) from expected `compactionResets` and `contextDilutionTurns`, plus `>=3`-turn sustained cache collapse tracking (`sustainedCollapseRuns`, `sustainedCollapseTurns`, `maxConsecutiveMisses`).
+  - Added empirically grounded edit-loop cache hygiene guidance to `rules/AGENTS.md` Rule 4 (prefer `<45s` targeted checks inside edit-verify loops; keep `<=10s` commands synchronous via `WaitMsBeforeAsync` instead of early backgrounding).
+- **Persistent `--tool-loading eager|lazy` installer option (#25)**
+  - Added `--tool-loading eager|lazy` in `scripts/install.mjs` (`install` / `config`) persisted in `~/.gemini/cache/agy-fast/config.json` and preserved across auto-updates for hosts or setups that need lazy loading.
+- **Multi-branch CI & automated GitHub Release workflow (`.github/workflows/ci.yml`, `.github/workflows/release.yml`, `CONTRIBUTING.md`)**
+  - Added cross-platform CI (`verify (ubuntu-latest)`, `verify (windows-latest)`, `stress`), `dev` + `main` branching guide, PR template, and automated `v*` tag release publishing verified against `origin/main`, `package.json`, `plugin.json`, `dist/`, and `CHANGELOG.md`.
+
+### Security & Reliability
+
+- **Trusted `hooks.json` path precedence & isolated `GEMINI_HOME` support (#30, thanks `@ErrantSnow`)**
+  - Reordered `hooks.json` plugin resolution to check `PLUGIN_ROOT` → `AGY_PLUGIN_ROOT` → `$GEMINI_HOME/config/plugins/agy-fast` → `~/.gemini/config/plugins/agy-fast` before workspace-local `.agents/plugins/agy-fast` / `.`, preventing untrusted workspaces from hijacking `SessionStart`.
+- **POSIX piped installer isolation (#36, thanks `@0x7b1e`)**
+  - Prevented `curl ... | sh` from inferring or executing a workspace-local decoy `scripts/install.mjs` in CWD, verifying `plugin.json` identity (`name === "agy-fast"`) before local execution and handling root-level `/install.sh` safely.
+- **MCP NDJSON `64 MiB` frame size cap (#42, thanks `@wathing-wind`)**
+  - Enforced a `64 MiB` frame cap on NDJSON stdio framing matching `Content-Length` mode, returning `-32600`, releasing large buffers, and discarding oversized lines with `O(chunk)` memory without corrupting subsequent frames.
+- **Block accidental writes inside `.git` internal metadata (#41, thanks `@wathing-wind`)**
+  - Refused `apply_edits` writes targeting `.git` directories, worktree/submodule `.git` files, symlinks resolving into `.git`, Windows NTFS ADS suffixes (`:stream`) / trailing dots-spaces, and case-insensitive `.GIT` paths across all platforms (including WSL), while keeping `.gitignore`/`.github`/`.gitattributes` unaffected.
+- **Non-interactive Git credential guards (#44, thanks `@wathing-wind`)**
+  - Injected default `GIT_TERMINAL_PROMPT=0` and `GCM_INTERACTIVE=never` (preserving caller overrides, including case-insensitive Windows keys) across `runShellCommandAsync`, `batch_search` git queries, `SessionStart` snapshots, and `updater-core.ts` remote `git ls-remote`/`clone`/`fetch` calls.
+
+### Fixed
+
+- **Issue #27 verified bottlenecks (`batch_search`, `apply_edits`, `run_checks`, `benchmark`)**
+  - Eliminated `batch_search` file starvation under tight budgets and centered match windowing on long lines past column 240; improved `apply_edits` drifted-range hints and failure-first `bestEffort` reporting; fixed `benchmark-core.ts` out-of-order parallel tool-result pairing and spill/truncation/parallel-leak false positives.
+- **`apply_edits` mismatch & verify diagnostics (#32, thanks `@wathing-wind`)**
+  - Upgraded `findClosestRegionSnippet` with anchor-aligned high-entropy line scoring (including trailing anchors on `>10`-line hunks), preserved head+tail output on `Verify [FAIL]` by compacting long `Applied:` lists, water-filled multi-file validation errors, pre-validated `verify.cwd` before writing files, and surfaced `Verify [ERROR]` spawn failures consistently.
+- **`output-filter` VT100 & mid-suite failure hygiene (#31, thanks `@wathing-wind`)**
+  - Stripped VT100 line-erase spinner sequences (`\x1b[2K`/`\x1b[K`) and preserved mid-suite failures when folding verbose passing test lines.
+- **Node 20 & Windows CI determinism**
+  - Replaced multi-hop async init queuing in `src/protocol/mcp.ts` with a synchronous `postInitOutgoingQueue`, eliminated premature Node 20 timer `.unref()` exits in `snapshot.ts` and `cli-runner.ts`, and fixed Windows `AppData` tmpdir test matching.
+- **Docs**: Documented `agy --dangerously-skip-permissions` unattended CLI flag in `README.md` and `README.zh-CN.md`.
+
+### 简体中文摘要（v0.3.0）
+
+- **新增 `--cli` 直调模式，打通 Swarm Worker 与非 MCP 环境（#31，感谢 `@wathing-wind`）**：支持通过 `node dist/mcp-server.mjs --cli <search|outline|slice|edit|check>` 在无 MCP 挂载的 Swarm Worker 中批量搜索、提大纲、原子多块编辑与并发校验（同样死守 `≤8.8 KB` 预算），并加固退出码、参数作用域与基准覆盖率统计。
+- **新增 Prompt Cache 失效归因与持续暴跌诊断，补齐编辑循环护缓存规则**：`benchmark.mjs` 新增 `cacheMissAttribution`（精准拆解 `active>=60s` / `idle>=60s` / `plan_mode` / `errorRetry` / `async<60s` / `modelSwitch` / 副本漂移，并单独剥离压缩与大读取稀释，识别连续 `>=3` 轮持续暴跌）；`rules/AGENTS.md` Rule 4 补齐编辑循环快检（`<45s`）与短命令同步等待纪律。
+- **安装器支持持久化 `--tool-loading eager|lazy`（#25）**：可在安装或配置时切换急/懒加载并跨自动更新持久化保留。
+- **5 项安全与稳定性加固**：
+  - `hooks.json` 优先可信插件目录并支持隔离 `GEMINI_HOME`，防止不可信工作区劫持 `SessionStart`（#30，感谢 `@ErrantSnow`）；
+  - `install.sh` 禁止 `curl | sh` 管道安装回退执行当前目录伪造安装器，并校验 `plugin.json` 身份（#36，感谢 `@0x7b1e`）；
+  - MCP NDJSON 帧强制 `64 MiB` 上限防 OOM 并支持溢出后安全恢复（#42，感谢 `@wathing-wind`）；
+  - `apply_edits` 拦截对 `.git` 内部目录/worktree 文件/软链/Windows NTFS ADS 与跨平台大小写变体的误写，不误伤 `.gitignore`/`.github`（#41，感谢 `@wathing-wind`）；
+  - 全链路（含 `updater-core.ts` 远程 `git` 操作）默认注入 `GIT_TERMINAL_PROMPT=0` 与 `GCM_INTERACTIVE=never` 防止凭据弹窗卡死（#44，感谢 `@wathing-wind`）。
+- **核心工具体验修复与 CI/CD 基建（#27、#31、#32）**：解决 `batch_search` 紧预算饿死与长行 240 列截断；升级 `apply_edits` 锚点对齐错因提示、失败 `verify` 首尾保真与多文件水填充；优化 VT100 进度条清理与测试日志折叠；修复 Node 20 与 Windows 边界问题，并上线 Linux/Windows/压测 CI 与 `v*` tag 自动发版流水线。
+
+---
+
 ## [0.2.10] - 2026-11-22
 
 ### Fixed

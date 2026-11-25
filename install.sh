@@ -32,9 +32,28 @@ case "${1:-}" in
     ;;
 esac
 
-SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd || pwd)"
+# In `curl ... | sh`, $0 is the shell name rather than the installer path.
+# Never infer a local plugin from the current workspace in that case.
+# Explicit paths and `sh install.sh` remain supported on macOS / Linux.
+SCRIPT_DIR=""
+case "$0" in
+  */*|*.sh)
+    if [ -f "$0" ]; then
+      case "$0" in
+        */*) script_parent=${0%/*} ;;
+        *)   script_parent=. ;;
+      esac
+      SCRIPT_DIR="$(CDPATH= cd -P "${script_parent:-/}" 2>/dev/null && pwd -P)" || SCRIPT_DIR=""
+    fi
+    ;;
+esac
 
-if [ -f "${SCRIPT_DIR}/plugin.json" ] && [ -f "${SCRIPT_DIR}/scripts/install.mjs" ]; then
+# Verify plugin identity before running a local scripts/install.mjs. A different
+# plugin in the current workspace must never be mistaken for agy-fast.
+if [ -n "$SCRIPT_DIR" ] &&
+   [ -f "${SCRIPT_DIR}/plugin.json" ] &&
+   [ -f "${SCRIPT_DIR}/scripts/install.mjs" ] &&
+   node -e 'const fs = require("node:fs"); try { if (JSON.parse(fs.readFileSync(process.argv[1], "utf8")).name !== "agy-fast") process.exit(1); } catch { process.exit(1); }' "${SCRIPT_DIR}/plugin.json"; then
   if [ "${HAS_SUBCMD}" -eq 1 ]; then
     exec node "${SCRIPT_DIR}/scripts/install.mjs" "$@"
   else

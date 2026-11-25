@@ -1,0 +1,133 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Verify and Publish GitHub Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG_NAME: ${{ github.ref_name }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag is on main and versions match
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          if ! git merge-base --is-ancestor HEAD FETCH_HEAD; then
+            echo "::error::Tag ${TAG_NAME} is not an ancestor of origin/main. Merge dev -> main first, then tag on main."
+            exit 1
+          fi
+
+          node -e '
+            const fs = require("node:fs");
+            const tag = process.env.TAG_NAME || "";
+            const expected = tag.replace(/^v/, "");
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8")).version;
+            const plugin = JSON.parse(fs.readFileSync("plugin.json", "utf8")).version;
+            if (!expected || pkg !== expected || plugin !== expected) {
+              console.error(`Version mismatch: tag=${tag}, package.json=${pkg}, plugin.json=${plugin}`);
+              process.exit(1);
+            }
+            console.log(`Version verified: ${tag} === package.json (${pkg}) === plugin.json (${plugin})`);
+          '
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck, build, dist sync check, and test
+        run: |
+          npm run typecheck
+          npm run build
+          if ! git diff --exit-code -- dist/; then
+            echo "::error::dist/*.mjs bundles are out of sync with src/."
+            exit 1
+          fi
+          npm test
+
+      - name: Extract release notes from CHANGELOG.md
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("node:fs");
+            const tag = process.env.TAG_NAME || "";
+            const ver = tag.replace(/^v/, "");
+            const isPrerelease = ver.includes("-");
+            const changelog = fs.readFileSync("CHANGELOG.md", "utf8").replace(/\r\n/g, "\n");
+            const escaped = ver.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            const headingRe = new RegExp(`^## \\[${escaped}\\][^\\n]*$`, "m");
+            const match = headingRe.exec(changelog);
+            if (!match) {
+              if (isPrerelease) {
+                console.log("No CHANGELOG.md section found for prerelease; will use GitHub auto-generated notes.");
+                fs.appendFileSync(process.env.GITHUB_OUTPUT, "has_notes=false\nis_prerelease=true\n");
+                process.exit(0);
+              }
+              console.error(`Missing "## [${ver}]" section in CHANGELOG.md for stable release ${tag}.`);
+              process.exit(1);
+            }
+            const rest = changelog.slice(match.index + match[0].length);
+            const nextHeading = rest.search(/\n## \[/);
+            let body = (nextHeading === -1 ? rest : rest.slice(0, nextHeading)).trim();
+            body = body.replace(/(?:\n+---+\s*)+$/, "").trim();
+            if (!body) {
+              console.error(`CHANGELOG.md section "## [${ver}]" is empty.`);
+              process.exit(1);
+            }
+            fs.writeFileSync("/tmp/release-notes.md", body + "\n", "utf8");
+            fs.appendFileSync(
+              process.env.GITHUB_OUTPUT,
+              `has_notes=true\nis_prerelease=${isPrerelease ? "true" : "false"}\n`,
+            );
+            console.log(`Extracted ${body.length} chars of release notes for ${tag}.`);
+          '
+
+      - name: Create GitHub Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release ${TAG_NAME} already exists; skipping creation."
+            exit 0
+          fi
+
+          ARGS=(release create "${TAG_NAME}" --repo "${GITHUB_REPOSITORY}" --verify-tag --title "${TAG_NAME}")
+          if [ "${{ steps.notes.outputs.is_prerelease }}" = "true" ]; then
+            ARGS+=(--prerelease)
+          else
+            ARGS+=(--latest)
+          fi
+
+          if [ "${{ steps.notes.outputs.has_notes }}" = "true" ]; then
+            ARGS+=(--notes-file /tmp/release-notes.md)
+          else
+            ARGS+=(--generate-notes)
+          fi
+
+          gh "${ARGS[@]}"

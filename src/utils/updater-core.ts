@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execBinaryAsync } from "./exec-utils.js";
+import { execBinaryAsync, withNonInteractiveGitEnv } from "./exec-utils.js";
 
 export const DEFAULT_REPO_URL = "https://github.com/INK-Q/agy-fast.git";
 export const DEFAULT_GITHUB_SLUG = "INK-Q/agy-fast";
@@ -76,13 +76,19 @@ export interface UpdateState {
   latestVersion?: string;
   latestRef?: string;
   availableVersion?: string;
+  availableRef?: string;
+  availableCommit?: string;
+  availableReleaseUrl?: string;
+  availableInstallKind?: InstallKind;
   availableReason?: string;
+  skippedVersion?: string;
   lastAppliedVersion?: string;
   lastAppliedFrom?: string;
   lastAppliedAt?: string;
   lastAppliedCommit?: string;
   notifiedAppliedVersion?: string;
   notifiedAvailableVersion?: string;
+  notifiedAvailableCommit?: string;
   lastError?: string;
 }
 
@@ -97,6 +103,8 @@ export interface RemoteVersionInfo {
   ref: string;
   version: string | null;
   commitSha?: string;
+  releaseUrl?: string;
+  publishedAt?: string;
   source: "git-tags" | "git-main" | "github-api";
 }
 
@@ -109,6 +117,7 @@ export interface UpdateRunOptions {
   repoUrl?: string;
   timeoutMs?: number;
   env?: NodeJS.ProcessEnv;
+  fetchFn?: typeof fetch;
 }
 
 export interface UpdateRunResult {
@@ -121,15 +130,30 @@ export interface UpdateRunResult {
     | "error";
   currentVersion: string;
   latestVersion: string | null;
+  latestRef?: string;
+  commitSha?: string;
+  releaseUrl?: string;
+  publishedAt?: string;
   installKind: InstallKind;
   message: string;
   error?: string;
 }
 
-export function getHomeDir(env: NodeJS.ProcessEnv = process.env): string {
-  return process.platform === "win32"
-    ? env.USERPROFILE || env.HOME || os.homedir()
-    : env.HOME || env.USERPROFILE || os.homedir();
+export function getHomeDir(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  if (platform === "win32") {
+    const userProfile = env.USERPROFILE?.trim();
+    if (userProfile) return userProfile;
+    const driveHome =
+      env.HOMEDRIVE && env.HOMEPATH ? `${env.HOMEDRIVE}${env.HOMEPATH}`.trim() : "";
+    if (driveHome) return driveHome;
+    const home = env.HOME?.trim();
+    if (home) return home;
+    return os.homedir();
+  }
+  return env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir();
 }
 
 export function getUpdaterPaths(env: NodeJS.ProcessEnv = process.env): UpdaterPaths {
@@ -224,9 +248,11 @@ async function readJsonFile<T>(filePath: string): Promise<T | null> {
   return null;
 }
 
+let tmpWriteSeq = 0;
+
 async function writeJsonAtomically(filePath: string, data: unknown): Promise<void> {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
-  const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}`;
+  const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}.${++tmpWriteSeq}`;
   await fs.writeFile(tmpPath, `${JSON.stringify(data, null, 2)}\n`, "utf8");
   try {
     await fs.rename(tmpPath, filePath);
@@ -274,6 +300,39 @@ export async function writeUpdateState(
   const merged: UpdateState = { ...existing, ...patch };
   await writeJsonAtomically(paths.stateFile, merged);
   return merged;
+}
+
+export async function skipUpdateVersion(
+  rawVersion: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<{ version: string; state: UpdateState }> {
+  const parsed = parseSemver(rawVersion);
+  if (!parsed) {
+    throw new Error(
+      `Invalid version '${rawVersion}'. Expected semver like 0.3.1 or v0.3.1.`,
+    );
+  }
+  const version = `${parsed[0]}.${parsed[1]}.${parsed[2]}`;
+  const state = await writeUpdateState(
+    {
+      skippedVersion: version,
+      notifiedAvailableVersion: version,
+    },
+    env,
+  );
+  return { version, state };
+}
+
+export async function clearSkippedVersion(
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<UpdateState> {
+  return writeUpdateState(
+    {
+      skippedVersion: undefined,
+      notifiedAvailableVersion: undefined,
+    },
+    env,
+  );
 }
 
 export function parseToolLoadingMode(raw: unknown): ToolLoadingMode | null {
@@ -400,19 +459,55 @@ export async function consumeSnapshotUpdateNotice(
     return `[agy-fast] Auto-updated v${state.lastAppliedFrom} -> v${currentVersion} (rules/hooks active now; reload Desktop/IDE window if MCP was already running).`;
   }
 
-  // 2. Update available (notify mode, symlink, or dirty git repo) -> announce once per version
+  const installerPath = path.join(pluginDir, "scripts", "install.mjs");
+  const isManualInstall =
+    state.availableInstallKind === "symlink" ||
+    state.availableInstallKind === "dev-source" ||
+    state.availableInstallKind === "git-dirty";
+
+  // 2. Semver update available -> announce once per version (unless skipped by user)
   if (
     state.availableVersion &&
-    compareSemver(state.availableVersion, currentVersion) > 0 &&
-    state.notifiedAvailableVersion !== state.availableVersion
+    compareSemver(state.availableVersion, currentVersion) > 0
   ) {
+    if (
+      state.skippedVersion === state.availableVersion ||
+      state.notifiedAvailableVersion === state.availableVersion
+    ) {
+      return null;
+    }
     await writeUpdateState(
       { notifiedAvailableVersion: state.availableVersion },
       env,
     ).catch(() => {});
+    const ver = state.availableVersion;
     const reason = state.availableReason ? ` (${state.availableReason})` : "";
-    const installerPath = path.join(pluginDir, "scripts", "install.mjs");
-    return `[agy-fast] Update available: v${currentVersion} -> v${state.availableVersion}${reason}. Run: node "${installerPath}" update`;
+    const urlSuffix = state.availableReleaseUrl ? ` | ${state.availableReleaseUrl}` : "";
+    if (isManualInstall) {
+      return `[agy-fast] Update available: v${currentVersion} -> v${ver}${reason}. Pull & build in repo, or skip: node "${installerPath}" update --skip-version ${ver}${urlSuffix}`;
+    }
+    return `[agy-fast] Update available: v${currentVersion} -> v${ver}${reason}. Run: node "${installerPath}" update --prompt (or --skip-version ${ver})${urlSuffix}`;
+  }
+
+  // 3. Main-channel commit update available -> announce once per commit
+  if (
+    !state.availableVersion &&
+    state.availableCommit &&
+    state.availableCommit !== state.lastAppliedCommit &&
+    state.notifiedAvailableCommit !== state.availableCommit
+  ) {
+    await writeUpdateState(
+      { notifiedAvailableCommit: state.availableCommit },
+      env,
+    ).catch(() => {});
+    const refLabel = state.availableRef || "main";
+    const shortSha = state.availableCommit.slice(0, 7);
+    const reason = state.availableReason ? ` (${state.availableReason})` : "";
+    const urlSuffix = state.availableReleaseUrl ? ` | ${state.availableReleaseUrl}` : "";
+    if (isManualInstall) {
+      return `[agy-fast] Update available on ${refLabel} (${shortSha})${reason}. Pull & build in repo.${urlSuffix}`;
+    }
+    return `[agy-fast] Update available on ${refLabel} (${shortSha})${reason}. Run: node "${installerPath}" update --prompt${urlSuffix}`;
   }
 
   return null;
@@ -441,6 +536,7 @@ export async function detectInstallKind(pluginDir: string): Promise<InstallKind>
     const statusRes = await execBinaryAsync("git", ["status", "--porcelain"], {
       cwd: resolved,
       timeoutMs: 4_000,
+      env: withNonInteractiveGitEnv(),
     });
     if (statusRes.error || statusRes.exitCode !== 0 || statusRes.stdout.trim() !== "") {
       return "git-dirty";
@@ -462,23 +558,76 @@ export async function detectInstallKind(pluginDir: string): Promise<InstallKind>
   return "copied";
 }
 
-function extractGithubSlug(repoUrl: string): string | null {
-  const m = /github\.com[:/]([^/]+\/[^/.]+?)(?:\.git)?\/?$/i.exec(repoUrl.trim());
-  return m?.[1] ?? null;
+export function extractGithubSlug(repoUrl: string): string | null {
+  const m =
+    /^(?:https?:\/\/|ssh:\/\/git@|git@)github\.com[:/]([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?\/?$/i.exec(
+      repoUrl.trim(),
+    );
+  if (!m?.[1] || m[1].includes("..")) return null;
+  return m[1];
+}
+
+export function buildGithubReleaseUrl(
+  repoUrl: string,
+  ref?: string,
+  commitSha?: string,
+): string | undefined {
+  const slug = extractGithubSlug(repoUrl);
+  if (!slug) return undefined;
+  const trimmedRef = ref?.trim();
+  if (trimmedRef && parseSemver(trimmedRef)) {
+    return `https://github.com/${slug}/releases/tag/${encodeURIComponent(trimmedRef)}`;
+  }
+  if (commitSha?.trim()) {
+    return `https://github.com/${slug}/commit/${encodeURIComponent(commitSha.trim())}`;
+  }
+  if (trimmedRef) {
+    return `https://github.com/${slug}/tree/${encodeURIComponent(trimmedRef)}`;
+  }
+  return `https://github.com/${slug}/releases`;
+}
+
+function sanitizeGithubHtmlUrl(raw: unknown, fallback?: string): string | undefined {
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (/^https:\/\/github\.com\//i.test(trimmed)) {
+      return trimmed;
+    }
+  }
+  return fallback;
+}
+
+export function validateRepoUrl(rawUrl: string): string {
+  const trimmed = rawUrl.trim();
+  if (!trimmed || trimmed.startsWith("-") || /[\0\r\n]/.test(trimmed)) {
+    throw new Error(`Invalid update repository URL: ${rawUrl}`);
+  }
+  return trimmed;
 }
 
 export async function fetchLatestRemoteVersion(opts: {
   repoUrl: string;
   channel: UpdateChannel;
   timeoutMs?: number;
+  env?: NodeJS.ProcessEnv;
+  fetchFn?: typeof fetch;
 }): Promise<RemoteVersionInfo> {
+  const safeRepoUrl = validateRepoUrl(opts.repoUrl);
   const timeoutMs = opts.timeoutMs ?? 8_000;
-  const gitEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
+  const gitEnv = withNonInteractiveGitEnv(opts.env);
+  const doFetch = opts.fetchFn ?? (typeof fetch === "function" ? fetch : undefined);
+  const slug = extractGithubSlug(safeRepoUrl);
+  const ghHeaders = {
+    Accept: "application/vnd.github+json",
+    "User-Agent": "agy-fast-updater",
+  };
+  let gitUnavailableOrFailed = false;
 
   if (opts.channel === "release") {
+    let confirmedUntagged = false;
     const tagsRes = await execBinaryAsync(
       "git",
-      ["ls-remote", "--tags", "--refs", opts.repoUrl],
+      ["ls-remote", "--tags", "--refs", "--", safeRepoUrl],
       { cwd: os.tmpdir(), timeoutMs, env: gitEnv },
     );
     if (!tagsRes.error && !tagsRes.timedOut && tagsRes.exitCode === 0) {
@@ -488,68 +637,195 @@ export async function fetchLatestRemoteVersion(opts: {
           ref: latest.tag,
           version: latest.version,
           commitSha: latest.commitSha,
+          releaseUrl: buildGithubReleaseUrl(safeRepoUrl, latest.tag, latest.commitSha),
           source: "git-tags",
         };
       }
-    }
+      // Clean exit 0 with zero semver tags confirms the repo is untagged — skip redundant API calls
+      confirmedUntagged = true;
+    } else {
+      gitUnavailableOrFailed = true;
+      // Fallback to GitHub Releases / Tags API only when git ls-remote could not run/succeed.
+      // Fail immediately on network/timeout/non-404 errors so release users are never downgraded to main.
+      if (!slug || !doFetch) {
+        throw new Error(
+          tagsRes.stderr.trim() ||
+            tagsRes.error ||
+            (tagsRes.timedOut
+              ? `Timed out checking releases from: ${safeRepoUrl}`
+              : `Unable to reach update source: ${safeRepoUrl}`),
+        );
+      }
 
-    // Fallback to GitHub Releases API if git is unavailable and URL is GitHub
-    const slug = extractGithubSlug(opts.repoUrl);
-    if (slug && typeof fetch === "function") {
-      try {
-        const res = await fetch(
-          `https://api.github.com/repos/${slug}/releases/latest`,
+      const relRes = await doFetch(
+        `https://api.github.com/repos/${slug}/releases/latest`,
+        {
+          headers: ghHeaders,
+          signal: AbortSignal.timeout(timeoutMs),
+        },
+      );
+
+      let checkTagsApi = false;
+      if (relRes.ok) {
+        const json = (await relRes.json()) as {
+          tag_name?: unknown;
+          html_url?: unknown;
+          published_at?: unknown;
+        };
+        if (typeof json.tag_name === "string") {
+          const parsed = parseSemver(json.tag_name);
+          if (parsed) {
+            const tag = json.tag_name.trim();
+            return {
+              ref: tag,
+              version: `${parsed[0]}.${parsed[1]}.${parsed[2]}`,
+              releaseUrl: sanitizeGithubHtmlUrl(
+                json.html_url,
+                buildGithubReleaseUrl(safeRepoUrl, tag),
+              ),
+              publishedAt:
+                typeof json.published_at === "string" ? json.published_at : undefined,
+              source: "github-api",
+            };
+          }
+        }
+        checkTagsApi = true;
+      } else if (relRes.status === 404) {
+        checkTagsApi = true;
+      } else {
+        throw new Error(
+          `GitHub releases API returned HTTP ${relRes.status} for ${slug}`,
+        );
+      }
+
+      if (checkTagsApi) {
+        const tagsApiRes = await doFetch(
+          `https://api.github.com/repos/${slug}/tags?per_page=30`,
           {
-            headers: {
-              Accept: "application/vnd.github+json",
-              "User-Agent": "agy-fast-updater",
-            },
+            headers: ghHeaders,
             signal: AbortSignal.timeout(timeoutMs),
           },
         );
-        if (res.ok) {
-          const json = (await res.json()) as { tag_name?: unknown };
-          if (typeof json.tag_name === "string") {
-            const parsed = parseSemver(json.tag_name);
-            if (parsed) {
-              return {
-                ref: json.tag_name.trim(),
-                version: `${parsed[0]}.${parsed[1]}.${parsed[2]}`,
-                source: "github-api",
-              };
-            }
+        if (!tagsApiRes.ok) {
+          throw new Error(
+            `GitHub tags API returned HTTP ${tagsApiRes.status} for ${slug}`,
+          );
+        }
+        const rawTags = (await tagsApiRes.json()) as unknown;
+        if (!Array.isArray(rawTags)) {
+          throw new Error(`Invalid GitHub tags API response for ${slug}`);
+        }
+        let best: { tag: string; version: string; commitSha?: string } | null = null;
+        for (const item of rawTags) {
+          if (!item || typeof item !== "object") continue;
+          const rec = item as { name?: unknown; commit?: { sha?: unknown } };
+          if (typeof rec.name !== "string") continue;
+          const parsed = parseSemver(rec.name);
+          if (!parsed) continue;
+          const version = `${parsed[0]}.${parsed[1]}.${parsed[2]}`;
+          if (!best || compareSemver(version, best.version) > 0) {
+            best = {
+              tag: rec.name.trim(),
+              version,
+              commitSha:
+                typeof rec.commit?.sha === "string" ? rec.commit.sha : undefined,
+            };
           }
         }
-      } catch {
-        // Fall through to git main check or error
+        if (best) {
+          return {
+            ref: best.tag,
+            version: best.version,
+            commitSha: best.commitSha,
+            releaseUrl: buildGithubReleaseUrl(safeRepoUrl, best.tag, best.commitSha),
+            source: "github-api",
+          };
+        }
+        confirmedUntagged = true;
       }
+    }
+
+    if (!confirmedUntagged) {
+      throw new Error(`Unable to determine release version from: ${safeRepoUrl}`);
     }
   }
 
-  // Main channel (or fallback when repo has no semver tags yet)
-  const headRes = await execBinaryAsync(
-    "git",
-    ["ls-remote", opts.repoUrl, "refs/heads/main", "HEAD"],
-    { cwd: os.tmpdir(), timeoutMs, env: gitEnv },
-  );
-  if (!headRes.error && !headRes.timedOut && headRes.exitCode === 0) {
-    const firstLine = headRes.stdout.trim().split(/\r?\n/)[0] ?? "";
-    const sha = firstLine.split(/\s+/)[0] || undefined;
-    if (sha) {
+  // Main channel (or definitively confirmed untagged repository)
+  let headErr = "";
+  if (!gitUnavailableOrFailed) {
+    const headRes = await execBinaryAsync(
+      "git",
+      ["ls-remote", "--", safeRepoUrl, "refs/heads/main", "HEAD"],
+      { cwd: os.tmpdir(), timeoutMs, env: gitEnv },
+    );
+    if (!headRes.error && !headRes.timedOut && headRes.exitCode === 0) {
+      const entries = headRes.stdout
+        .trim()
+        .split(/\r?\n/)
+        .map((line) => line.trim().split(/\s+/))
+        .filter((parts) => parts.length >= 2 && Boolean(parts[0]));
+      const mainEntry = entries.find((parts) => parts[1] === "refs/heads/main");
+      const chosen = mainEntry ?? entries[0];
+      if (chosen?.[0]) {
+        const ref = mainEntry ? "main" : "HEAD";
+        return {
+          ref,
+          version: null,
+          commitSha: chosen[0],
+          releaseUrl: buildGithubReleaseUrl(safeRepoUrl, ref, chosen[0]),
+          source: "git-main",
+        };
+      }
+    }
+    headErr =
+      headRes.stderr.trim() ||
+      headRes.error ||
+      (headRes.timedOut
+        ? `Timed out checking main branch from: ${safeRepoUrl}`
+        : "");
+  }
+
+  if (slug && doFetch) {
+    const commitRes = await doFetch(
+      `https://api.github.com/repos/${slug}/commits/main`,
+      {
+        headers: ghHeaders,
+        signal: AbortSignal.timeout(timeoutMs),
+      },
+    );
+    if (!commitRes.ok) {
+      throw new Error(
+        `GitHub commits API returned HTTP ${commitRes.status} for ${slug}`,
+      );
+    }
+    const json = (await commitRes.json()) as {
+      sha?: unknown;
+      html_url?: unknown;
+      commit?: { committer?: { date?: unknown }; author?: { date?: unknown } };
+    };
+    if (typeof json.sha === "string" && json.sha.trim()) {
+      const sha = json.sha.trim();
+      const publishedAt =
+        typeof json.commit?.committer?.date === "string"
+          ? json.commit.committer.date
+          : typeof json.commit?.author?.date === "string"
+            ? json.commit.author.date
+            : undefined;
       return {
         ref: "main",
         version: null,
         commitSha: sha,
-        source: "git-main",
+        releaseUrl: sanitizeGithubHtmlUrl(
+          json.html_url,
+          buildGithubReleaseUrl(safeRepoUrl, "main", sha),
+        ),
+        publishedAt,
+        source: "github-api",
       };
     }
   }
 
-  throw new Error(
-    headRes.stderr.trim() ||
-      headRes.error ||
-      `Unable to reach update source: ${opts.repoUrl}`,
-  );
+  throw new Error(headErr || `Unable to reach update source: ${safeRepoUrl}`);
 }
 
 export async function verifyStagedPlugin(stagingDir: string): Promise<{
@@ -579,7 +855,7 @@ export async function verifyStagedPlugin(stagingDir: string): Promise<{
   const mcpPath = path.join(stagingDir, "dist", "mcp-server.mjs");
   const smokeOk = await new Promise<boolean>((resolve) => {
     const child = spawn(process.execPath, [mcpPath], {
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "ignore"],
       windowsHide: true,
     });
     let stdout = "";
@@ -589,6 +865,9 @@ export async function verifyStagedPlugin(stagingDir: string): Promise<{
     }, 6_000);
     timer.unref();
 
+    child.stdin.on("error", () => {
+      // Ignore EPIPE if a broken staged bundle exits before reading stdin
+    });
     child.stdout.on("data", (d: Buffer | string) => {
       stdout += d.toString();
     });
@@ -694,23 +973,24 @@ function isProcessDead(pid: number): boolean {
   }
 }
 
-async function acquireUpdateLock(lockPath: string): Promise<boolean> {
+async function acquireUpdateLock(lockPath: string): Promise<string | null> {
   await fs.mkdir(path.dirname(lockPath), { recursive: true });
+  const token = `${process.pid}-${Date.now()}-${++tmpWriteSeq}-${Math.random().toString(36).slice(2, 10)}`;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const handle = await fs.open(lockPath, "wx");
       try {
         await handle.writeFile(
-          JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }),
+          JSON.stringify({ pid: process.pid, token, createdAt: new Date().toISOString() }),
           "utf8",
         );
       } finally {
         await handle.close();
       }
-      return true;
+      return token;
     } catch (err) {
       const code = (err as NodeJS.ErrnoException)?.code;
-      if (code !== "EEXIST") return false;
+      if (code !== "EEXIST") return null;
       try {
         const st = await fs.stat(lockPath);
         let stale = Date.now() - st.mtimeMs > LOCK_STALE_MS;
@@ -725,16 +1005,35 @@ async function acquireUpdateLock(lockPath: string): Promise<boolean> {
           }
         }
         if (stale) {
-          await fs.rm(lockPath, { force: true });
+          // Atomically claim the stale lock via rename so concurrent reclaimers
+          // never unlink a live lock freshly acquired by another process.
+          const claimedPath = `${lockPath}.stale.${process.pid}.${++tmpWriteSeq}`;
+          try {
+            await fs.rename(lockPath, claimedPath);
+            await fs.rm(claimedPath, { force: true }).catch(() => {});
+          } catch {
+            // Another process already reclaimed or removed it; retry open("wx")
+          }
           continue;
         }
       } catch {
         continue;
       }
-      return false;
+      return null;
     }
   }
-  return false;
+  return null;
+}
+
+async function releaseUpdateLock(lockPath: string, token: string): Promise<void> {
+  try {
+    const info = await readJsonFile<{ token?: unknown }>(lockPath);
+    if (info?.token === token) {
+      await fs.rm(lockPath, { force: true });
+    }
+  } catch {
+    // Ignore cleanup errors
+  }
 }
 
 export async function runPluginUpdate(
@@ -761,8 +1060,8 @@ export async function runPluginUpdate(
     };
   }
 
-  const locked = await acquireUpdateLock(paths.lockFile);
-  if (!locked) {
+  const lockToken = await acquireUpdateLock(paths.lockFile);
+  if (!lockToken) {
     return {
       status: "skipped-locked",
       currentVersion,
@@ -776,7 +1075,13 @@ export async function runPluginUpdate(
   let stagingDir = "";
 
   try {
-    const remote = await fetchLatestRemoteVersion({ repoUrl, channel, timeoutMs });
+    const remote = await fetchLatestRemoteVersion({
+      repoUrl,
+      channel,
+      timeoutMs,
+      env,
+      fetchFn: opts.fetchFn,
+    });
     const prevState = await readUpdateState(env);
 
     const hasNewerSemver =
@@ -787,13 +1092,21 @@ export async function runPluginUpdate(
       remote.commitSha !== prevState.lastAppliedCommit;
 
     if (!opts.force && !hasNewerSemver && !hasNewerMainCommit) {
+      const clearStaleSkip =
+        Boolean(prevState.skippedVersion) &&
+        compareSemver(prevState.skippedVersion!, currentVersion) <= 0;
       await writeUpdateState(
         {
           lastCheckAt: nowIso,
           latestVersion: remote.version ?? currentVersion,
           latestRef: remote.ref,
           availableVersion: undefined,
+          availableRef: undefined,
+          availableCommit: undefined,
+          availableReleaseUrl: undefined,
+          availableInstallKind: undefined,
           availableReason: undefined,
+          ...(clearStaleSkip ? { skippedVersion: undefined } : {}),
           lastError: undefined,
         },
         env,
@@ -802,13 +1115,25 @@ export async function runPluginUpdate(
         status: "up-to-date",
         currentVersion,
         latestVersion: remote.version ?? currentVersion,
+        latestRef: remote.ref,
+        commitSha: remote.commitSha,
+        releaseUrl: remote.releaseUrl,
+        publishedAt: remote.publishedAt,
         installKind,
         message: `agy-fast v${currentVersion} is already up to date.`,
       };
     }
 
+    const isSkippedInBackground = Boolean(
+      opts.background &&
+        !opts.force &&
+        remote.version &&
+        prevState.skippedVersion === remote.version,
+    );
+
     const effectiveNotifyOnly =
       opts.checkOnly ||
+      isSkippedInBackground ||
       (opts.background && settings.mode === "notify") ||
       installKind === "symlink" ||
       installKind === "git-dirty" ||
@@ -822,9 +1147,17 @@ export async function runPluginUpdate(
             ? "uncommitted local changes"
             : installKind === "dev-source"
               ? "local source repo"
-              : settings.mode === "notify"
-                ? "notify mode"
-                : undefined;
+              : isSkippedInBackground
+                ? "skipped by user"
+                : settings.mode === "notify"
+                  ? "notify mode"
+                  : undefined;
+
+      const shouldClearSkip =
+        Boolean(prevState.skippedVersion) &&
+        ((remote.version !== null &&
+          compareSemver(remote.version, prevState.skippedVersion!) > 0) ||
+          compareSemver(prevState.skippedVersion!, currentVersion) <= 0);
 
       await writeUpdateState(
         {
@@ -832,7 +1165,12 @@ export async function runPluginUpdate(
           latestVersion: remote.version ?? undefined,
           latestRef: remote.ref,
           availableVersion: remote.version ?? undefined,
+          availableRef: remote.ref,
+          availableCommit: remote.commitSha,
+          availableReleaseUrl: remote.releaseUrl,
+          availableInstallKind: installKind,
           availableReason: reason,
+          ...(shouldClearSkip ? { skippedVersion: undefined } : {}),
           lastError: undefined,
         },
         env,
@@ -842,6 +1180,10 @@ export async function runPluginUpdate(
         status: "available",
         currentVersion,
         latestVersion: remote.version,
+        latestRef: remote.ref,
+        commitSha: remote.commitSha,
+        releaseUrl: remote.releaseUrl,
+        publishedAt: remote.publishedAt,
         installKind,
         message: remote.version
           ? `Update available: v${currentVersion} -> v${remote.version}${reason ? ` (${reason})` : ""}.`
@@ -855,12 +1197,13 @@ export async function runPluginUpdate(
       `staging-${process.pid}-${Date.now()}`,
     );
     await fs.mkdir(paths.cacheDir, { recursive: true });
-    const gitEnv = { ...env, GIT_TERMINAL_PROMPT: "0" };
+    const gitEnv = withNonInteractiveGitEnv(env);
 
+    const safeRepoUrl = validateRepoUrl(repoUrl);
     const cloneArgs =
-      remote.ref === "main"
-        ? ["clone", "--depth", "1", "--branch", "main", repoUrl, stagingDir]
-        : ["clone", "--depth", "1", "--branch", remote.ref, repoUrl, stagingDir];
+      remote.ref === "HEAD"
+        ? ["clone", "--depth", "1", "--", safeRepoUrl, stagingDir]
+        : ["clone", "--depth", "1", "--branch", remote.ref, "--", safeRepoUrl, stagingDir];
     const cloneRes = await execBinaryAsync("git", cloneArgs, {
       cwd: paths.cacheDir,
       timeoutMs: Math.max(timeoutMs, 30_000),
@@ -891,6 +1234,12 @@ export async function runPluginUpdate(
           lastCheckAt: nowIso,
           latestVersion: stagedCheck.version,
           latestRef: remote.ref,
+          availableVersion: undefined,
+          availableRef: undefined,
+          availableCommit: undefined,
+          availableReleaseUrl: undefined,
+          availableInstallKind: undefined,
+          availableReason: undefined,
           lastAppliedCommit: remote.commitSha,
           lastError: undefined,
         },
@@ -900,6 +1249,10 @@ export async function runPluginUpdate(
         status: "up-to-date",
         currentVersion,
         latestVersion: stagedCheck.version,
+        latestRef: remote.ref,
+        commitSha: remote.commitSha,
+        releaseUrl: remote.releaseUrl,
+        publishedAt: remote.publishedAt,
         installKind,
         message: `agy-fast v${currentVersion} is already up to date.`,
       };
@@ -943,7 +1296,12 @@ export async function runPluginUpdate(
         latestVersion: stagedCheck.version,
         latestRef: remote.ref,
         availableVersion: undefined,
+        availableRef: undefined,
+        availableCommit: undefined,
+        availableReleaseUrl: undefined,
+        availableInstallKind: undefined,
         availableReason: undefined,
+        skippedVersion: undefined,
         lastAppliedVersion: stagedCheck.version,
         lastAppliedFrom: currentVersion,
         lastAppliedAt: nowIso,
@@ -958,6 +1316,10 @@ export async function runPluginUpdate(
       status: "updated",
       currentVersion,
       latestVersion: stagedCheck.version,
+      latestRef: remote.ref,
+      commitSha: remote.commitSha,
+      releaseUrl: remote.releaseUrl,
+      publishedAt: remote.publishedAt,
       installKind,
       message: `Updated agy-fast v${currentVersion} -> v${stagedCheck.version} (${installKind}).`,
     };
@@ -982,7 +1344,7 @@ export async function runPluginUpdate(
     if (stagingDir) {
       await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => {});
     }
-    await fs.rm(paths.lockFile, { force: true }).catch(() => {});
+    await releaseUpdateLock(paths.lockFile, lockToken);
   }
 }
 

@@ -1,10 +1,20 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  clearSkippedVersion,
   parseUpdateChannel,
   runPluginUpdate,
+  skipUpdateVersion,
   type UpdateChannel,
 } from "./utils/updater-core.js";
+
+function requireFlagValue(args: string[], idx: number, flag: string): string {
+  const next = args[idx + 1];
+  if (!next || next.startsWith("-")) {
+    throw new Error(`Missing value after ${flag}`);
+  }
+  return next;
+}
 
 function parseCliArgs(argv: string[]): {
   pluginDir: string;
@@ -12,6 +22,8 @@ function parseCliArgs(argv: string[]): {
   checkOnly: boolean;
   force: boolean;
   json: boolean;
+  skipVersion?: string;
+  clearSkip: boolean;
   channel?: UpdateChannel;
   repoUrl?: string;
 } {
@@ -25,6 +37,8 @@ function parseCliArgs(argv: string[]): {
   let checkOnly = false;
   let force = false;
   let json = false;
+  let skipVersion: string | undefined;
+  let clearSkip = false;
   let channel: UpdateChannel | undefined;
   let repoUrl: string | undefined;
 
@@ -38,22 +52,69 @@ function parseCliArgs(argv: string[]): {
       force = true;
     } else if (a === "--json") {
       json = true;
-    } else if (a === "--plugin-dir" && args[i + 1]) {
-      pluginDir = path.resolve(args[++i]!);
-    } else if (a === "--channel" && args[i + 1]) {
-      const parsed = parseUpdateChannel(args[++i]);
+    } else if (a === "--clear-skip") {
+      clearSkip = true;
+    } else if (a === "--skip-version") {
+      skipVersion = requireFlagValue(args, i, "--skip-version");
+      i++;
+    } else if (a === "--plugin-dir") {
+      pluginDir = path.resolve(requireFlagValue(args, i, "--plugin-dir"));
+      i++;
+    } else if (a === "--channel") {
+      const val = requireFlagValue(args, i, "--channel");
+      const parsed = parseUpdateChannel(val);
       if (!parsed) throw new Error(`Invalid --channel value (expected 'release' or 'main')`);
       channel = parsed;
-    } else if (a === "--repo" && args[i + 1]) {
-      repoUrl = args[++i]!;
+      i++;
+    } else if (a === "--repo") {
+      repoUrl = requireFlagValue(args, i, "--repo");
+      i++;
+    } else {
+      throw new Error(`Unknown updater option: ${a}`);
     }
   }
 
-  return { pluginDir, background, checkOnly, force, json, channel, repoUrl };
+  return {
+    pluginDir,
+    background,
+    checkOnly,
+    force,
+    json,
+    skipVersion,
+    clearSkip,
+    channel,
+    repoUrl,
+  };
 }
 
 async function main(): Promise<void> {
   const opts = parseCliArgs(process.argv);
+
+  if (opts.clearSkip) {
+    await clearSkippedVersion();
+    const res = {
+      status: "cleared-skip",
+      message: "Cleared skipped agy-fast version preference.",
+    };
+    process.stdout.write(
+      opts.json ? `${JSON.stringify(res, null, 2)}\n` : `${res.message}\n`,
+    );
+    return;
+  }
+
+  if (opts.skipVersion) {
+    const { version } = await skipUpdateVersion(opts.skipVersion);
+    const res = {
+      status: "skipped-version",
+      skippedVersion: version,
+      message: `Skipped agy-fast v${version}. You will be notified again when a newer release is published.`,
+    };
+    process.stdout.write(
+      opts.json ? `${JSON.stringify(res, null, 2)}\n` : `${res.message}\n`,
+    );
+    return;
+  }
+
   const result = await runPluginUpdate({
     pluginDir: opts.pluginDir,
     background: opts.background,
@@ -80,9 +141,14 @@ async function main(): Promise<void> {
 
 main().catch((err) => {
   if (!process.argv.includes("--background")) {
-    process.stderr.write(
-      `Error: ${err instanceof Error ? err.message : String(err)}\n`,
-    );
+    const errMsg = err instanceof Error ? err.message : String(err);
+    if (process.argv.includes("--json")) {
+      process.stdout.write(
+        `${JSON.stringify({ status: "error", message: errMsg, error: errMsg }, null, 2)}\n`,
+      );
+    } else {
+      process.stderr.write(`Error: ${errMsg}\n`);
+    }
     process.exitCode = 1;
   }
 });
