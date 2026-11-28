@@ -326,6 +326,93 @@ describe("run_checks", () => {
     }
   });
 
+  it("routes unquoted Windows ';' chaining to PowerShell while keeping cmd.exe and PS 5.1-incompatible chains intact", () => {
+    const mustRouteToPowerShell = [
+      "agent-reach --version 2>&1; agent-reach --help 2>&1",
+      "git status; git diff --stat",
+      "node -v ; npm -v ; python --version",
+      'echo "a && b"; echo "c || d"',
+      "echo 'a && b'; echo 'c || d'",
+      'echo "a; b"; echo "c; d"',
+      'echo "C:\\\\"; echo ok',
+      "echo a | findstr a; echo b",
+      "dir C:\\; dir D:\\",
+      '& "C:\\bin\\a.exe" -v; & "C:\\bin\\b.exe" -v',
+      'echo a | & "C:\\bin\\b.exe"; echo c',
+      'git log -n 5 --format="%h %s"; git status',
+      'echo "set FOO=bar"; echo baz',
+      'echo "if errorlevel 1"; echo baz',
+      'echo "2>nul"; echo baz',
+      "npm run build && echo $LASTEXITCODE; echo done",
+      "call-api --check; echo done",
+      "rem-tool --version; rem-tool --help",
+      "goto-def --check; echo done",
+    ];
+    for (const cmd of mustRouteToPowerShell) {
+      assert.equal(
+        needsPowerShellOnWindows(cmd),
+        true,
+        `Expected PowerShell routing for: ${cmd}`,
+      );
+    }
+
+    const mustStayOnCmd = [
+      // Quoted semicolons only
+      `node -e "console.log('a; b')"`,
+      "echo 'foo; bar'",
+      // Compact non-whitespace semicolon parameters
+      "java -cp a.jar;b.jar Main",
+      'java -cp a.jar;"C:\\Program Files\\b.jar" Main',
+      'java -cp "C:\\a.jar";b.jar Main',
+      'java -cp "C:\\a.jar";"C:\\b.jar" Main',
+      "msbuild /p:Configuration=Release;Platform=x64",
+      "cmake -DCMAKE_PREFIX_PATH=C:\\a;C:\\b .",
+      "foo --opt=a;b",
+      // Explicit cmd.exe env vars and syntax
+      "echo %USERPROFILE%; echo done",
+      'echo "%USERPROFILE%"; echo done',
+      "echo %ProgramFiles(x86)%; echo done",
+      "set FOO=bar; echo baz",
+      "@set FOO=bar; echo baz",
+      'set "FOO=bar"; echo baz',
+      '@set "FOO=bar"; echo baz',
+      'echo ok; set "FOO=bar"',
+      "set /a x=1; echo done",
+      "setlocal; echo done",
+      "if errorlevel 1 echo fail; echo done",
+      "if not exist dist mkdir dist; echo done",
+      "if defined NODE_ENV echo ok; echo done",
+      'if /i "a"=="A" echo eq; echo done',
+      'if "a"=="b" echo eq; echo done',
+      'for /f "tokens=1" %i in (a.txt) do echo %i; echo done',
+      "cd /d D:\\project; dir",
+      "rem note; see docs",
+      ":: note; see docs",
+      "echo a 2>nul; echo b 2>nul",
+      // Mixed unquoted ';' with PowerShell 5.1-incompatible chain operators
+      "npm run build && npm test; echo done",
+      "npm test || echo fail; echo done",
+      "echo a & echo b; echo c",
+      '"C:\\bin\\a.exe" & echo b; echo c',
+      "echo a&echo b; echo c",
+      // Escaped, trailing, or leading semicolons
+      "find . -exec echo {} \\; -print",
+      "echo foo^; bar",
+      "echo foo`; bar",
+      "git status;",
+      "git status;   ",
+      "git status;   \ngit diff",
+      "; echo leading",
+    ];
+    for (const cmd of mustStayOnCmd) {
+      assert.equal(
+        needsPowerShellOnWindows(cmd),
+        false,
+        `Expected cmd.exe routing for: ${cmd}`,
+      );
+    }
+  });
+
   it("decodes UTF-8, truncated UTF-8 tails, and legacy codepage buffers cleanly", () => {
     assert.equal(parseWindowsCodePage("Active code page: 936\r\n"), "gb18030");
     assert.equal(parseWindowsCodePage("Active code page: 866\r\n"), "ibm866");
@@ -701,6 +788,26 @@ describe("run_checks", () => {
       }
     });
 
+    it("executes unquoted ';'-chained commands end-to-end on Windows without cmd.exe swallowing trailing commands", async () => {
+      const res = await runChecks({
+        outputMode: "full",
+        commands: [
+          {
+            name: "win-semicolon-chain",
+            command: `node -e "console.log('SEMI_' + 'FIRST')" 2>&1; node -e "console.log('SEMI_' + 'SECOND')" 2>&1`,
+          },
+          {
+            name: "win-semicolon-call-op",
+            command: `& ${nodeBin} -e "console.log('CALL_' + 'ONE')" 2>&1; & ${nodeBin} -e "console.log('CALL_' + 'TWO')" 2>&1`,
+          },
+        ],
+      });
+      assert.equal(res.isError, false);
+      assert.match(res.text, /Checks: 2\/2 passed/);
+      assert.match(res.text, /SEMI_FIRST[\r\n]+SEMI_SECOND/);
+      assert.match(res.text, /CALL_ONE[\r\n]+CALL_TWO/);
+    });
+
     it("falls back cleanly without crashing when taskkill is unavailable on command timeout", async () => {
       const savedEnv = { ...process.env };
       const savedPath = process.env.PATH;
@@ -862,5 +969,17 @@ describe("run_checks", () => {
       assert.match(sigRes.text, /FAIL \(SIGKILL - possible OOM\)/);
       assert.match(sigRes.text, /Terminated by SIGKILL - possible OOM/);
     }
+  });
+
+  it("appends a parseable 1-line Example JSON on validation errors", async () => {
+    const emptyRes = await runChecks({ commands: [] });
+    assert.equal(emptyRes.isError, true);
+    const match = emptyRes.text.match(/\nExample: (\{.*\})$/);
+    assert.ok(match, emptyRes.text);
+    assert.ok(Array.isArray(JSON.parse(match[1]!).commands));
+
+    const missingCmd = await runChecks({ commands: [{ command: "   " }] });
+    assert.equal(missingCmd.isError, true);
+    assert.match(missingCmd.text, /\nExample: \{"commands":/);
   });
 });

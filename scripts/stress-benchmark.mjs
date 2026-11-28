@@ -113,8 +113,10 @@ class McpTestClient {
   }
 
   async start() {
+    const spawnEnv = { ...this.env };
+    delete spawnEnv.AGY_FAST_TOOLS;
     this.child = spawn(process.execPath, [...this.nodeArgs, MCP_SERVER], {
-      env: this.env,
+      env: spawnEnv,
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.child.stderr.on("data", (chunk) => {

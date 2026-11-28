@@ -647,4 +647,91 @@ describe("output-filter", () => {
     });
     assert.equal(unknownEmpty.bodyText, "Exited with code unknown");
   });
+
+  it("preserves TAP, node --test, and Jest failing test headers without error keywords while ignoring mid-line false positives", () => {
+    const filler = (n: number, prefix = "") =>
+      Array.from({ length: n }, (_, i) => `${prefix}neutral log line #${i + 1}: payload state`);
+    const compact = (lines: string[]) =>
+      formatCompactCommandOutputWithMeta({
+        stdout: lines.join("\n"),
+        stderr: "",
+        exitCode: 1,
+        timedOut: false,
+        maxChars: 750,
+      }).text;
+
+    const cases = [
+      {
+        lead: Array.from({ length: 12 }, (_, i) => `ok ${i + 1} - pass #${i + 1}`),
+        body: ["not ok 13 - computes cart discount", "  ---", "  location: '/repo/test/cart.test.ts:42:3'"],
+        tail: ["# fail 1"],
+        expect: [/not ok 13 - computes cart discount/, /cart\.test\.ts:42:3/],
+      },
+      {
+        lead: Array.from({ length: 10 }, (_, i) => `  ✔ pass #${i + 1} (0.4ms)`),
+        body: ["  ✖ calculates shipping total (3.2ms)", "    expected: 25", "    actual: 30"],
+        tail: ["ℹ fail 1"],
+        expect: [/✖ calculates shipping total/, /expected: 25/],
+      },
+      {
+        lead: Array.from({ length: 10 }, (_, i) => `  ✓ pass #${i + 1} (1 ms)`),
+        body: ["  ✕ applies promo code (5 ms)", "    Expected: 20", "    Received: 25"],
+        tail: ["Tests: 1 failed, 10 passed, 11 total"],
+        expect: [/✕ applies promo code/],
+      },
+      {
+        lead: Array.from({ length: 10 }, (_, i) => `@app/web:test: ✔ ok #${i + 1} (1ms)`),
+        body: ["@app/web:test: not ok 11 - validates checkout", "@app/web:test:   expected: true"],
+        tail: ["@app/web:test: # fail 1"],
+        expect: [/@app\/web:test: not ok 11 - validates checkout/],
+      },
+    ];
+    for (const c of cases) {
+      const out = compact([...c.lead, ...c.body, ...filler(40), ...c.tail]);
+      for (const re of c.expect) assert.match(out, re);
+    }
+
+    const hijackOut = formatCompactCommandOutputWithMeta({
+      stdout: [
+        "PASS src/a.test.ts",
+        "  ● Console",
+        "●  (SSG)      prerendered as static HTML",
+        "● (Static)   prerendered as static content",
+        "● (Dynamic)  server-rendered on demand",
+        "● (ISR)      incremental static regeneration",
+        "status check: not ok yet (retrying)",
+        "viewport dims: × 1080",
+        "viewport 1920 × 1080",
+        "status was not ok yet (not okay)",
+        "• Packages in scope: 4",
+        ...filler(20),
+        "  ● Cart › applies tax rate",
+        "    Expected: 10",
+        "    Received: 9",
+        ...filler(40),
+        "Test Suites: 1 failed, 1 total",
+      ].join("\n"),
+      stderr: "",
+      exitCode: 1,
+      timedOut: false,
+      maxChars: 650,
+    }).text;
+    assert.match(hijackOut, /● Cart › applies tax rate/);
+    for (const noise of [/● Console/, /\(SSG\)/, /status check: not ok/, /viewport dims: × 1080/, /1920 × 1080/]) {
+      assert.doesNotMatch(hijackOut, noise);
+    }
+
+    const crossFoldMeta = formatCompactCommandOutputWithMeta({
+      stdout: [
+        ...Array.from({ length: 5 }, (_, i) => `PASS src/a${i}.test.ts ✕ note`),
+        ...filler(16),
+      ].join("\n"),
+      stderr: "",
+      exitCode: 1,
+      timedOut: false,
+      maxChars: 2000,
+    });
+    assert.equal(crossFoldMeta.collapsedLines, 0);
+    assert.match(crossFoldMeta.text, /PASS src\/a0\.test\.ts ✕ note/);
+  });
 });

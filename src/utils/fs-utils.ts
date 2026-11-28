@@ -272,11 +272,17 @@ export interface WalkOptions {
   includeHidden?: boolean;
   ignoreDirs?: Set<string>;
   fileFilter?: (relPosixPath: string) => boolean;
+  /** Optional wall-clock soft budget in ms; stops cleanly and marks timedOut + truncated. */
+  timeoutMs?: number;
+  /** Optional cap on visited directories (readdir calls) to prevent runaway walks when few files match. */
+  maxDirs?: number;
 }
 
 export interface WalkResult {
   files: string[];
   truncated: boolean;
+  timedOut?: boolean;
+  dirsTruncated?: boolean;
 }
 
 export async function walkFiles(
@@ -288,9 +294,25 @@ export async function walkFiles(
   const includeHidden = options.includeHidden ?? false;
   const ignoreDirs = options.ignoreDirs ?? DEFAULT_IGNORE_DIRS;
   const fileFilter = options.fileFilter;
+  const timeoutMs =
+    options.timeoutMs !== undefined &&
+    Number.isFinite(options.timeoutMs) &&
+    options.timeoutMs > 0
+      ? Math.max(1, Math.trunc(options.timeoutMs))
+      : null;
+  const deadline = timeoutMs !== null ? Date.now() + timeoutMs : null;
+  const maxDirs =
+    options.maxDirs !== undefined &&
+    Number.isFinite(options.maxDirs) &&
+    options.maxDirs > 0
+      ? Math.max(1, Math.trunc(options.maxDirs))
+      : null;
 
   const files: string[] = [];
   let truncated = false;
+  let timedOut = false;
+  let dirsTruncated = false;
+  let visitedDirs = 0;
 
   // Global concurrency semaphore caps simultaneous fs.readdir calls across all
   // recursion depths to prevent EMFILE FD exhaustion on nested workspaces.
@@ -307,13 +329,37 @@ export async function walkFiles(
     truncated = true;
     drainWaiters();
   };
+  const withinBudget = (): boolean => {
+    if (truncated) return false;
+    if (deadline !== null && Date.now() >= deadline) {
+      timedOut = true;
+      markTruncated();
+      return false;
+    }
+    return true;
+  };
+  const timeoutTimer =
+    timeoutMs !== null
+      ? setTimeout(() => {
+          timedOut = true;
+          markTruncated();
+        }, timeoutMs)
+      : null;
+  timeoutTimer?.unref();
+
   const readDirBounded = async (dir: string) => {
-    if (truncated) return null;
+    if (!withinBudget()) return null;
     while (activeReaddirs >= MAX_CONCURRENT_READDIRS) {
       await new Promise<void>((resolve) => waitQueue.push(resolve));
-      if (truncated) return null;
+      if (!withinBudget()) return null;
     }
-    if (truncated) return null;
+    if (!withinBudget()) return null;
+    if (maxDirs !== null && visitedDirs >= maxDirs) {
+      dirsTruncated = true;
+      markTruncated();
+      return null;
+    }
+    visitedDirs++;
     activeReaddirs++;
     try {
       return await fs.readdir(dir, { withFileTypes: true });
@@ -334,14 +380,14 @@ export async function walkFiles(
   }
 
   const scanDir = async (dir: string, relDir: string): Promise<DirScanResult> => {
-    if (truncated) return { localFiles: [], subdirs: [] };
+    if (!withinBudget()) return { localFiles: [], subdirs: [] };
     let entries;
     try {
       entries = await readDirBounded(dir);
     } catch {
       return { localFiles: [], subdirs: [] };
     }
-    if (!entries || truncated) return { localFiles: [], subdirs: [] };
+    if (!entries || !withinBudget()) return { localFiles: [], subdirs: [] };
     entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 
     const localFiles: string[] = [];
@@ -367,15 +413,16 @@ export async function walkFiles(
 
   // Prefetch sibling directories concurrently in bounded batches while emitting
   // matched files in deterministic lexicographical DFS order and only marking
-  // `truncated` when a (maxFiles + 1)-th matching file is actually encountered.
+  // `truncated` when a (maxFiles + 1)-th matching file or scan budget is hit.
   async function visit(
     dir: string,
     relDir: string,
     depth: number,
     prefetched?: Promise<DirScanResult>,
   ): Promise<void> {
-    if (truncated || depth > maxDepth) return;
+    if (!withinBudget() || depth > maxDepth) return;
     const { localFiles, subdirs } = await (prefetched ?? scanDir(dir, relDir));
+    if (!withinBudget()) return;
 
     for (const relPosix of localFiles) {
       if (files.length >= maxFiles) {
@@ -388,11 +435,11 @@ export async function walkFiles(
     if (depth >= maxDepth || subdirs.length === 0) return;
 
     const batchSize = 8;
-    for (let i = 0; i < subdirs.length && !truncated; i += batchSize) {
+    for (let i = 0; i < subdirs.length && withinBudget(); i += batchSize) {
       const slice = subdirs.slice(i, i + batchSize);
       const prefetches = slice.map((sub) => scanDir(sub.abs, sub.rel));
       try {
-        for (let j = 0; j < slice.length && !truncated; j++) {
+        for (let j = 0; j < slice.length && withinBudget(); j++) {
           await visit(slice[j]!.abs, slice[j]!.rel, depth + 1, prefetches[j]);
         }
       } finally {
@@ -405,6 +452,15 @@ export async function walkFiles(
     }
   }
 
-  await visit(rootDir, "", 0);
-  return { files, truncated };
+  try {
+    await visit(rootDir, "", 0);
+  } finally {
+    if (timeoutTimer) clearTimeout(timeoutTimer);
+  }
+  return {
+    files,
+    truncated,
+    ...(timedOut ? { timedOut: true } : {}),
+    ...(dirsTruncated ? { dirsTruncated: true } : {}),
+  };
 }

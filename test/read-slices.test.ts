@@ -1271,4 +1271,81 @@ describe("read_slices", () => {
     assert.match(encRes.text, /be\.rc\nERROR: UTF-16 encoded file is not supported \(convert to UTF-8 first\): .*\[UTF-16 BE\]/);
     assert.match(encRes.text, /u32\.txt\nERROR: Binary file cannot be read as text:/);
   });
+
+  it("coerces bare single strings for paths/outlines/lineRanges, preserves corruption guards, and appends 1-line examples on validation errors", async () => {
+    const bareDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-bare-str-"));
+    try {
+      await fs.writeFile(
+        path.join(bareDir, "app.ts"),
+        "export function alpha() {\n  return 1;\n}\nexport function beta() {\n  return 2;\n}\n",
+        "utf8",
+      );
+
+      // 1. Bare single-string coercion works for quick_outline.paths, read_slices.outlines, and read_slices.lineRanges
+      const qoRes = await runQuickOutline({
+        cwd: bareDir,
+        paths: "app.ts" as unknown as string[],
+      });
+      assert.equal(qoRes.isError, false);
+      assert.match(qoRes.text, /L1-L3 \[function\] alpha/);
+
+      const rsOutlineRes = await runReadSlices({
+        cwd: bareDir,
+        outlines: "app.ts" as unknown as string[],
+      });
+      assert.equal(rsOutlineRes.isError, false);
+      assert.match(rsOutlineRes.text, /L4-L6 \[function\] beta/);
+
+      const rsRangeRes = await runReadSlices({
+        cwd: bareDir,
+        lineRanges: "app.ts:1-3,4-6" as unknown as string[],
+      });
+      assert.equal(rsRangeRes.isError, false);
+      assert.match(rsRangeRes.text, /export function alpha/);
+      assert.match(rsRangeRes.text, /export function beta/);
+
+      // 2. Corrupted literals ("true"/"false"/"null") and malformed JSON fragments starting with "[" or "{" NEVER coerce
+      for (const lit of ["true", "false", "null"]) {
+        const qoLit = await runQuickOutline({ cwd: bareDir, paths: lit as unknown as string[] });
+        assert.equal(qoLit.isError, true);
+        assert.match(qoLit.text, /serialization corruption detected/i);
+
+        const rsLit = await runReadSlices({ cwd: bareDir, lineRanges: lit as unknown as string[] });
+        assert.equal(rsLit.isError, true);
+        assert.match(rsLit.text, /serialization corruption detected/i);
+      }
+
+      for (const frag of ['["app.ts', '{"path":"app.ts"', "{}", ""]) {
+        const qoFrag = await runQuickOutline({ cwd: bareDir, paths: frag as unknown as string[] });
+        assert.equal(qoFrag.isError, true);
+        assert.match(qoFrag.text, /\nExample: \{"paths":\["src\/app\.ts"\]\}/);
+
+        const rsOutFrag = await runReadSlices({ cwd: bareDir, outlines: frag as unknown as string[] });
+        assert.equal(rsOutFrag.isError, true);
+        assert.match(rsOutFrag.text, /\nExample: \{"outlines":\["src\/app\.ts"\]/);
+
+        const rsRangeFrag = await runReadSlices({ cwd: bareDir, lineRanges: frag as unknown as string[] });
+        assert.equal(rsRangeFrag.isError, true);
+        assert.match(rsRangeFrag.text, /\nExample: \{"lineRanges":\["src\/app\.ts:1-60"\]\}/);
+      }
+
+      // 3. Validation errors include parseable 1-line Example JSON
+      const badRange = await runReadSlices({
+        cwd: bareDir,
+        lineRanges: "not-a-range" as unknown as string[],
+      });
+      assert.equal(badRange.isError, true);
+      const rangeEx = badRange.text.match(/\nExample: (\{.*\})$/);
+      assert.ok(rangeEx, badRange.text);
+      assert.deepEqual(JSON.parse(rangeEx[1]!), { lineRanges: ["src/app.ts:1-60"] });
+
+      const emptySlice = await runReadSlices({ cwd: bareDir });
+      assert.equal(emptySlice.isError, true);
+      const emptyEx = emptySlice.text.match(/\nExample: (\{.*\})$/);
+      assert.ok(emptyEx, emptySlice.text);
+      assert.ok(Array.isArray(JSON.parse(emptyEx[1]!).outlines));
+    } finally {
+      await fs.rm(bareDir, { recursive: true, force: true });
+    }
+  });
 });

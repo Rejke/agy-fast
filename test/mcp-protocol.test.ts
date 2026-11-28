@@ -7,6 +7,7 @@ import { PassThrough } from "node:stream";
 import { pathToFileURL } from "node:url";
 import { after, before, describe, it } from "node:test";
 import { MAX_FRAME_BYTES, McpStdioServer } from "../src/protocol/mcp.js";
+import { createAgyFastServer } from "../src/mcp-server-core.js";
 
 const MCP_SERVER_SCRIPT = path.resolve(process.cwd(), "dist", "mcp-server.mjs");
 
@@ -18,9 +19,12 @@ function buildCleanServerEnv(
   delete env.ANTIGRAVITY_APP_DATA_DIR;
   delete env.AGY_FAST_HOST;
   delete env.AGY_FAST_EDITS_FORMAT;
+  delete env.AGY_FAST_SCHEMA_COMPAT;
+  delete env.AGY_FAST_TOOLS;
   delete env.AGY_FAST_CACHE_DIR;
   delete env.PLUGIN_ROOT;
   delete env.AGY_PLUGIN_ROOT;
+  delete env.NODE_USE_ENV_PROXY;
   for (const [k, v] of Object.entries(extraEnv)) {
     if (v === undefined) delete env[k];
     else env[k] = v;
@@ -31,9 +35,10 @@ function buildCleanServerEnv(
 function sendMessagesToServer(
   rawChunks: Array<string | Buffer>,
   extraEnv: Record<string, string | undefined> = {},
+  extraArgs: string[] = [],
 ): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [MCP_SERVER_SCRIPT], {
+    const child = spawn(process.execPath, [MCP_SERVER_SCRIPT, ...extraArgs], {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
       env: buildCleanServerEnv(extraEnv),
@@ -210,7 +215,7 @@ describe("MCP Stdio Server end-to-end", () => {
 
     const toolList = (
       byId.get(3)?.result as {
-        tools: Array<{ name: string; description: string; inputSchema: unknown }>;
+        tools: Array<{ name: string; inputSchema: unknown }>;
       }
     ).tools;
     assert.deepEqual(
@@ -222,25 +227,12 @@ describe("MCP Stdio Server end-to-end", () => {
       properties: { edits: { type: string } };
     };
     assert.equal(applySchema.properties.edits.type, "array");
-    // Ensure schemas avoid oneOf/anyOf/allOf and stay well under Antigravity ACP's
-    // ~2000-2048B eager tool declaration cutoff (which silently drops >2KB tool schemas).
+    // Ensure schemas avoid oneOf/anyOf/allOf for maximum client compatibility
     for (const tool of toolList) {
       assert.equal(
         hasDisallowedSchemaKeyword(tool.inputSchema),
         false,
         `Tool ${tool.name} schema should not contain oneOf/anyOf/allOf`,
-      );
-      const declBytes = Buffer.byteLength(
-        JSON.stringify({
-          name: tool.name,
-          description: tool.description,
-          parameters: tool.inputSchema,
-        }),
-        "utf8",
-      );
-      assert.ok(
-        declBytes <= 1800,
-        `Tool ${tool.name} declaration JSON is ${declBytes} bytes (>1800B limit for Antigravity ACP eager loading)`,
       );
     }
 
@@ -679,6 +671,7 @@ describe("MCP Stdio Server end-to-end", () => {
       await new Promise<void>((resolve, reject) => {
         const child = spawn(process.execPath, [MCP_SERVER_SCRIPT], {
           stdio: ["pipe", "pipe", "pipe"],
+          env: buildCleanServerEnv(),
           windowsHide: true,
         });
         let buf = "";
@@ -1278,5 +1271,290 @@ describe("MCP Stdio Server end-to-end", () => {
       crlfSplitRes.map((r) => r.id),
       [4, 7],
     );
+  });
+
+  it("supports --schema-compat=minimal and AGY_FAST_SCHEMA_COMPAT=minimal while preserving property names and runtime validation", async () => {
+    const ALLOWED_MINIMAL_KEYWORDS = new Set([
+      "type",
+      "properties",
+      "required",
+      "additionalProperties",
+      "items",
+      "enum",
+      "const",
+      "description",
+      "title",
+      "default",
+      "examples",
+    ]);
+
+    const assertStrictMinimalSubset = (node: unknown, pointer = "$"): void => {
+      assert.ok(node && typeof node === "object" && !Array.isArray(node), `${pointer} must be an object`);
+      for (const [key, val] of Object.entries(node as Record<string, unknown>)) {
+        assert.ok(
+          ALLOWED_MINIMAL_KEYWORDS.has(key),
+          `unexpected JSON Schema keyword '${key}' at ${pointer}`,
+        );
+        if (key === "properties") {
+          assert.ok(val && typeof val === "object" && !Array.isArray(val));
+          for (const [propName, propSchema] of Object.entries(val as Record<string, unknown>)) {
+            assertStrictMinimalSubset(propSchema, `${pointer}.properties.${propName}`);
+          }
+        } else if (key === "items") {
+          assertStrictMinimalSubset(val, `${pointer}.items`);
+        }
+      }
+    };
+
+    const listTools = async (
+      extraEnv: Record<string, string | undefined> = {},
+      extraArgs: string[] = [],
+    ) => {
+      const res = await sendMessagesToServer(
+        [
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "initialize",
+            params: {
+              protocolVersion: "2025-03-26",
+              capabilities: {},
+              clientInfo: { name: "strict-subset-client", version: "1.0.0" },
+            },
+          }) + "\n",
+          JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }) + "\n",
+        ],
+        extraEnv,
+        extraArgs,
+      );
+      assert.equal(res.code, 0, res.stderr);
+      assert.equal(res.stderr, "");
+      const lines = res.stdout.trim().split("\n").map((l) => JSON.parse(l));
+      return lines.find((l) => l.id === 2)?.result?.tools as Array<{
+        name: string;
+        description: string;
+        inputSchema: Record<string, unknown>;
+      }>;
+    };
+
+    const standardTools = await listTools();
+    const minimalCliTools = await listTools({}, ["--schema-compat=minimal"]);
+    const minimalEnvTools = await listTools({ AGY_FAST_SCHEMA_COMPAT: "minimal" });
+    // CLI flag overrides env var in both directions
+    const cliOverrideStandard = await listTools(
+      { AGY_FAST_SCHEMA_COMPAT: "minimal" },
+      ["--schema-compat", "standard"],
+    );
+    // Unrecognized env var falls back safely to standard
+    const invalidEnvFallback = await listTools({ AGY_FAST_SCHEMA_COMPAT: "bogus" });
+
+    assert.deepEqual(minimalCliTools, minimalEnvTools);
+    assert.deepEqual(cliOverrideStandard, standardTools);
+    assert.deepEqual(invalidEnvFallback, standardTools);
+
+    assert.equal(minimalCliTools.length, 5);
+    for (let i = 0; i < minimalCliTools.length; i++) {
+      const stdTool = standardTools[i]!;
+      const minTool = minimalCliTools[i]!;
+      assert.equal(minTool.name, stdTool.name);
+      assert.equal(hasDisallowedSchemaKeyword(minTool.inputSchema), false);
+      assertStrictMinimalSubset(minTool.inputSchema, minTool.name);
+      const stdBytes = Buffer.byteLength(JSON.stringify(stdTool), "utf8");
+      const minBytes = Buffer.byteLength(JSON.stringify(minTool), "utf8");
+      assert.ok(minBytes <= 1280, `${minTool.name} minimal schema exceeds 1280B (${minBytes}B)`);
+      assert.ok(
+        minBytes < stdBytes,
+        `${minTool.name} minimal schema (${minBytes}B) should be smaller than standard (${stdBytes}B)`,
+      );
+    }
+
+    // Crucial regression guard: stripping JSON Schema 'pattern' keyword must NEVER
+    // remove the tool property literally named 'pattern' in batch_search.queries.
+    const batchSearchMin = minimalCliTools.find((t) => t.name === "batch_search")!;
+    const queryItemProps = (
+      (
+        (batchSearchMin.inputSchema.properties as Record<string, unknown>)
+          .queries as Record<string, unknown>
+      ).items as Record<string, unknown>
+    ).properties as Record<string, unknown>;
+    assert.deepEqual(queryItemProps.pattern, { type: "string" });
+
+    // Runtime validation remains intact even when minItems/minimum are stripped from schema
+    const runtimeCheck = await sendMessagesToServer(
+      [
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: "2025-03-26", capabilities: {} },
+        }) + "\n",
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 2,
+          method: "tools/call",
+          params: {
+            name: "batch_search",
+            arguments: { cwd: tmpDir, queries: [] },
+          },
+        }) + "\n",
+      ],
+      {},
+      ["--schema-compat=minimal"],
+    );
+    assert.equal(runtimeCheck.code, 0);
+    const callReply = runtimeCheck.stdout
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l))
+      .find((l) => l.id === 2);
+    assert.equal(callReply.result.isError, true);
+
+    // Invalid CLI flag values fail fast; --help prints usage and exits 0
+    const badVal = await sendMessagesToServer([], {}, ["--schema-compat=invalid"]);
+    assert.equal(badVal.code, 1);
+    assert.match(badVal.stderr, /Invalid --schema-compat/);
+
+    const missingVal = await sendMessagesToServer([], {}, ["--schema-compat"]);
+    assert.equal(missingVal.code, 1);
+    assert.match(missingVal.stderr, /Missing value for --schema-compat/);
+
+    const unknownFlag = await sendMessagesToServer([], {}, ["--does-not-exist"]);
+    assert.equal(unknownFlag.code, 1);
+    assert.match(unknownFlag.stderr, /Unknown argument/);
+
+    const helpRes = await sendMessagesToServer([], {}, ["--help"]);
+    assert.equal(helpRes.code, 0);
+    assert.match(helpRes.stdout, /--schema-compat/);
+  });
+
+  it("enforces zero runtime dependencies, bundle size budget, and portable bin packaging", async () => {
+    const pkgPath = path.resolve(process.cwd(), "package.json");
+    const pkg = JSON.parse(await fs.readFile(pkgPath, "utf8")) as {
+      dependencies?: Record<string, string>;
+      bin?: Record<string, string>;
+      files?: string[];
+    };
+
+    assert.equal(
+      Object.keys(pkg.dependencies ?? {}).length,
+      0,
+      "agy-fast must keep zero runtime dependencies",
+    );
+    assert.equal(pkg.bin?.["agy-fast"], "./scripts/install.mjs");
+    assert.equal(pkg.bin?.["agy-fast-mcp"], "./dist/mcp-server.mjs");
+    assert.ok(Array.isArray(pkg.files) && pkg.files.includes("dist/*.mjs"));
+    assert.ok(Array.isArray(pkg.files) && pkg.files.includes("scripts/install.mjs"));
+
+    const serverBuf = await fs.readFile(MCP_SERVER_SCRIPT);
+    assert.ok(
+      serverBuf.subarray(0, 32).toString("utf8").startsWith("#!/usr/bin/env node\n"),
+      "dist/mcp-server.mjs must start with a node shebang for portable npx/bin execution",
+    );
+    const MAX_MCP_BUNDLE_BYTES = 512 * 1024;
+    assert.ok(
+      serverBuf.byteLength <= MAX_MCP_BUNDLE_BYTES,
+      `dist/mcp-server.mjs is ${serverBuf.byteLength} bytes, exceeding ${MAX_MCP_BUNDLE_BYTES}-byte anti-bloat budget`,
+    );
+  });
+
+  it("filters registered MCP tools via --tools and AGY_FAST_TOOLS and rejects invalid tool names", async () => {
+    const runWithArgs = (
+      cliArgs: string[],
+      rawChunks: string[],
+      extraEnv: Record<string, string | undefined> = {},
+    ): Promise<{ code: number | null; stdout: string; stderr: string }> =>
+      new Promise((resolve, reject) => {
+        const child = spawn(process.execPath, [MCP_SERVER_SCRIPT, ...cliArgs], {
+          stdio: ["pipe", "pipe", "pipe"],
+          env: buildCleanServerEnv(extraEnv),
+          windowsHide: true,
+        });
+        let stdout = "";
+        let stderr = "";
+        const timer = setTimeout(() => {
+          child.kill("SIGKILL");
+          reject(new Error(`runWithArgs timed out for args: ${cliArgs.join(" ")}`));
+        }, 6_000);
+        timer.unref();
+        child.stdout.on("data", (d) => {
+          stdout += d.toString("utf8");
+        });
+        child.stderr.on("data", (d) => {
+          stderr += d.toString("utf8");
+        });
+        child.on("error", (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+        child.on("close", (code) => {
+          clearTimeout(timer);
+          resolve({ code, stdout, stderr });
+        });
+        for (const chunk of rawChunks) child.stdin.write(chunk);
+        child.stdin.end();
+      });
+
+    const listReq = [
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "codex", version: "1.0.0" } },
+      })}\n`,
+      `${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`,
+      `${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" })}\n`,
+      `${JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "apply_edits", arguments: { edits: [] } } })}\n`,
+    ];
+
+    // 1. --tools comma-separated subset exposes only selected tools and rejects excluded tool calls
+    const subsetRes = await runWithArgs(["--tools", "batch_search,quick_outline,run_checks"], listReq);
+    assert.equal(subsetRes.code, 0, subsetRes.stderr);
+    const subsetLines = subsetRes.stdout.trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>);
+    const toolsList = ((subsetLines[1]!.result as { tools: Array<{ name: string }> }).tools).map((t) => t.name);
+    assert.deepEqual(toolsList, ["batch_search", "quick_outline", "run_checks"]);
+    const excludedCallErr = subsetLines[2]!.error as { code: number; message: string };
+    assert.equal(excludedCallErr.code, -32602);
+    assert.match(excludedCallErr.message, /Unknown tool/i);
+
+    // 2. AGY_FAST_TOOLS env var fallback works and --tools=... overrides it
+    const envRes = await runWithArgs([], listReq.slice(0, 3), { AGY_FAST_TOOLS: "quick_outline,run_checks" });
+    assert.equal(envRes.code, 0, envRes.stderr);
+    const envLines = envRes.stdout.trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>);
+    assert.deepEqual(
+      ((envLines[1]!.result as { tools: Array<{ name: string }> }).tools).map((t) => t.name),
+      ["quick_outline", "run_checks"],
+    );
+
+    const overrideRes = await runWithArgs(["--tools=batch_search"], listReq.slice(0, 3), { AGY_FAST_TOOLS: "run_checks" });
+    assert.equal(overrideRes.code, 0, overrideRes.stderr);
+    const overrideLines = overrideRes.stdout.trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>);
+    assert.deepEqual(
+      ((overrideLines[1]!.result as { tools: Array<{ name: string }> }).tools).map((t) => t.name),
+      ["batch_search"],
+    );
+
+    // 3. Invalid tool name, empty --tools, missing --tools value, duplicate invalid --tools, unknown flags, or extra args fail fast
+    for (const badArgs of [
+      ["--tools", "not_a_tool"],
+      ["--tools="],
+      ["--tools"],
+      ["--tools", "bogus", "--tools", "batch_search"],
+      ["--tool=batch_search"],
+      ["--tools", "batch_search", "quick_outline"],
+      ["--tools=batch_search", "--cli", "search", "foo"],
+    ]) {
+      const badRes = await runWithArgs(badArgs, []);
+      assert.equal(badRes.code, 1, `Expected exit 1 for ${badArgs.join(" ")}`);
+      assert.ok(badRes.stderr.length > 0);
+    }
+
+    // 4. --help succeeds even when AGY_FAST_TOOLS is invalid
+    const helpRes = await runWithArgs(["--help"], [], { AGY_FAST_TOOLS: "bogus" });
+    assert.equal(helpRes.code, 0, helpRes.stderr);
+    assert.match(helpRes.stdout, /--tools/);
+
+    // 5. Programmatic createAgyFastServer({ tools }) validates empty/unknown entries
+    assert.throws(() => createAgyFastServer({ tools: [] }), /empty/i);
+    assert.throws(() => createAgyFastServer({ tools: ["bogus" as never] }), /Unknown tool/i);
   });
 });

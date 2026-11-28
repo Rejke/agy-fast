@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -30,6 +30,7 @@ describe("installer", () => {
     const env: NodeJS.ProcessEnv = { ...process.env, HOME: homeDir, USERPROFILE: homeDir };
     delete env.GEMINI_HOME;
     delete env.ANTIGRAVITY_APP_DATA_DIR;
+    delete env.AGY_FAST_TOOLS;
     for (const [k, v] of Object.entries(extra)) {
       if (v === undefined) delete env[k];
       else env[k] = v;
@@ -49,7 +50,6 @@ describe("installer", () => {
     assert.match(out1, /Installed agy-fast/);
     assert.match(out1, /MCP server\s+: OK \(5 tools:/);
     assert.match(out1, /SessionStart: OK/);
-    assert.match(out1, /PreInvocation: OK/);
 
     // Verify all runtime files (including installer for self-doctor) are present and no node_modules copied
     for (const rel of [
@@ -60,7 +60,6 @@ describe("installer", () => {
       "assets/logo.svg",
       "dist/mcp-server.mjs",
       "dist/session-start.mjs",
-      "dist/pre-invocation.mjs",
       "dist/benchmark.mjs",
       "dist/updater.mjs",
       "scripts/install.mjs",
@@ -683,28 +682,347 @@ describe("installer", () => {
       );
       const backToLazy = JSON.parse(await fs.readFile(mcpConfigPath, "utf8"));
       assert.equal(backToLazy.mcpServers.fast.tools, undefined);
+    } finally {
+      await fs.rm(modeHome, { recursive: true, force: true });
+    }
+  });
 
-      // 5. `config --auto-compact-tokens` persists cleanly and surfaces in doctor
-      const quotaCfgOut = execFileSync(
+  it("falls back to atomic in-place sync on EBUSY/EPERM copied dir and fails clearly for --link", async () => {
+    const busyHome = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-ebusy-"));
+    const env = makeIsolatedEnv(busyHome);
+    const targetDir = path.join(busyHome, ".gemini", "config", "plugins", "agy-fast");
+    let locker: ReturnType<typeof spawn> | null = null;
+    try {
+      execFileSync(
         process.execPath,
-        [
-          INSTALL_SCRIPT,
-          "config",
-          "--no-acp",
-          "--auto-compact-tokens",
-          "320000",
-        ],
+        [INSTALL_SCRIPT, "install", "--no-enable", "--no-acp"],
         { env, encoding: "utf8" },
       );
-      assert.match(quotaCfgOut, /autoCompactTokens\s*: 320000/);
-      const quotaDocOut = execFileSync(
+      const customRuleContent = "---\ntrigger: always_on\n---\nkeep-me\n";
+      await fs.writeFile(path.join(targetDir, "rules", "custom.local.md"), customRuleContent, "utf8");
+      const targetManifestPath = path.join(targetDir, "plugin.json");
+      const beforeManifest = JSON.parse(await fs.readFile(targetManifestPath, "utf8"));
+      await fs.writeFile(
+        targetManifestPath,
+        JSON.stringify({ ...beforeManifest, version: "0.0.1-old" }, null, 2),
+        "utf8",
+      );
+
+      // Hold a cwd lock inside targetDir (on Windows this causes EBUSY on rename/rmdir)
+      locker = spawn(process.execPath, ["-e", 'console.log("READY"); setInterval(() => {}, 1000);'], {
+        cwd: path.join(targetDir, "dist"),
+        stdio: ["ignore", "pipe", "ignore"],
+        windowsHide: true,
+      });
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("locker did not emit READY")), 5000);
+        locker!.stdout!.on("data", (chunk: Buffer) => {
+          if (chunk.toString("utf8").includes("READY")) {
+            clearTimeout(timer);
+            resolve();
+          }
+        });
+        locker!.once("error", (e) => {
+          clearTimeout(timer);
+          reject(e);
+        });
+      });
+
+      const reinstallOut = execFileSync(
+        process.execPath,
+        [INSTALL_SCRIPT, "install", "--no-enable", "--no-acp"],
+        { env, encoding: "utf8" },
+      );
+      assert.match(reinstallOut, /Installed agy-fast/);
+      if (process.platform === "win32") {
+        assert.match(reinstallOut, /updated files atomically in-place/i);
+      }
+      const afterManifest = JSON.parse(await fs.readFile(targetManifestPath, "utf8"));
+      assert.equal(afterManifest.version, beforeManifest.version);
+      assert.equal(
+        await fs.readFile(path.join(targetDir, "rules", "custom.local.md"), "utf8"),
+        customRuleContent,
+      );
+      for (const dir of [targetDir, path.join(targetDir, "dist"), path.join(targetDir, "rules")]) {
+        const entries = await fs.readdir(dir);
+        assert.equal(entries.some((n) => n.includes(".agy-tmp.")), false);
+      }
+      const parentEntries = await fs.readdir(path.dirname(targetDir));
+      assert.equal(parentEntries.some((n) => n.includes(".agy-trash-")), false);
+
+      if (process.platform === "win32") {
+        assert.throws(
+          () =>
+            execFileSync(
+              process.execPath,
+              [INSTALL_SCRIPT, "install", "--link", "--no-enable", "--no-acp"],
+              { env, encoding: "utf8" },
+            ),
+          /Close the running host\/MCP process/i,
+        );
+        // Atomic rename failed before deleting plugin.json / custom.local.md, so both remain intact
+        assert.equal(
+          await fs.readFile(path.join(targetDir, "rules", "custom.local.md"), "utf8"),
+          customRuleContent,
+        );
+        assert.equal(JSON.parse(await fs.readFile(targetManifestPath, "utf8")).name, "agy-fast");
+      }
+    } finally {
+      if (locker && locker.exitCode === null && locker.signalCode === null) {
+        const closed = new Promise<void>((resolve) => {
+          locker!.once("close", () => resolve());
+        });
+        locker.kill("SIGKILL");
+        await closed;
+      }
+      await fs.rm(busyHome, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  it("starts standalone MCP server and forwards flags cleanly via 'mcp' subcommand", async () => {
+    const mcpResult = await new Promise<{ code: number | null; stdout: string; stderr: string }>(
+      (resolve, reject) => {
+        const child = spawn(
+          process.execPath,
+          [INSTALL_SCRIPT, "mcp", "--schema-compat=minimal"],
+          {
+            stdio: ["pipe", "pipe", "pipe"],
+            windowsHide: true,
+            env: makeIsolatedEnv(fakeHome),
+          },
+        );
+        let stdout = "";
+        let stderr = "";
+        const timer = setTimeout(() => {
+          child.kill("SIGKILL");
+          reject(new Error("install.mjs mcp timed out"));
+        }, 10_000);
+        timer.unref();
+        child.stdout.on("data", (d) => (stdout += d.toString("utf8")));
+        child.stderr.on("data", (d) => (stderr += d.toString("utf8")));
+        child.on("error", (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+        child.on("close", (code) => {
+          clearTimeout(timer);
+          resolve({ code, stdout, stderr });
+        });
+        child.stdin.write(
+          `${JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "initialize",
+            params: { protocolVersion: "2025-03-26", capabilities: {} },
+          })}\n${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" })}\n`,
+        );
+        child.stdin.end();
+      },
+    );
+
+    assert.equal(mcpResult.code, 0, mcpResult.stderr);
+    assert.equal(mcpResult.stderr, "");
+    const responses = mcpResult.stdout
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.equal(responses.length, 2);
+    const tools = responses[1].result.tools as Array<{
+      name: string;
+      inputSchema: Record<string, unknown>;
+    }>;
+    assert.equal(tools.length, 5);
+    assert.equal(
+      JSON.stringify(tools).includes('"minimum"'),
+      false,
+      "forwarded --schema-compat=minimal must strip minimum constraints",
+    );
+
+    const cliOut = execFileSync(
+      process.execPath,
+      [INSTALL_SCRIPT, "mcp", "--cli", "outline", "package.json"],
+      { env: makeIsolatedEnv(fakeHome), encoding: "utf8" },
+    );
+    assert.match(cliOut, /package\.json/);
+  });
+
+  it("installs and passes doctor even when ambient AGY_FAST_TOOLS is set", async () => {
+    const ambientHome = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-ambient-tools-"));
+    try {
+      const env = makeIsolatedEnv(ambientHome, {
+        AGY_FAST_TOOLS: "batch_search,quick_outline,run_checks",
+      });
+      execFileSync(
+        process.execPath,
+        [INSTALL_SCRIPT, "install", "--no-enable", "--no-acp"],
+        { env, encoding: "utf8" },
+      );
+      const doctorOut = execFileSync(
         process.execPath,
         [INSTALL_SCRIPT, "doctor"],
         { env, encoding: "utf8" },
       );
-      assert.match(quotaDocOut, /PreInvocation: OK \(.*threshold: 320000\)/);
+      assert.match(doctorOut, /MCP server\s+: OK \(5 tools:/);
     } finally {
-      await fs.rm(modeHome, { recursive: true, force: true });
+      await fs.rm(ambientHome, { recursive: true, force: true });
+    }
+  });
+
+  it("generates standard MCP JSON config snippets, valid Antigravity mcp_config, and tailored generic rules", async () => {
+    const cfgHome = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-mcpcfg-"));
+    try {
+      const env = makeIsolatedEnv(cfgHome);
+      const customTarget = path.join(cfgHome, 'custom "$plugin"');
+      const expectedPosix = path.join(customTarget, "dist", "mcp-server.mjs").split(path.sep).join("/");
+
+      // 1. Default mcp-only JSON output + --schema-compat=minimal support
+      const jsonOut = execFileSync(
+        process.execPath,
+        [INSTALL_SCRIPT, "mcp-config", "--quiet", "--target", customTarget],
+        { env, encoding: "utf8" },
+      );
+      assert.deepEqual(JSON.parse(jsonOut).mcpServers["agy-fast"], {
+        command: "node",
+        args: [expectedPosix],
+      });
+
+      const minOut = execFileSync(
+        process.execPath,
+        [INSTALL_SCRIPT, "mcp-config", "--quiet", "--host=generic", "--schema-compat=minimal", "--target", customTarget],
+        { env, encoding: "utf8" },
+      );
+      assert.deepEqual(JSON.parse(minOut).mcpServers["agy-fast"], {
+        command: "node",
+        args: [expectedPosix, "--schema-compat=minimal"],
+      });
+
+      // 2. Antigravity mcp_config.json uses tools.<name>.eager (no invalid toolLoading key) and respects --tool-loading lazy
+      const agyOut = execFileSync(
+        process.execPath,
+        [INSTALL_SCRIPT, "mcp-config", "--quiet", "--host", "antigravity", "--target", customTarget],
+        { env, encoding: "utf8" },
+      );
+      const agyCfg = JSON.parse(agyOut);
+      assert.equal(agyCfg.mcpServers.fast.toolLoading, undefined);
+      assert.equal(agyCfg.mcpServers.fast.tools.batch_search.eager, true);
+      assert.equal(agyCfg.mcpServers.fast.tools.run_checks.eager, true);
+
+      const agyLazyOut = execFileSync(
+        process.execPath,
+        [INSTALL_SCRIPT, "mcp-config", "--quiet", "--host", "antigravity", "--tool-loading", "lazy", "--target", customTarget],
+        { env, encoding: "utf8" },
+      );
+      assert.equal(JSON.parse(agyLazyOut).mcpServers.fast.tools, undefined);
+
+      // 3. Host-agnostic rules template handles read_slices, shared cwd, dev schema bounds, filtered CLI subcommands, and shell quoting
+      const sliceRulesOut = execFileSync(
+        process.execPath,
+        [INSTALL_SCRIPT, "mcp-config", "--rules", "--tools", "read_slices", "--target", customTarget],
+        { env, encoding: "utf8" },
+      );
+      assert.match(sliceRulesOut, /`read_slices`/);
+      assert.match(sliceRulesOut, /Pass explicit `cwd`/);
+      assert.match(sliceRulesOut, /lineRanges/);
+      assert.match(sliceRulesOut, /<=150/);
+      assert.match(sliceRulesOut, /--cli <slice>/);
+      assert.ok(sliceRulesOut.includes('\\"\\$plugin\\"'));
+
+      const subsetRulesOut = execFileSync(
+        process.execPath,
+        [
+          INSTALL_SCRIPT,
+          "mcp-config",
+          "--rules",
+          "--tools",
+          "batch_search,quick_outline,run_checks",
+          "--target",
+          customTarget,
+        ],
+        { env, encoding: "utf8" },
+      );
+      assert.match(subsetRulesOut, /`batch_search`/);
+      assert.match(subsetRulesOut, /contextLines.*0\.\.10/);
+      assert.match(subsetRulesOut, /150/);
+      assert.match(subsetRulesOut, /--cli <search\|outline\|check>/);
+      assert.doesNotMatch(subsetRulesOut, /`apply_edits`/);
+      assert.doesNotMatch(subsetRulesOut, /`read_slices`/);
+      assert.doesNotMatch(subsetRulesOut, /mcp_agy-fast_fast_|call_mcp_tool|toolSummary|SessionStart/);
+
+      // 4. --tools wires server-side --tools args (and filters Antigravity eager map)
+      const filteredJsonOut = execFileSync(
+        process.execPath,
+        [
+          INSTALL_SCRIPT,
+          "mcp-config",
+          "--quiet",
+          "--host",
+          "json",
+          "--tools",
+          "batch_search,quick_outline",
+          "--schema-compat=minimal",
+          "--target",
+          customTarget,
+        ],
+        { env, encoding: "utf8" },
+      );
+      assert.deepEqual(JSON.parse(filteredJsonOut).mcpServers["agy-fast"], {
+        command: "node",
+        args: [expectedPosix, "--tools", "batch_search,quick_outline", "--schema-compat=minimal"],
+      });
+
+      const filteredAgyOut = execFileSync(
+        process.execPath,
+        [
+          INSTALL_SCRIPT,
+          "mcp-config",
+          "--quiet",
+          "--host",
+          "antigravity",
+          "--tools",
+          "batch_search,quick_outline",
+          "--target",
+          customTarget,
+        ],
+        { env, encoding: "utf8" },
+      );
+      const filteredAgyCfg = JSON.parse(filteredAgyOut);
+      assert.deepEqual(filteredAgyCfg.mcpServers.fast.args, [
+        expectedPosix,
+        "--tools",
+        "batch_search,quick_outline",
+      ]);
+      assert.deepEqual(Object.keys(filteredAgyCfg.mcpServers.fast.tools), [
+        "batch_search",
+        "quick_outline",
+      ]);
+
+      // 5. Invalid --host, trailing comma in --tools, or cross-command flags fail fast
+      assert.throws(
+        () =>
+          execFileSync(process.execPath, [INSTALL_SCRIPT, "mcp-config", "--host", "codex"], {
+            env,
+            encoding: "utf8",
+          }),
+        /Invalid value after --host/,
+      );
+      assert.throws(
+        () =>
+          execFileSync(process.execPath, [INSTALL_SCRIPT, "mcp-config", "--tools", "batch_search,"], {
+            env,
+            encoding: "utf8",
+          }),
+        /empty tool entry/i,
+      );
+      assert.throws(
+        () =>
+          execFileSync(process.execPath, [INSTALL_SCRIPT, "install", "--tools", "batch_search"], {
+            env,
+            encoding: "utf8",
+          }),
+        /only supported with the 'mcp-config' command/,
+      );
+    } finally {
+      await fs.rm(cfgHome, { recursive: true, force: true });
     }
   });
 });

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -13,7 +13,10 @@ import {
   formatCompareMarkdown,
   formatMetricsMarkdown,
   formatUsageSplitMarkdown,
+  loadSessionsFromFiles,
   parseTranscriptJsonl,
+  parseTranscriptJsonlFile,
+  type SkippedTranscriptFile,
 } from "../src/benchmark-core.js";
 
 const BENCHMARK_CLI = path.resolve(process.cwd(), "dist", "benchmark.mjs");
@@ -384,19 +387,30 @@ describe("benchmark analyzer & CLI", () => {
     // Symlinked transcript files & session dirs are collected, deduplicated, and cycle-safe
     const symlinkDir = path.join(tmpDir, "symlink-runs");
     await fs.mkdir(symlinkDir, { recursive: true });
-    await fs.symlink(
-      path.join(sess1Logs, "transcript_full.jsonl"),
-      path.join(symlinkDir, "s1-link.jsonl"),
-    );
+    try {
+      await fs.symlink(
+        path.join(sess1Logs, "transcript_full.jsonl"),
+        path.join(symlinkDir, "s1-link.jsonl"),
+      );
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (process.platform !== "win32" || (code !== "EPERM" && code !== "ENOTSUP")) {
+        throw err;
+      }
+    }
+
+    const dirLinkType = process.platform === "win32" ? "junction" : "dir";
     await fs.symlink(
       path.join(brainDir, "sess-1"),
       path.join(symlinkDir, "s1-dir-link"),
+      dirLinkType,
     );
     await fs.symlink(
       path.join(brainDir, "sess-2"),
       path.join(symlinkDir, "s2-dir-link"),
+      dirLinkType,
     );
-    await fs.symlink(symlinkDir, path.join(symlinkDir, "self-loop"));
+    await fs.symlink(symlinkDir, path.join(symlinkDir, "self-loop"), dirLinkType);
 
     const symlinkFiles = await collectTranscriptFiles([symlinkDir]);
     assert.equal(symlinkFiles.length, 2);
@@ -1912,5 +1926,158 @@ describe("benchmark analyzer & CLI", () => {
     });
     assert.match(splitMd, /Prompt Cache misses \(non-compact\) \| 7 \| 7 \| 0 \| -100\.0% \|/);
     assert.match(splitMd, /Sustained cache collapse \(>=3 misses\) \| 1 runs \(4t\) \| 1 runs \(4t\) \| 0 runs \(0t\) \|/);
+  });
+
+  it("streams transcript JSONL line-by-line with full parity to parseTranscriptJsonl", async () => {
+    const streamDir = path.join(tmpDir, "stream-parity");
+    await fs.mkdir(streamDir, { recursive: true });
+
+    const lines = [
+      // UTF-8 BOM on first line + CRLF
+      "\uFEFF" +
+        JSON.stringify({
+          step_index: 0,
+          type: "USER_INPUT",
+          created_at: "2026-11-23T10:00:00Z",
+        }),
+      "   ",
+      "{malformed json line without closing brace",
+      "42",
+      '"just a string"',
+      "null",
+      JSON.stringify({
+        step_index: 1,
+        type: "PLANNER_RESPONSE",
+        created_at: "2026-11-23T10:00:02Z",
+        input_tokens: 1200,
+        output_tokens: 80,
+        tool_calls: [{ name: "mcp_agy-fast_fast_batch_search", args: { queries: [] } }],
+      }),
+      ...Array.from({ length: 120 }, (_, i) =>
+        JSON.stringify({
+          step_index: i + 2,
+          type: "GENERIC",
+          created_at: `2026-11-23T10:00:${String(3 + (i % 50)).padStart(2, "0")}Z`,
+          content: `step payload ${i} with unicode 中文`,
+        }),
+      ),
+      // Trailing line WITHOUT trailing newline
+      JSON.stringify({
+        step_index: 999,
+        type: "PLANNER_RESPONSE",
+        created_at: "2026-11-23T10:02:00Z",
+        output_tokens: 50,
+      }),
+    ];
+    // Mix CRLF and LF endings without trailing newline
+    const rawContent = lines
+      .map((line, i) => (i === lines.length - 1 ? line : `${line}${i % 2 === 0 ? "\r\n" : "\n"}`))
+      .join("");
+    const filePath = path.join(streamDir, "transcript.jsonl");
+    await fs.writeFile(filePath, rawContent, "utf8");
+
+    const fromString = parseTranscriptJsonl(rawContent);
+    const fromStream = await parseTranscriptJsonlFile(filePath);
+    assert.deepEqual(fromStream, fromString);
+    assert.equal(fromStream.length, 123);
+    assert.equal(fromStream[fromStream.length - 1]?.step_index, 999);
+
+    // Rejects cleanly on unreadable targets (missing path and directory)
+    await assert.rejects(
+      () => parseTranscriptJsonlFile(path.join(streamDir, "does-not-exist.jsonl")),
+    );
+    await assert.rejects(() => parseTranscriptJsonlFile(streamDir));
+  });
+
+  it("loads sessions with bounded concurrency and reports unreadable/corrupted skipped files", async () => {
+    const batchDir = path.join(tmpDir, "bounded-skip-suite");
+    await fs.mkdir(batchDir, { recursive: true });
+
+    const makeSessionJsonl = (id: number): string =>
+      [
+        JSON.stringify({
+          step_index: 0,
+          type: "USER_INPUT",
+          created_at: `2026-11-23T11:${String(id).padStart(2, "0")}:00Z`,
+        }),
+        JSON.stringify({
+          step_index: 1,
+          type: "PLANNER_RESPONSE",
+          created_at: `2026-11-23T11:${String(id).padStart(2, "0")}:02Z`,
+          input_tokens: 1000,
+          output_tokens: 60,
+        }),
+      ].join("\n") + "\n";
+
+    // Create 18 valid sessions + 2 corrupted JSONL files + 1 empty JSONL file
+    for (let i = 0; i < 18; i++) {
+      const sub = path.join(batchDir, `s-${String(i).padStart(2, "0")}`);
+      await fs.mkdir(sub, { recursive: true });
+      await fs.writeFile(path.join(sub, "transcript.jsonl"), makeSessionJsonl(i), "utf8");
+    }
+    const corruptA = path.join(batchDir, "corrupt-a", "transcript.jsonl");
+    const corruptB = path.join(batchDir, "corrupt-b", "transcript.jsonl");
+    const emptyFile = path.join(batchDir, "empty-c", "transcript.jsonl");
+    await fs.mkdir(path.dirname(corruptA), { recursive: true });
+    await fs.mkdir(path.dirname(corruptB), { recursive: true });
+    await fs.mkdir(path.dirname(emptyFile), { recursive: true });
+    await fs.writeFile(corruptA, "{truncated json\nnot-json\n", "utf8");
+    await fs.writeFile(corruptB, "<<<corrupted>>>", "utf8");
+    await fs.writeFile(emptyFile, "   \n\n", "utf8");
+
+    const skipped: SkippedTranscriptFile[] = [];
+    const callbackSkipped: SkippedTranscriptFile[] = [];
+    const metrics = await analyzePaths([batchDir], {
+      concurrency: 4,
+      skippedFiles: skipped,
+      onSkippedFile: (item) => callbackSkipped.push(item),
+    });
+
+    assert.equal(metrics.sessions, 18);
+    assert.equal(skipped.length, 2);
+    assert.deepEqual(callbackSkipped, skipped);
+    assert.ok(skipped.some((s) => s.path === corruptA && /corrupted JSONL/.test(s.reason)));
+    assert.ok(skipped.some((s) => s.path === corruptB && /corrupted JSONL/.test(s.reason)));
+    assert.ok(!skipped.some((s) => s.path === emptyFile));
+
+    // Direct I/O errors (missing path + directory) are captured in skippedFiles cross-platform
+    const validFile = path.join(batchDir, "s-00", "transcript.jsonl");
+    const missingFile = path.join(batchDir, "missing-session.jsonl");
+    const ioSkipped: SkippedTranscriptFile[] = [];
+    const loaded = await loadSessionsFromFiles([validFile, missingFile, batchDir], {
+      concurrency: 2,
+      skippedFiles: ioSkipped,
+    });
+    assert.equal(loaded.length, 1);
+    assert.equal(ioSkipped.length, 2);
+    assert.equal(ioSkipped[0]?.path, missingFile);
+    assert.equal(ioSkipped[1]?.path, batchDir);
+
+    // Bounded recent waves stop cleanly after collecting N valid sessions even with corrupted files
+    const recentSkipped: SkippedTranscriptFile[] = [];
+    const recentSessions = await loadSessionsFromFiles(
+      [
+        corruptA,
+        path.join(batchDir, "s-01", "transcript.jsonl"),
+        path.join(batchDir, "s-02", "transcript.jsonl"),
+        path.join(batchDir, "s-03", "transcript.jsonl"),
+        path.join(batchDir, "s-04", "transcript.jsonl"),
+      ],
+      { recent: 3, concurrency: 2, skippedFiles: recentSkipped },
+    );
+    assert.equal(recentSessions.length, 3);
+    assert.equal(recentSkipped.length, 1);
+    assert.equal(recentSkipped[0]?.path, corruptA);
+
+    // CLI emits skipped-file warnings to stderr without breaking --json stdout schema
+    const cliRes = spawnSync(process.execPath, [BENCHMARK_CLI, "analyze", batchDir, "--json"], {
+      encoding: "utf8",
+    });
+    assert.equal(cliRes.status, 0, cliRes.stderr);
+    const parsedJson = JSON.parse(cliRes.stdout) as { sessions: number };
+    assert.equal(parsedJson.sessions, 18);
+    assert.match(cliRes.stderr, /Warning: skipped 2 unreadable\/corrupted transcript file\(s\)/);
+    assert.ok(cliRes.stderr.includes("corrupt-a"));
+    assert.ok(cliRes.stderr.includes("corrupt-b"));
   });
 });

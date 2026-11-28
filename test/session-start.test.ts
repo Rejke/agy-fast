@@ -8,6 +8,7 @@ import {
   buildWorkspaceSnapshot,
   isHomeOrSystemRoot,
   parsePorcelainBranchHeader,
+  toWorkspaceRelativeStatusLine,
 } from "../src/utils/snapshot.js";
 
 const HOOK_SCRIPT = path.resolve(process.cwd(), "dist", "session-start.mjs");
@@ -24,6 +25,7 @@ function runHook(
     delete env.AGY_FAST_HOST;
     delete env.AGY_FAST_EDITS_FORMAT;
     delete env.AGY_FAST_CACHE_DIR;
+    delete env.NODE_USE_ENV_PROXY;
     for (const [k, v] of Object.entries(extraEnv)) {
       if (v === undefined) delete env[k];
       else env[k] = v;
@@ -579,6 +581,7 @@ describe("session-start hook", () => {
         delete env.PLUGIN_ROOT;
         delete env.AGY_PLUGIN_ROOT;
         delete env.GEMINI_HOME;
+        delete env.NODE_USE_ENV_PROXY;
         for (const [k, v] of Object.entries(extraEnv)) {
           if (v === undefined) delete env[k];
           else env[k] = v;
@@ -853,5 +856,180 @@ describe("session-start hook", () => {
     } finally {
       await fs.rm(cjkDir, { recursive: true, force: true });
     }
+  });
+
+  it("scopes git status to a nested workspace with workspace-relative paths and ignores enclosing repos that do not track it", async () => {
+    const outerDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-nested-snap-"));
+    // Drop the "Workspace: <absolute path>" header so path assertions only see the sections
+    const bodyOf = (snap: string) => snap.split("\n").slice(1).join("\n");
+    try {
+      const appDir = path.join(outerDir, "packages", "app");
+      const otherDir = path.join(outerDir, "packages", "other");
+      const untrackedDir = path.join(outerDir, "scratch", "demo");
+      const ignoredDir = path.join(outerDir, "sandbox");
+      await fs.mkdir(path.join(appDir, "src"), { recursive: true });
+      await fs.mkdir(otherDir, { recursive: true });
+      await fs.writeFile(path.join(outerDir, ".gitignore"), "sandbox/\n", "utf8");
+      await fs.writeFile(path.join(appDir, "package.json"), JSON.stringify({ name: "app" }), "utf8");
+      await fs.writeFile(path.join(appDir, "src", "a.ts"), "export const a = 1;\n", "utf8");
+      await fs.writeFile(path.join(otherDir, "b.ts"), "export const b = 1;\n", "utf8");
+      execFileSync("git", ["init", "-q"], { cwd: outerDir });
+      execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: outerDir });
+      execFileSync("git", ["config", "user.name", "Test"], { cwd: outerDir });
+      execFileSync("git", ["add", "."], { cwd: outerDir });
+      execFileSync("git", ["commit", "-q", "-m", "feat: outer repo"], { cwd: outerDir });
+
+      // Dirty files inside and outside the nested workspace
+      await fs.writeFile(path.join(appDir, "src", "a.ts"), "export const a = 2;\n", "utf8");
+      await fs.writeFile(path.join(appDir, "new file.ts"), "export {};\n", "utf8");
+      await fs.writeFile(path.join(otherDir, "b.ts"), "export const b = 2;\n", "utf8");
+      await fs.writeFile(path.join(outerDir, "root-only.txt"), "x\n", "utf8");
+      // Folders below the repo root that the repo does not track (untracked / ignored)
+      await fs.mkdir(untrackedDir, { recursive: true });
+      await fs.writeFile(path.join(untrackedDir, "go.mod"), "module example.com/scratch\n", "utf8");
+      await fs.mkdir(ignoredDir, { recursive: true });
+      await fs.writeFile(path.join(ignoredDir, "go.mod"), "module example.com/sandbox\n", "utf8");
+
+      const nested = await buildWorkspaceSnapshot(appDir);
+      assert.ok(nested !== null, "Expected non-null nested workspace snapshot");
+      assert.match(nested, /Git: branch `[^`]+` \(repo root: \.\.\/\.\.\)\n/);
+      assert.match(nested, /Modified \(2\): M src\/a\.ts, \?\? "?new file\.ts"?\n/);
+      assert.match(nested, /feat: outer repo/);
+      assert.doesNotMatch(bodyOf(nested), /packages\/|root-only|scratch|b\.ts/);
+
+      for (const [dir, moduleName] of [
+        [untrackedDir, "scratch"],
+        [ignoredDir, "sandbox"],
+      ] as const) {
+        const snap = await buildWorkspaceSnapshot(dir);
+        assert.ok(snap !== null, `Expected non-null snapshot for ${moduleName}`);
+        assert.ok(snap.includes(`go.mod (example.com/${moduleName})`), snap);
+        assert.doesNotMatch(bodyOf(snap), /Git: branch|feat: outer repo|root-only|packages/);
+      }
+
+      const root = await buildWorkspaceSnapshot(outerDir);
+      assert.ok(root !== null, "Expected non-null repo-root snapshot");
+      assert.match(root, /Git: branch `[^`]+`\n/);
+      assert.match(root, /M packages\/app\/src\/a\.ts, M packages\/other\/b\.ts/);
+
+      // rev-parse timeout must not misclassify a clean tracked nested workspace as untracked
+      const nestedRevParseTimeout = await buildWorkspaceSnapshot(appDir, {
+        gitExec: async (_bin, args) => {
+          if (args.includes("rev-parse")) {
+            return {
+              exitCode: null,
+              signal: "SIGTERM",
+              timedOut: true,
+              durationMs: 800,
+              stdout: "",
+              stderr: "",
+              truncated: false,
+            };
+          }
+          if (args.includes("status")) {
+            return {
+              exitCode: 0,
+              signal: null,
+              timedOut: false,
+              durationMs: 5,
+              stdout: "## main\n",
+              stderr: "",
+              truncated: false,
+            };
+          }
+          return {
+            exitCode: 0,
+            signal: null,
+            timedOut: false,
+            durationMs: 5,
+            stdout: "abc1234 feat: outer repo\n",
+            stderr: "",
+            truncated: false,
+          };
+        },
+      });
+      assert.ok(nestedRevParseTimeout !== null);
+      assert.match(nestedRevParseTimeout, /Git: branch `main` \(repo root: \.\.\/\.\.\)\n/);
+      assert.match(nestedRevParseTimeout, /Working tree: clean/);
+
+      // When both status and rev-parse time out on a nested workspace, keep the timeout fallback
+      const nestedAllTimeout = await buildWorkspaceSnapshot(appDir, {
+        gitExec: async () => ({
+          exitCode: null,
+          signal: "SIGTERM",
+          timedOut: true,
+          durationMs: 800,
+          stdout: "",
+          stderr: "",
+          truncated: false,
+        }),
+      });
+      assert.ok(nestedAllTimeout !== null);
+      assert.match(nestedAllTimeout, /Git: branch `[^`]+` \(repo root: \.\.\/\.\.\)\n/);
+      assert.match(nestedAllTimeout, /Working tree: unknown \(git status timed out\)/);
+
+      // Even if rev-parse times out, an untracked nested dir reported as `?? scratch/demo/` is still omitted
+      const untrackedRevParseTimeout = await buildWorkspaceSnapshot(untrackedDir, {
+        gitExec: async (_bin, args) => {
+          if (args.includes("rev-parse")) {
+            return {
+              exitCode: null,
+              signal: "SIGTERM",
+              timedOut: true,
+              durationMs: 800,
+              stdout: "",
+              stderr: "",
+              truncated: false,
+            };
+          }
+          return {
+            exitCode: 0,
+            signal: null,
+            timedOut: false,
+            durationMs: 5,
+            stdout: args.includes("status") ? "## main\n?? scratch/demo/\n" : "abc1234 feat: outer repo\n",
+            stderr: "",
+            truncated: false,
+          };
+        },
+      });
+      assert.ok(untrackedRevParseTimeout !== null);
+      assert.doesNotMatch(bodyOf(untrackedRevParseTimeout), /Git: branch|feat: outer repo/);
+    } finally {
+      await fs.rm(outerDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rewrites porcelain status lines relative to a nested workspace", () => {
+    assert.equal(toWorkspaceRelativeStatusLine(" M packages/app/src/a.ts", 2), " M src/a.ts");
+    assert.equal(toWorkspaceRelativeStatusLine("?? packages/app/new dir/", 2), "?? new dir/");
+    assert.equal(
+      toWorkspaceRelativeStatusLine('?? "packages/app/new file.ts"', 2),
+      '?? "new file.ts"',
+    );
+    assert.equal(
+      toWorkspaceRelativeStatusLine("R  packages/app/old.ts -> packages/app/src/new.ts", 2),
+      "R  old.ts -> src/new.ts",
+    );
+    assert.equal(
+      toWorkspaceRelativeStatusLine("C  packages/app/src.ts -> packages/app/copy.ts", 2),
+      "C  src.ts -> copy.ts",
+    );
+    // Non-rename paths literally containing " -> " must not be split or dropped
+    assert.equal(
+      toWorkspaceRelativeStatusLine(' M "packages/app/a -> b/c/d.ts"', 2),
+      ' M "a -> b/c/d.ts"',
+    );
+    assert.equal(
+      toWorkspaceRelativeStatusLine('?? "packages/app/foo -> bar/"', 2),
+      '?? "foo -> bar/"',
+    );
+    // The workspace itself (or an ancestor) reported as one untracked directory
+    assert.equal(toWorkspaceRelativeStatusLine("?? packages/app/", 2), null);
+    assert.equal(toWorkspaceRelativeStatusLine("?? packages/", 2), null);
+    assert.equal(toWorkspaceRelativeStatusLine('?? "my packages/"', 2), null);
+    // Repo-root workspaces and blank lines are left untouched
+    assert.equal(toWorkspaceRelativeStatusLine(" M src/a.ts", 0), " M src/a.ts");
+    assert.equal(toWorkspaceRelativeStatusLine("", 2), "");
   });
 });

@@ -1543,4 +1543,98 @@ describe("batch_search", () => {
       await fs.rm(cjkDir, { recursive: true, force: true });
     }
   });
+  it("enforces walkFiles maxDirs/timeoutMs budgets and supports contextLines up to 10", async () => {
+    const budgetDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-walk-budget-"));
+    try {
+      // Create 12 sibling subdirectories + a 25-line file for contextLines: 10 verification
+      for (let i = 0; i < 12; i++) {
+        const sub = path.join(budgetDir, `dir_${String(i).padStart(2, "0")}`);
+        await fs.mkdir(sub, { recursive: true });
+        await fs.writeFile(path.join(sub, `file_${i}.ts`), `export const n = ${i};\n`, "utf8");
+      }
+      const ctxLines = Array.from({ length: 25 }, (_, idx) =>
+        idx === 12 ? "const CONTEXT_TARGET_LINE = true;" : `// line ${idx + 1}`,
+      );
+      await fs.writeFile(path.join(budgetDir, "ctx.ts"), `${ctxLines.join("\n")}\n`, "utf8");
+
+      // 1. maxDirs caps glob & fuzzy scans gracefully instead of walking unbounded trees
+      const globCapRes = await runBatchSearch(
+        {
+          cwd: budgetDir,
+          queries: [
+            { type: "glob", pattern: "does-not-exist-*.xyz" },
+            { type: "fuzzy", pattern: "zzz_missing_token" },
+          ],
+        },
+        { walkMaxDirs: 3 },
+      );
+      assert.equal(globCapRes.isError, false);
+      assert.match(globCapRes.text, /scan budget reached/);
+
+      // 2. Partial matches found before maxDirs cap are returned with a budget notice
+      const partialRes = await runBatchSearch(
+        {
+          cwd: budgetDir,
+          queries: [{ type: "glob", pattern: "**/*.ts" }],
+        },
+        { walkMaxDirs: 3 },
+      );
+      assert.equal(partialRes.isError, false);
+      assert.match(partialRes.text, /ctx\.ts/);
+      assert.match(partialRes.text, /scan budget reached/);
+
+      // 3. Node fallback respects walkMaxDirs cleanly without hanging
+      const nodeCapRes = await runBatchSearch(
+        {
+          cwd: budgetDir,
+          queries: [{ type: "text", pattern: "NO_SUCH_TOKEN_XYZ" }],
+        },
+        { forceNodeFallback: true, walkMaxDirs: 3 },
+      );
+      assert.equal(nodeCapRes.isError, false);
+      assert.match(nodeCapRes.text, /scan budget reached/);
+
+      // 4. contextLines: 10 works in both rg and Node fallback (no longer clamped at 5)
+      for (const forceNodeFallback of [false, true]) {
+        const ctxRes = await runBatchSearch(
+          {
+            cwd: budgetDir,
+            queries: [{ type: "text", pattern: "CONTEXT_TARGET_LINE", path: "ctx.ts", contextLines: 10 }],
+          },
+          { forceNodeFallback },
+        );
+        assert.equal(ctxRes.isError, false);
+        assert.match(ctxRes.text, /3- \/\/ line 3/);
+        assert.match(ctxRes.text, /13: const CONTEXT_TARGET_LINE = true;/);
+        assert.match(ctxRes.text, /23- \/\/ line 23/);
+      }
+
+      // 5. walkFiles timeoutMs stops cleanly without throwing and marks timedOut + truncated
+      const timedWalk = await walkFiles(budgetDir, {
+        maxDirs: 1000,
+        timeoutMs: 1,
+        fileFilter: () => false,
+      });
+      assert.equal(Array.isArray(timedWalk.files), true);
+      if (timedWalk.timedOut) {
+        assert.equal(timedWalk.truncated, true);
+      }
+    } finally {
+      await fs.rm(budgetDir, { recursive: true, force: true });
+    }
+  });
+
+  it("appends a parseable 1-line Example JSON on validation errors", async () => {
+    const emptyRes = await runBatchSearch({ queries: [] });
+    assert.equal(emptyRes.isError, true);
+    const match = emptyRes.text.match(/\nExample: (\{.*\})$/);
+    assert.ok(match, emptyRes.text);
+    assert.ok(Array.isArray(JSON.parse(match[1]!).queries));
+
+    const badQueryRes = await runBatchSearch({
+      queries: [{ type: "unknown" as never, pattern: "foo" }],
+    });
+    assert.equal(badQueryRes.isError, false);
+    assert.match(badQueryRes.text, /Example: \{"queries":/);
+  });
 });

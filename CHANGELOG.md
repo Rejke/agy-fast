@@ -5,6 +5,58 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ---
 
+## [0.3.2] - 2026-11-26
+
+### Added
+
+- **Selective tool exposure (`--tools` / `AGY_FAST_TOOLS`), minimal JSON Schema subset switch, and portable MCP entrypoints (`src/mcp-server-core.ts`, `src/mcp-server.ts`, `scripts/build.mjs`, `scripts/install.mjs`, `package.json`, #64, thanks `@acrot0`, Refs #61, #74)**
+  - Added `--tools <list>` / `AGY_FAST_TOOLS` so standalone MCP hosts can expose only the needed tool subset (e.g. `batch_search,quick_outline,run_checks`) and cut fixed schema token overhead, while rejecting excluded tools with `-32602` and isolating ambient `AGY_FAST_TOOLS` in installer/updater/stress smoke checks.
+  - Added `--schema-compat <standard|minimal>` / `AGY_FAST_SCHEMA_COMPAT=minimal` to recursively strip numeric/array range constraint keywords (`minimum`/`maximum`/`minItems`/`maxItems`) for strict JSON Schema subset hosts (preserving property names such as `batch_search.queries[].pattern` and keeping all runtime validation unchanged).
+  - Added executable `#!/usr/bin/env node` shebang to `dist/mcp-server.mjs`, exposed `agy-fast-mcp` in `package.json` `bin` (with public npmjs `publishConfig`), and added `agy-fast mcp [args...]` in-process passthrough in `scripts/install.mjs`.
+- **Standard MCP config snippet generator & host-agnostic rules template (`scripts/install.mjs`, #72, thanks `@acrot0`, Refs #61, #74)**
+  - Added `mcp-config` subcommand supporting `--host <mcp-only|json|generic|antigravity>`, `--tools <list>`, `--schema-compat=minimal`, `--tool-loading eager|lazy`, and `--rules` for generating standard JSON snippets, strict-validated Antigravity `mcp_config.json`, and trimmed host-agnostic routing rules.
+- **Zero-schema-cost boundary coercion & 1-line validation examples (`src/utils/arg-validation.ts`, `src/tools/*.ts`, #77, thanks `@acrot0`, Refs #74)**
+  - Coerced clean bare single strings into 1-element arrays for `quick_outline.paths`, `read_slices.outlines`, and `read_slices.lineRanges` (while continuing to circuit-break serialized `"true"`/`"false"`/`"null"` and malformed JSON fragments), silently accepted `oldText`/`old_string` and `newText`/`new_string` fallback aliases in `apply_edits` (failing fast on conflicts within the `8,800 B` UTF-8 cap), and appended a minimal 1-line `Example:` JSON snippet to validation errors with `0 B` MCP schema overhead.
+- **Traditional Chinese documentation (`README.zh-TW.md`, `src/utils/updater-core.ts`, `scripts/install.mjs`, `package.json`, #87, thanks `@popuchoco`)**
+  - Added `README.zh-TW.md`, wired it into package files, installer optional docs, and updater sync, added language switcher links across all three READMEs, and aligned documented `run_checks` timeout limits with `150 s`.
+
+### Performance & Reliability
+
+- **Bounded `batch_search` / `walkFiles` scan budgets, `150 s` MCP call budget, and `contextLines <= 10` (`src/tools/batch-search.ts`, `src/utils/fs-utils.ts`, `src/utils/exec-utils.ts`, `src/mcp-server-core.ts`, `rules/AGENTS.md`, Refs #83)**
+  - Added time (`12 s` walk / `60 s` call) and directory-count (`20,000` dirs) caps to `walkFiles` and `batch_search` to prevent slow filesystem hangs, tightened `MCP_CALL_BUDGET_SEC` from `170 s` to `150 s`, raised `contextLines` maximum from `5` to `10` within the `<=1280 B` schema cap, and clarified required `pattern` usage.
+- **Streaming transcript JSONL benchmark parser (`src/benchmark-core.ts`, #49, thanks `@wathing-wind`, Refs #59)**
+  - Streamed transcript JSONL files line-by-line with bounded concurrency and skipped-file reporting to avoid loading multi-hundred-MB transcripts into memory at once.
+- **Sharper `rules/AGENTS.md` routing & cache hygiene (`rules/AGENTS.md`, #86, thanks `@liuye0209`)**
+  - Refined Rule 2 and Rule 4 to encourage complete symbol-range slicing (`<=200 lines/call`), compact-first broad searches (`files_with_matches`/`count`), accurate `run_checks` `full` vs. targeted failure reruns, and fast edit-verify timeout hygiene.
+- **Deterministic anti-bloat guardrails (`test/mcp-protocol.test.ts`)**
+  - Added assertions locking zero runtime `dependencies`, portable `bin`/`files` packaging, executable `dist/mcp-server.mjs` shebang, and a `512 KB` bundle ceiling alongside the existing `<=1280 B` per-tool schema cap.
+
+### Fixed
+
+- **Windows unquoted `;` PowerShell routing & hyphenated CLI guard (`src/utils/exec-utils.ts`, #76, thanks `@BLACK-BIRTHDAY`, Fixes #75)**
+  - Routed unquoted Windows `;` command chains to PowerShell while guarding hyphenated commands (`call-api`, `rem-tool`, `goto-def`) from being misclassified as `cmd.exe` builtins.
+- **Reject `apply_edits` hunk edits on non-UTF-8 files (`src/tools/apply-edits.ts`, #68, thanks `@ErrantSnow`)**
+  - Validated raw file bytes with Node's SIMD `isUtf8()` before applying hunks so non-UTF-8 legacy encodings are never silently corrupted with `\uFFFD`, while keeping UTF-8 BOM/CJK/CRLF and `create+overwrite: true` intact.
+- **Windows `EBUSY` atomic in-place installer/updater fallback & dev-source updates (`scripts/install.mjs`, `src/utils/updater-core.ts`, #69, thanks `@acrot0`, Fixes #65)**
+  - Added atomic in-place file swap fallback when Windows holds directory locks on `plugins/agy-fast`, evacuated targets via atomic rename into dot-prefixed trash before deletion, wrapped `uninstall` lock errors cleanly, and allowed dev-source `plugins/agy-fast` directories to update safely.
+- **Nested workspace `git status` scoping & timeout/rename hardening (`src/utils/snapshot.ts`, #79, thanks `@lymTudou`)**
+  - Scoped `SessionStart` `git status` to nested workspaces, skipped enclosing repos that do not track them, distinguished `rev-parse` timeouts from unborn `HEAD`, guarded `" -> "` splitting to `R`/`C` rename/copy entries, and resolved canonical git entries for branch reads.
+- **Compact test-failure header preservation in `output-filter` (`src/utils/output-filter.ts`, #73, thanks `@ErrantSnow`)**
+  - Preserved failing test headers (`not ok`, `✖`/`✕`/`✘`/`✗`/`×`, Jest `●` while excluding benign `● Console` and Next.js build bullets) and colon-scoped monorepo prefixes when compacting test logs.
+- **Hermetic, Windows-compatible test runner (`scripts/test.mjs`, `test/*.test.ts`, #70, thanks `@acrot0`; #89, thanks `@lymTudou`)**
+  - Isolated Windows non-admin `EPERM` symlink tests, gated `--test-concurrency` on Node `>=20.10.0`, stripped `NODE_USE_ENV_PROXY`, and isolated every `npm test` run inside a temporary `HOME` with `GIT_CONFIG_NOSYSTEM=1` and scrubbed `GIT_CONFIG_*`/`AGY_FAST_*` env vars.
+
+### 简体中文摘要（v0.3.2）
+
+- **按需暴露工具（`--tools`）、精简 Schema 子集与可移植 MCP 入口（#64 感谢 `@acrot0`，Refs #61/#74）**：新增 `--tools` / `AGY_FAST_TOOLS` 裁剪工具集合；新增 `--schema-compat=minimal` / `AGY_FAST_SCHEMA_COMPAT=minimal` 剥离数值/数组范围关键字以适配严格 JSON Schema 子集宿主（运行时校验不变）；为 `dist/mcp-server.mjs` 补齐 shebang、`package.json` 新增 `agy-fast-mcp` 入口与官方 npmjs `publishConfig`，`install.mjs` 新增进程内 `mcp` 透传子命令。
+- **标准 `mcp-config` 片段生成与通用精简规则（#72，感谢 `@acrot0`）**：新增 `mcp-config` 子命令，支持标准 JSON、通过严格校验的原生 Antigravity 配置与按 `--tools` 裁剪的宿主无关路由规则。
+- **零 Schema 成本入口容错与 1 行报错示例（#77，感谢 `@acrot0`，Refs #74）**：`paths`/`outlines`/`lineRanges` 支持干净裸字符串自动包数组，`apply_edits` 内部静默兼容 `oldText`/`newText` 别名（冲突显式报错且严守 `8,800 B` 上限），校验报错附带 1 行最小合法 JSON `Example:`。
+- **繁體中文 README（#87，感谢 `@popuchoco`）**：新增 `README.zh-TW.md` 并同步纳入打包、安装器与自动更新清单。
+- **防卡死预算、流式基准解析与规则/门禁优化（#49 感谢 `@wathing-wind`；#86 感谢 `@liuye0209`；Refs #83/#59）**：为 `walkFiles`/`batch_search` 加上时间与目录数上限、将 MCP 预算收紧至 `150 s`、`contextLines` 上限提至 `10`；`benchmark` 改为逐行流式解析 JSONL；优化 `rules/AGENTS.md`；新增零依赖、`bin` 打包与 `512 KB` 产物体积确定性门禁。
+- **Windows 与核心稳定性六连修（#76 感谢 `@BLACK-BIRTHDAY`；#68/#73 感谢 `@ErrantSnow`；#69/#70 感谢 `@acrot0`；#79/#89 感谢 `@lymTudou`）**：Windows 未加引号 `;` 路由至 PowerShell 并修复连字符命令误判；`apply_edits` 拒改非 UTF-8 文件；Windows `EBUSY` 原子就地更新回退；嵌套工作区 `snapshot` 范围与超时/重命名加固；`output-filter` 紧凑模式保留失败测试标题；测试运行器全面隔离本机 `git` 配置、代理与 `AGY_FAST_*` 环境变量。
+
+---
+
 ## [0.3.1] - 2026-11-24
 
 ### Added

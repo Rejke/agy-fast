@@ -1,5 +1,6 @@
-import { promises as fs } from "node:fs";
+import { createReadStream, promises as fs } from "node:fs";
 import path from "node:path";
+import readline from "node:readline";
 
 export interface TranscriptToolCall {
   id?: string;
@@ -10,10 +11,18 @@ export interface TranscriptToolCall {
   arguments?: Record<string, unknown> | string;
 }
 
+export interface SkippedTranscriptFile {
+  path: string;
+  reason: string;
+}
+
 export interface AnalyzeOptions {
   recent?: number;
   sinceMs?: number;
   untilMs?: number;
+  concurrency?: number;
+  skippedFiles?: SkippedTranscriptFile[];
+  onSkippedFile?: (skipped: SkippedTranscriptFile) => void;
 }
 
 export interface TranscriptStep {
@@ -896,20 +905,68 @@ function isReadonlySearchShell(cmd: string): boolean {
   return hasReadonlySearch;
 }
 
+type ParsedJsonlLineResult =
+  | { kind: "empty" }
+  | { kind: "step"; step: TranscriptStep }
+  | { kind: "malformed" };
+
+function parseTranscriptJsonlLine(rawLine: string): ParsedJsonlLineResult {
+  const trimmed = rawLine.trim();
+  if (!trimmed) return { kind: "empty" };
+  try {
+    const parsed = JSON.parse(trimmed) as TranscriptStep;
+    if (parsed && typeof parsed === "object") {
+      return { kind: "step", step: parsed };
+    }
+    return { kind: "malformed" };
+  } catch {
+    return { kind: "malformed" };
+  }
+}
+
 export function parseTranscriptJsonl(content: string): TranscriptStep[] {
   const steps: TranscriptStep[] = [];
   for (const rawLine of content.split(/\r?\n/)) {
-    const trimmed = rawLine.trim();
-    if (!trimmed) continue;
-    try {
-      const parsed = JSON.parse(trimmed) as TranscriptStep;
-      if (parsed && typeof parsed === "object") {
-        steps.push(parsed);
-      }
-    } catch {
-      // Skip malformed line
+    const res = parseTranscriptJsonlLine(rawLine);
+    if (res.kind === "step") {
+      steps.push(res.step);
     }
   }
+  return steps;
+}
+
+async function parseTranscriptJsonlFileDetailed(
+  filePath: string,
+): Promise<{ steps: TranscriptStep[]; malformedLines: number }> {
+  const steps: TranscriptStep[] = [];
+  let malformedLines = 0;
+  const stream = createReadStream(filePath, { encoding: "utf8" });
+  const rl = readline.createInterface({
+    input: stream,
+    crlfDelay: Infinity,
+  });
+  try {
+    for await (const line of rl) {
+      const res = parseTranscriptJsonlLine(line);
+      if (res.kind === "step") {
+        steps.push(res.step);
+      } else if (res.kind === "malformed") {
+        malformedLines++;
+      }
+    }
+  } finally {
+    // Prevent late stream errors during cleanup from becoming unhandled events
+    stream.on("error", () => {});
+    rl.close();
+    stream.destroy();
+  }
+  return { steps, malformedLines };
+}
+
+export async function parseTranscriptJsonlFile(
+  filePath: string,
+): Promise<TranscriptStep[]> {
+  const { steps } = await parseTranscriptJsonlFileDetailed(filePath);
   return steps;
 }
 
@@ -2072,7 +2129,31 @@ export async function collectTranscriptFiles(
   return found.sort();
 }
 
-async function sortFilesByRecentMtime(files: string[]): Promise<string[]> {
+const DEFAULT_TRANSCRIPT_READ_CONCURRENCY = 8;
+const MAX_TRANSCRIPT_READ_CONCURRENCY = 32;
+
+function formatReadErrorReason(err: unknown): string {
+  if (err && typeof err === "object") {
+    const code = "code" in err && typeof err.code === "string" ? err.code : "";
+    const msg = err instanceof Error ? err.message : String(err);
+    if (code && !msg.includes(code)) return `${code}: ${msg}`;
+    return msg;
+  }
+  return String(err);
+}
+
+function normalizeReadConcurrency(concurrency?: number): number {
+  if (concurrency === undefined) return DEFAULT_TRANSCRIPT_READ_CONCURRENCY;
+  if (!Number.isSafeInteger(concurrency) || concurrency < 1) {
+    throw new RangeError("concurrency must be a positive integer");
+  }
+  return Math.min(concurrency, MAX_TRANSCRIPT_READ_CONCURRENCY);
+}
+
+async function sortFilesByRecentMtime(
+  files: string[],
+  onSkipped?: (skipped: SkippedTranscriptFile) => void,
+): Promise<string[]> {
   const withMtime: Array<{ file: string; mtimeMs: number }> = [];
   const batchSize = 64;
   for (let i = 0; i < files.length; i += batchSize) {
@@ -2081,14 +2162,21 @@ async function sortFilesByRecentMtime(files: string[]): Promise<string[]> {
       slice.map(async (file) => {
         try {
           const stat = await fs.stat(file);
-          return { file, mtimeMs: stat.mtimeMs };
-        } catch {
-          return null;
+          return { ok: true as const, file, mtimeMs: stat.mtimeMs };
+        } catch (err) {
+          return {
+            ok: false as const,
+            skipped: { path: file, reason: formatReadErrorReason(err) },
+          };
         }
       }),
     );
     for (const item of results) {
-      if (item !== null) withMtime.push(item);
+      if (item.ok) {
+        withMtime.push({ file: item.file, mtimeMs: item.mtimeMs });
+      } else {
+        onSkipped?.(item.skipped);
+      }
     }
   }
   withMtime.sort(
@@ -2099,11 +2187,118 @@ async function sortFilesByRecentMtime(files: string[]): Promise<string[]> {
   return withMtime.map((x) => x.file);
 }
 
+type LoadedTranscriptOutcome =
+  | { kind: "session"; steps: TranscriptStep[]; rawSteps: TranscriptStep[] }
+  | { kind: "empty" }
+  | { kind: "skipped"; skipped: SkippedTranscriptFile };
+
+async function loadSingleTranscriptFile(
+  file: string,
+  sinceMs?: number,
+  untilMs?: number,
+): Promise<LoadedTranscriptOutcome> {
+  try {
+    const { steps: rawSteps, malformedLines } =
+      await parseTranscriptJsonlFileDetailed(file);
+    if (rawSteps.length === 0 && malformedLines > 0) {
+      return {
+        kind: "skipped",
+        skipped: {
+          path: file,
+          reason: `corrupted JSONL (0 valid steps, ${malformedLines} malformed line${malformedLines === 1 ? "" : "s"})`,
+        },
+      };
+    }
+    const steps = filterStepsByTime(rawSteps, sinceMs, untilMs);
+    if (!steps.some((s) => s.type === "PLANNER_RESPONSE")) {
+      return { kind: "empty" };
+    }
+    return { kind: "session", steps, rawSteps };
+  } catch (err) {
+    return {
+      kind: "skipped",
+      skipped: {
+        path: file,
+        reason: formatReadErrorReason(err),
+      },
+    };
+  }
+}
+
+export async function loadSessionsFromFiles(
+  orderedFiles: string[],
+  options: AnalyzeOptions = {},
+): Promise<TranscriptStep[][]> {
+  const { recent, sinceMs, untilMs, skippedFiles, onSkippedFile } = options;
+  const concurrency = normalizeReadConcurrency(options.concurrency);
+  const sessions: TranscriptStep[][] = [];
+
+  const recordOutcome = (outcome: LoadedTranscriptOutcome): void => {
+    if (outcome.kind === "skipped") {
+      skippedFiles?.push(outcome.skipped);
+      onSkippedFile?.(outcome.skipped);
+      return;
+    }
+    if (outcome.kind === "session") {
+      if (outcome.steps !== outcome.rawSteps) {
+        fullSessionStepsMap.set(outcome.steps, outcome.rawSteps);
+      }
+      sessions.push(outcome.steps);
+    }
+  };
+
+  if (recent !== undefined) {
+    let cursor = 0;
+    while (cursor < orderedFiles.length && sessions.length < recent) {
+      const remaining = recent - sessions.length;
+      const batchLen = Math.min(
+        concurrency,
+        remaining,
+        orderedFiles.length - cursor,
+      );
+      const batch = orderedFiles.slice(cursor, cursor + batchLen);
+      cursor += batchLen;
+      const outcomes = await Promise.all(
+        batch.map((file) => loadSingleTranscriptFile(file, sinceMs, untilMs)),
+      );
+      for (const outcome of outcomes) {
+        recordOutcome(outcome);
+        if (sessions.length >= recent) break;
+      }
+    }
+    return sessions;
+  }
+
+  if (orderedFiles.length === 0) return sessions;
+
+  const outcomes = new Array<LoadedTranscriptOutcome>(orderedFiles.length);
+  let nextIdx = 0;
+  const workerCount = Math.min(concurrency, orderedFiles.length);
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (true) {
+        const idx = nextIdx++;
+        if (idx >= orderedFiles.length) break;
+        outcomes[idx] = await loadSingleTranscriptFile(
+          orderedFiles[idx]!,
+          sinceMs,
+          untilMs,
+        );
+      }
+    }),
+  );
+
+  for (const outcome of outcomes) {
+    if (outcome) recordOutcome(outcome);
+  }
+  return sessions;
+}
+
 async function loadFilteredSessions(
   inputs: string[],
   options: AnalyzeOptions = {},
 ): Promise<TranscriptStep[][]> {
-  const { recent, sinceMs, untilMs } = options;
+  const { recent, sinceMs, untilMs, skippedFiles, onSkippedFile } = options;
   if (recent !== undefined && (!Number.isSafeInteger(recent) || recent < 1)) {
     throw new RangeError("recent must be a positive integer");
   }
@@ -2116,28 +2311,19 @@ async function loadFilteredSessions(
   if (sinceMs !== undefined && untilMs !== undefined && sinceMs > untilMs) {
     throw new RangeError("sinceMs must be less than or equal to untilMs");
   }
+  normalizeReadConcurrency(options.concurrency);
 
   const files = await collectTranscriptFiles(inputs);
+  const recordSkipped = (skipped: SkippedTranscriptFile): void => {
+    skippedFiles?.push(skipped);
+    onSkippedFile?.(skipped);
+  };
   const orderedFiles =
-    recent !== undefined ? await sortFilesByRecentMtime(files) : files;
+    recent !== undefined
+      ? await sortFilesByRecentMtime(files, recordSkipped)
+      : files;
 
-  const sessions: TranscriptStep[][] = [];
-  for (const file of orderedFiles) {
-    try {
-      const content = await fs.readFile(file, "utf8");
-      const rawSteps = parseTranscriptJsonl(content);
-      const steps = filterStepsByTime(rawSteps, sinceMs, untilMs);
-      if (!steps.some((s) => s.type === "PLANNER_RESPONSE")) continue;
-      if (steps !== rawSteps) {
-        fullSessionStepsMap.set(steps, rawSteps);
-      }
-      sessions.push(steps);
-      if (recent !== undefined && sessions.length >= recent) break;
-    } catch {
-      // Skip unreadable file
-    }
-  }
-  return sessions;
+  return loadSessionsFromFiles(orderedFiles, options);
 }
 
 export async function analyzePaths(

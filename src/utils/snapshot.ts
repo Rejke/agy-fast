@@ -88,6 +88,68 @@ export function parsePorcelainBranchHeader(headerLine: string): {
   return { branch: branchOnly, isUnborn: false };
 }
 
+/**
+ * Number of path segments between the enclosing repository root and the workspace:
+ * 0 when the workspace is the repository root, 2 for `<repo>/packages/app`.
+ * Counted on physical paths so 8.3 short names, letter case and symlinked segments
+ * cannot drift from the root-relative prefix git itself prints.
+ */
+async function resolveNestedRepoInfo(
+  workspaceDir: string,
+  gitEntry: string,
+): Promise<{ nestingDepth: number; effectiveGitEntry: string }> {
+  if (path.dirname(gitEntry) === path.resolve(workspaceDir)) {
+    return { nestingDepth: 0, effectiveGitEntry: gitEntry };
+  }
+  const realWorkspace = await fs.realpath(workspaceDir).catch(() => path.resolve(workspaceDir));
+  const realEntry = await findGitEntry(realWorkspace);
+  if (!realEntry) {
+    return { nestingDepth: 0, effectiveGitEntry: gitEntry };
+  }
+  const rel = path.relative(path.dirname(realEntry), realWorkspace);
+  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
+    return { nestingDepth: 0, effectiveGitEntry: realEntry };
+  }
+  return {
+    nestingDepth: rel.split(path.sep).filter(Boolean).length,
+    effectiveGitEntry: realEntry,
+  };
+}
+
+/**
+ * Rewrites one `git status --porcelain=v1` line of a nested workspace so its path(s) are
+ * relative to the workspace instead of the repository root (porcelain output is always
+ * root-relative). Returns null for an untracked/ignored directory entry that is the workspace
+ * itself or one of its ancestors, i.e. git reports the whole workspace as untracked.
+ */
+export function toWorkspaceRelativeStatusLine(
+  line: string,
+  nestingDepth: number,
+): string | null {
+  if (nestingDepth <= 0 || line.length < 4) return line;
+  let containsWorkspace = false;
+  const strip = (p: string): string => {
+    const quoted = p.startsWith('"');
+    const segs = (quoted ? p.slice(1) : p).split("/");
+    const last = segs[segs.length - 1] ?? "";
+    const isDirEntry = last === "" || last === '"';
+    const nameCount = isDirEntry ? segs.length - 1 : segs.length;
+    if (nameCount <= nestingDepth) {
+      containsWorkspace = isDirEntry;
+      return p;
+    }
+    return `${quoted ? '"' : ""}${segs.slice(nestingDepth).join("/")}`;
+  };
+  const code = line.slice(0, 2);
+  const rawBody = line.slice(3);
+  const isRenameOrCopy = code[0] === "R" || code[0] === "C";
+  const rest = isRenameOrCopy
+    ? rawBody.split(" -> ").map(strip).join(" -> ")
+    : strip(rawBody);
+  if (containsWorkspace && (code === "??" || code === "!!")) return null;
+  return `${line.slice(0, 3)}${rest}`;
+}
+
 async function getGitSummary(
   workspaceDir: string,
   timeoutMs: number,
@@ -99,11 +161,24 @@ async function getGitSummary(
     return null;
   }
 
+  // A workspace nested inside an enclosing repository (a monorepo package, or a plain folder
+  // below a repo-initialised parent/home directory) only reports its own subtree.
+  const { nestingDepth, effectiveGitEntry } = gitEntry
+    ? await resolveNestedRepoInfo(workspaceDir, gitEntry)
+    : { nestingDepth: 0, effectiveGitEntry: null };
+  const isNested = nestingDepth > 0;
+
   const gitEnv = withNonInteractiveGitEnv();
-  const [statusRes, logRes] = await Promise.all([
+  const [statusRes, logRes, headTreeRes] = await Promise.all([
     gitExec(
       "git",
-      [...HARDENED_GIT_BASE_ARGS, "status", "--porcelain=v1", "--branch"],
+      [
+        ...HARDENED_GIT_BASE_ARGS,
+        "status",
+        "--porcelain=v1",
+        "--branch",
+        ...(isNested ? ["--", "."] : []),
+      ],
       {
         cwd: workspaceDir,
         timeoutMs,
@@ -117,14 +192,28 @@ async function getGitSummary(
       maxOutputBytes: 8192,
       env: gitEnv,
     }),
+    // Nested only: does HEAD contain the workspace directory at all? (single tree lookup)
+    isNested
+      ? gitExec(
+          "git",
+          [...HARDENED_GIT_BASE_ARGS, "rev-parse", "--verify", "--quiet", "HEAD:./"],
+          { cwd: workspaceDir, timeoutMs, maxOutputBytes: 256, env: gitEnv },
+        )
+      : null,
   ]);
 
   const statusOk = !statusRes.error && !statusRes.timedOut && statusRes.exitCode === 0;
   const logOk = !logRes.error && !logRes.timedOut && logRes.exitCode === 0;
+  const headConfirmedMissing = Boolean(
+    headTreeRes && !headTreeRes.error && !headTreeRes.timedOut && headTreeRes.exitCode !== 0,
+  );
   const fallbackBranch =
-    !statusOk && gitEntry ? await readBranchFromGitEntry(gitEntry) : null;
+    !statusOk && effectiveGitEntry ? await readBranchFromGitEntry(effectiveGitEntry) : null;
 
   if (!statusOk && !logOk && !(statusRes.timedOut && fallbackBranch)) {
+    return null;
+  }
+  if (isNested && !statusOk && headConfirmedMissing) {
     return null;
   }
 
@@ -133,7 +222,7 @@ async function getGitSummary(
   let statusLines: string[] = [];
 
   if (statusOk) {
-    const rawLines = statusRes.stdout.split(/\r?\n/);
+    let rawLines = statusRes.stdout.split(/\r?\n/);
     if (statusRes.truncated && rawLines.length > 1) {
       // Drop potentially mid-path truncated trailing line
       rawLines.pop();
@@ -145,7 +234,18 @@ async function getGitSummary(
       isUnborn = parsed.isUnborn;
       rawLines.splice(headerIdx, 1);
     } else {
-      branch = (await readBranchFromGitEntry(gitEntry)) ?? "HEAD";
+      branch = (await readBranchFromGitEntry(effectiveGitEntry)) ?? "HEAD";
+    }
+    if (isNested) {
+      const relLines = rawLines.map((l) => toWorkspaceRelativeStatusLine(l, nestingDepth));
+      const workspaceReportedUntracked = relLines.some((l) => l === null);
+      const hasTrackedChange = relLines.some(
+        (l) => l !== null && l.trim() !== "" && !/^(?:\?\?|!!) /.test(l),
+      );
+      // The enclosing repository does not track this workspace (confirmed missing from HEAD or
+      // reported as an untracked/ignored directory): skip the unrelated outer repo.
+      if ((headConfirmedMissing || workspaceReportedUntracked) && !hasTrackedChange) return null;
+      rawLines = relLines.filter((l): l is string => l !== null);
     }
     statusLines = rawLines.filter((l) => {
       const trimmed = l.trim();
@@ -168,8 +268,13 @@ async function getGitSummary(
         .filter(Boolean)
     : [];
 
+  const branchNotes: string[] = [];
+  if (isUnborn) branchNotes.push("unborn, no commits yet");
+  if (isNested) {
+    branchNotes.push(`repo root: ${Array.from({ length: nestingDepth }, () => "..").join("/")}`);
+  }
   const parts: string[] = [
-    isUnborn ? `Git: branch \`${branch}\` (unborn, no commits yet)` : `Git: branch \`${branch}\``,
+    `Git: branch \`${branch}\`${branchNotes.length > 0 ? ` (${branchNotes.join("; ")})` : ""}`,
   ];
   if (!statusOk) {
     parts.push(

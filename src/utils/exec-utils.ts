@@ -168,9 +168,9 @@ export function decodeProcessOutput(
 /**
  * agy aborts an MCP tool call after 180 s ("timed out after 3m0s") and drops
  * its result. All commands of one tool call share this budget; the remaining
- * 10 s cover the kill grace period below and response formatting.
+ * 30 s cover Windows process-tree kill grace, host scheduling, and formatting.
  */
-export const MCP_CALL_BUDGET_SEC = 170;
+export const MCP_CALL_BUDGET_SEC = 150;
 
 function killChildTree(pid: number | undefined, detached: boolean): NodeJS.Timeout | null {
   if (!pid) return null;
@@ -238,6 +238,12 @@ const WINDOWS_PS_UNQUOTED_SYNTAX_RE =
   /(?<![\\`])\$(?:HOME|PWD|null|true|false|_)\b|\$\([^)]|@\(|(?:^|[;\r\n])\s*\$[A-Za-z_][A-Za-z0-9_]*\s*=/im;
 const WINDOWS_PS_CMDLET_RE =
   /(?:^|[;|&({\r\n]\s*)(?:Get|Set|New|Remove|Test|Select|Where|ForEach|Sort|Group|Measure|Compare|ConvertTo|ConvertFrom|Export|Import|Invoke|Start|Stop|Restart|Wait|Read|Write|Out|Format|Resolve|Join|Split|Copy|Move|Rename|Clear|Add|Push|Pop|Enable|Disable)-[A-Z][A-Za-z0-9]*\b(?!-)/;
+const WINDOWS_CMD_ENV_VAR_RE = /%[A-Za-z_][A-Za-z0-9_()]*%/;
+const WINDOWS_CMD_UNQUOTED_SYNTAX_RE =
+  /(?:^|[;&|(\r\n])\s*@?(?:set\s+(?:\/[ap]\s+|[A-Za-z_][A-Za-z0-9_]*=)|(?:setlocal|endlocal|rem|call|goto)\b(?!-)|::|(?:cd|chdir)\s+\/d\b|if\s+(?:\/i\s+(?:not\s+)?|(?:not\s+)?(?:errorlevel\s+\d|exist\s|defined\s|cmdextversion\s+\d|[^(\r\n;&|]*==))|for\s+(?:\/[dflr]\b|%%?[A-Za-z]\s+in\b))|(?<![\\`])(?:>>?|<)\s*nul(?=$|[\s;&|)])/i;
+const WINDOWS_CMD_QUOTED_SET_AT_POS_RE =
+  /^@?set[ \t]+(?:\/[ap][ \t]+)?"[A-Za-z_][A-Za-z0-9_]*=/i;
+const WINDOWS_PS51_CHAIN_OPERATOR_RE = /&&|\|\|/;
 const EXPLICIT_POWERSHELL_INVOCATION_RE =
   /^\s*(?:["']?)(?:pwsh|powershell)(?:\.exe)?(?:["']?)(?:\s|$)/i;
 const PS_NON_INVOCATION_TAIL_RE =
@@ -397,6 +403,126 @@ export function unwrapTrivialWindowsPowerShellCommand(command: string): string {
   return inner;
 }
 
+/**
+ * Detects unquoted PowerShell `; ` statement chaining while keeping legitimate
+ * `cmd.exe` commands (e.g. `%VAR%`, compact `key=a;b` / `-cp a.jar;b.jar`,
+ * `set FOO=...`, `if errorlevel ...`, `2>nul`) and commands mixing `;` with
+ * PowerShell 5.1-incompatible chain operators (`&&`, `||`, cmd `&`) on `cmd.exe`.
+ */
+function hasPowerShellSemicolonChaining(
+  command: string,
+  withoutSingle: string,
+  unquoted: string,
+): boolean {
+  if (
+    WINDOWS_CMD_ENV_VAR_RE.test(withoutSingle) ||
+    WINDOWS_CMD_UNQUOTED_SYNTAX_RE.test(unquoted) ||
+    WINDOWS_PS51_CHAIN_OPERATOR_RE.test(unquoted)
+  ) {
+    return false;
+  }
+
+  let quote: '"' | "'" | null = null;
+  let sawLeadingToken = false;
+  let atStatementStart = true;
+  let hasSemicolonChain = false;
+
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]!;
+    const next = command[i + 1];
+    if (quote === "'") {
+      if (ch === "'") {
+        if (next === "'") {
+          i++;
+        } else {
+          quote = null;
+        }
+      }
+      continue;
+    }
+    if (quote === '"') {
+      if ((ch === "\\" || ch === "`") && (next === ch || next === '"')) {
+        i++;
+        continue;
+      }
+      if (ch === '"') {
+        if (next === '"') {
+          i++;
+        } else {
+          quote = null;
+        }
+      }
+      continue;
+    }
+    if (ch === "'") {
+      quote = "'";
+      sawLeadingToken = true;
+      atStatementStart = false;
+      continue;
+    }
+    if (ch === '"') {
+      quote = '"';
+      sawLeadingToken = true;
+      atStatementStart = false;
+      continue;
+    }
+    if (ch === ";") {
+      const prev = i > 0 ? command[i - 1] : "";
+      const prevPrev = i > 1 ? command[i - 2] : "";
+      const isEscaped =
+        prev === "^" ||
+        prev === "`" ||
+        (prev === "\\" && (i === 1 || /\s/.test(prevPrev!)));
+      if (sawLeadingToken && !isEscaped && (next === " " || next === "\t")) {
+        let j = i + 1;
+        while (j < command.length && (command[j] === " " || command[j] === "\t")) {
+          j++;
+        }
+        if (
+          j < command.length &&
+          command[j] !== "\r" &&
+          command[j] !== "\n" &&
+          command[j] !== ";"
+        ) {
+          hasSemicolonChain = true;
+        }
+      }
+      atStatementStart = true;
+      continue;
+    }
+    if (ch === "&") {
+      const prev = i > 0 ? command[i - 1] : "";
+      if (prev !== ">" && !atStatementStart) {
+        return false;
+      }
+      if (atStatementStart) {
+        sawLeadingToken = true;
+        atStatementStart = false;
+      }
+      continue;
+    }
+    if (ch === "\r" || ch === "\n") {
+      sawLeadingToken = false;
+      atStatementStart = true;
+      continue;
+    }
+    if (ch === "|" || ch === "(" || ch === "{") {
+      atStatementStart = true;
+      continue;
+    }
+    if (ch === " " || ch === "\t") {
+      continue;
+    }
+    if (atStatementStart && WINDOWS_CMD_QUOTED_SET_AT_POS_RE.test(command.slice(i))) {
+      return false;
+    }
+    sawLeadingToken = true;
+    atStatementStart = false;
+  }
+
+  return hasSemicolonChain;
+}
+
 function stripQuotedSpans(command: string, stripDoubleQuotes: boolean): string {
   let out = "";
   let quote: '"' | "'" | null = null;
@@ -450,7 +576,8 @@ function stripQuotedSpans(command: string, stripDoubleQuotes: boolean): string {
 
 /**
  * Detects whether a Windows command uses PowerShell syntax (`$env:VAR`, automatic
- * variables, subexpressions, or PascalCase `Verb-Noun` cmdlets outside quotes)
+ * variables, subexpressions, PascalCase `Verb-Noun` cmdlets, or unquoted `; `
+ * statement chaining outside cmd.exe / PowerShell 5.1-incompatible constructs)
  * so cross-platform/cmd commands keep fast `cmd.exe` execution without altering
  * quoting behavior.
  */
@@ -465,7 +592,8 @@ export function needsPowerShellOnWindows(command: string): boolean {
   const unquoted = stripQuotedSpans(command, true);
   return (
     WINDOWS_PS_UNQUOTED_SYNTAX_RE.test(unquoted) ||
-    WINDOWS_PS_CMDLET_RE.test(unquoted)
+    WINDOWS_PS_CMDLET_RE.test(unquoted) ||
+    hasPowerShellSemicolonChaining(command, withoutSingle, unquoted)
   );
 }
 

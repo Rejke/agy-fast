@@ -4,6 +4,8 @@ import {
   formatCorruptedArrayError,
   isPlainObject,
   parseMaybeJsonArray,
+  TOOL_VALIDATION_EXAMPLES,
+  withValidationExample,
   type CorruptedItem,
 } from "../utils/arg-validation.js";
 import { MCP_CALL_BUDGET_SEC, runShellCommandAsync, type ExecResult } from "../utils/exec-utils.js";
@@ -107,14 +109,20 @@ export async function runChecks(
       };
     }
     return {
-      text: "Error: 'commands' must be a non-empty array of check commands.",
+      text: withValidationExample(
+        "Error: 'commands' must be a non-empty array of check commands.",
+        TOOL_VALIDATION_EXAMPLES.run_checks,
+      ),
       isError: true,
     };
   }
   const rawCommands = parsedCommands.value;
   if (rawCommands.length === 0) {
     return {
-      text: "Error: 'commands' must be a non-empty array of check commands.",
+      text: withValidationExample(
+        "Error: 'commands' must be a non-empty array of check commands.",
+        TOOL_VALIDATION_EXAMPLES.run_checks,
+      ),
       isError: true,
     };
   }
@@ -171,7 +179,10 @@ export async function runChecks(
       typeof raw === "string" ? { command: raw } : (raw as unknown as CheckCommandSpec);
     if (!spec || typeof spec.command !== "string" || !spec.command.trim()) {
       return {
-        text: `Error: commands[${i}] must contain a non-empty 'command' string.`,
+        text: withValidationExample(
+          `Error: commands[${i}] must contain a non-empty 'command' string.`,
+          TOOL_VALIDATION_EXAMPLES.run_checks,
+        ),
         isError: true,
       };
     }

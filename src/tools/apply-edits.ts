@@ -1,9 +1,12 @@
+import { isUtf8 } from "node:buffer";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import {
   formatCorruptedArrayError,
   isPlainObject,
   parseMaybeJsonArray,
+  TOOL_VALIDATION_EXAMPLES,
+  withValidationExample,
   type CorruptedItem,
 } from "../utils/arg-validation.js";
 import { MCP_CALL_BUDGET_SEC, runShellCommandAsync } from "../utils/exec-utils.js";
@@ -833,6 +836,72 @@ function corruptedEditsError(items: CorruptedItem[]): { text: string; isError: b
   };
 }
 
+function resolveHunkFieldWithAliases(
+  rawHunk: Record<string, unknown>,
+  canonicalKey: "target" | "replacement",
+  aliasKeys: readonly string[],
+): { ok: true; value: unknown } | { ok: false; error: string } {
+  const hasCanonical = rawHunk[canonicalKey] !== undefined;
+  const presentAliases = aliasKeys.filter((key) => rawHunk[key] !== undefined);
+
+  if (hasCanonical) {
+    const canonicalVal = rawHunk[canonicalKey];
+    for (const aliasKey of presentAliases) {
+      if (rawHunk[aliasKey] !== canonicalVal) {
+        return {
+          ok: false,
+          error: `conflicting '${canonicalKey}' and alias '${aliasKey}' (values differ; omit the alias or make them identical)`,
+        };
+      }
+    }
+    return { ok: true, value: canonicalVal };
+  }
+
+  if (presentAliases.length === 0) {
+    return { ok: true, value: undefined };
+  }
+
+  const firstKey = presentAliases[0]!;
+  const firstVal = rawHunk[firstKey];
+  for (let k = 1; k < presentAliases.length; k++) {
+    const otherKey = presentAliases[k]!;
+    if (rawHunk[otherKey] !== firstVal) {
+      return {
+        ok: false,
+        error: `conflicting aliases '${firstKey}' and '${otherKey}' (values differ; use '${canonicalKey}')`,
+      };
+    }
+  }
+  return { ok: true, value: firstVal };
+}
+
+function normalizeEditHunk(
+  rawHunk: Record<string, unknown>,
+): { ok: true; hunk: EditHunk } | { ok: false; errors: string[] } {
+  const targetRes = resolveHunkFieldWithAliases(rawHunk, "target", [
+    "oldText",
+    "old_string",
+  ]);
+  const replacementRes = resolveHunkFieldWithAliases(rawHunk, "replacement", [
+    "newText",
+    "new_string",
+  ]);
+  const errors: string[] = [];
+  if (!targetRes.ok) errors.push(targetRes.error);
+  if (!replacementRes.ok) errors.push(replacementRes.error);
+  if (errors.length > 0) {
+    return { ok: false, errors };
+  }
+  return {
+    ok: true,
+    hunk: {
+      ...(rawHunk as unknown as EditHunk),
+      target: (targetRes as { ok: true; value: unknown }).value as string,
+      replacement: (replacementRes as { ok: true; value: unknown }).value as string,
+    },
+  };
+}
+
 function formatErrorBulletsWithinBytes(
   heading: string,
   errors: string[],
@@ -1041,12 +1110,18 @@ export async function runApplyEdits(
     }
     if (parsedEdits.kind === "invalid_json") {
       return {
-        text: `Error: 'edits' is not a valid JSON array (0 files modified): ${parsedEdits.detail}`,
+        text: withValidationExample(
+          `Error: 'edits' is not a valid JSON array (0 files modified): ${parsedEdits.detail}`,
+          TOOL_VALIDATION_EXAMPLES.apply_edits,
+        ),
         isError: true,
       };
     }
     return {
-      text: "Error: 'edits' must be a non-empty JSON array string (or array) of file edit objects.",
+      text: withValidationExample(
+        "Error: 'edits' must be a non-empty JSON array string (or array) of file edit objects.",
+        TOOL_VALIDATION_EXAMPLES.apply_edits,
+      ),
       isError: true,
     };
   }
@@ -1068,7 +1143,7 @@ export async function runApplyEdits(
   // Detect nested-JSON serialization corruption (e.g. edits: [true], [false, true], [null], or hunks: [true])
   // before regular validation so the caller immediately falls back instead of retrying in a loop.
   const corruptedItems: CorruptedItem[] = [];
-  const normalizedEdits: FileEdit[] = [];
+  const normalizedEdits: Array<FileEdit & { hunkAliasErrors?: Array<{ hunkIndex: number; message: string }> }> = [];
   for (let i = 0; i < rawEdits.length; i++) {
     const rawEntry = rawEdits[i];
     if (!isPlainObject(rawEntry)) {
@@ -1076,6 +1151,7 @@ export async function runApplyEdits(
       continue;
     }
     let normalizedHunks: EditHunk[] | undefined;
+    const hunkAliasErrors: Array<{ hunkIndex: number; message: string }> = [];
     if (rawEntry.hunks !== undefined) {
       const parsedHunks = parseMaybeJsonArray(rawEntry.hunks);
       if (!parsedHunks.ok) {
@@ -1087,24 +1163,36 @@ export async function runApplyEdits(
         continue;
       }
       let hunkCorrupted = false;
+      const resolvedHunks: EditHunk[] = [];
       for (let j = 0; j < parsedHunks.value.length; j++) {
-        if (!isPlainObject(parsedHunks.value[j])) {
+        const rawHunk = parsedHunks.value[j];
+        if (!isPlainObject(rawHunk)) {
           corruptedItems.push({
             label: `edits[${i}].hunks[${j}]`,
-            value: parsedHunks.value[j],
+            value: rawHunk,
             expected: "a hunk object",
           });
           hunkCorrupted = true;
+          continue;
+        }
+        const normRes = normalizeEditHunk(rawHunk);
+        if (!normRes.ok) {
+          for (const message of normRes.errors) {
+            hunkAliasErrors.push({ hunkIndex: j, message });
+          }
+        } else {
+          resolvedHunks.push(normRes.hunk);
         }
       }
       if (hunkCorrupted) continue;
-      normalizedHunks = parsedHunks.value as unknown as EditHunk[];
+      normalizedHunks = resolvedHunks;
     }
     normalizedEdits.push({
       path: rawEntry.path as string,
       hunks: normalizedHunks,
       create: rawEntry.create as string | undefined,
       overwrite: rawEntry.overwrite as boolean | undefined,
+      ...(hunkAliasErrors.length > 0 ? { hunkAliasErrors } : {}),
     });
   }
   if (corruptedItems.length > 0) {
@@ -1122,13 +1210,19 @@ export async function runApplyEdits(
       const cmd = input.verify.command;
       if (typeof cmd !== "string" || !cmd.trim()) {
         return {
-          text: "Validation failed (0 files modified):\n- 'verify.command' must be a non-empty string.",
+          text: withValidationExample(
+            "Validation failed (0 files modified):\n- 'verify.command' must be a non-empty string.",
+            TOOL_VALIDATION_EXAMPLES.apply_edits,
+          ),
           isError: true,
         };
       }
       if (input.verify.cwd !== undefined && typeof input.verify.cwd !== "string") {
         return {
-          text: "Validation failed (0 files modified):\n- 'verify.cwd' must be a string.",
+          text: withValidationExample(
+            "Validation failed (0 files modified):\n- 'verify.cwd' must be a string.",
+            TOOL_VALIDATION_EXAMPLES.apply_edits,
+          ),
           isError: true,
         };
       }
@@ -1148,7 +1242,10 @@ export async function runApplyEdits(
       };
     } else {
       return {
-        text: "Validation failed (0 files modified):\n- 'verify' must be a command string or { command, cwd?, timeoutSec? } object.",
+        text: withValidationExample(
+          "Validation failed (0 files modified):\n- 'verify' must be a command string or { command, cwd?, timeoutSec? } object.",
+          TOOL_VALIDATION_EXAMPLES.apply_edits,
+        ),
         isError: true,
       };
     }
@@ -1192,12 +1289,23 @@ export async function runApplyEdits(
     const entry = normalizedEdits[i]!;
     if (typeof entry.path !== "string" || !entry.path.trim()) {
       errors.push(`edits[${i}]: 'path' must be a non-empty string`);
+      if (entry.hunkAliasErrors) {
+        for (const err of entry.hunkAliasErrors) {
+          errors.push(`edits[${i}] hunk #${err.hunkIndex + 1}: ${err.message}`);
+        }
+      }
       continue;
     }
 
     const absPath = resolvePath(entry.path, baseCwd);
     const writeTargetPath = await canonicalizeTargetPath(absPath);
     const relPath = toPosixPath(path.relative(baseCwd, absPath)) || path.basename(absPath);
+    if (entry.hunkAliasErrors && entry.hunkAliasErrors.length > 0) {
+      for (const err of entry.hunkAliasErrors) {
+        errors.push(`${relPath} hunk #${err.hunkIndex + 1}: ${err.message}`);
+      }
+      continue;
+    }
     if (isGitInternalPath(absPath) || isGitInternalPath(writeTargetPath)) {
       errors.push(`${relPath}: refusing to modify Git internal metadata path (.git)`);
       continue;
@@ -1234,8 +1342,15 @@ export async function runApplyEdits(
   }
 
   if (errors.length > 0) {
+    const exampleSuffix = `\nExample: ${TOOL_VALIDATION_EXAMPLES.apply_edits}`;
+    const exampleSuffixBytes = Buffer.byteLength(exampleSuffix, "utf8");
+    const formatted = formatErrorBulletsWithinBytes(
+      "Validation failed (0 files modified):",
+      errors,
+      DEFAULT_INLINE_MAX_BYTES - exampleSuffixBytes,
+    );
     return {
-      text: `Validation failed (0 files modified):\n- ${errors.join("\n- ")}`,
+      text: withValidationExample(formatted, TOOL_VALIDATION_EXAMPLES.apply_edits),
       isError: true,
     };
   }
@@ -1368,6 +1483,12 @@ export async function runApplyEdits(
       );
       continue;
     }
+    if (!isUtf8(fileData.rawBuffer)) {
+      errors.push(
+        `${item.relPath}: file is not valid UTF-8 (hunk edits would corrupt non-UTF-8 bytes; convert to UTF-8 first or rewrite the whole file with create + overwrite: true)`,
+      );
+      continue;
+    }
 
     const normalizedOriginal = fileData.rawContent.replace(/\r\n/g, "\n");
     const planned = planHunksForContent(normalizedOriginal, item.hunks, item.relPath);
@@ -1424,6 +1545,25 @@ export async function runApplyEdits(
     const prefix = bestEffort
       ? "Edit aborted (0 files modified):"
       : "Atomic edit aborted (0 files modified):";
+    const hasSchemaTypeError = errors.some(
+      (e) =>
+        e.includes("'target' must be") ||
+        e.includes("'replacement' must be") ||
+        e.includes("must be an object with 'target' and 'replacement'"),
+    );
+    if (hasSchemaTypeError) {
+      const exampleSuffix = `\nExample: ${TOOL_VALIDATION_EXAMPLES.apply_edits}`;
+      const exampleSuffixBytes = Buffer.byteLength(exampleSuffix, "utf8");
+      const formatted = formatErrorBulletsWithinBytes(
+        prefix,
+        errors,
+        DEFAULT_INLINE_MAX_BYTES - exampleSuffixBytes,
+      );
+      return {
+        text: withValidationExample(formatted, TOOL_VALIDATION_EXAMPLES.apply_edits),
+        isError: true,
+      };
+    }
     return {
       text: formatErrorBulletsWithinBytes(prefix, errors, DEFAULT_INLINE_MAX_BYTES),
       isError: true,

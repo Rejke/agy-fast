@@ -17,7 +17,6 @@ export const UPDATER_RUNTIME_FILES = [
   "assets/logo.svg",
   "dist/mcp-server.mjs",
   "dist/session-start.mjs",
-  "dist/pre-invocation.mjs",
   "dist/benchmark.mjs",
   "dist/updater.mjs",
   "scripts/install.mjs",
@@ -33,6 +32,7 @@ export const UPDATER_OPTIONAL_FILES = [
   "assets/architecture-zh-dark.svg",
   "README.md",
   "README.zh-CN.md",
+  "README.zh-TW.md",
   "CHANGELOG.md",
   "docs/ANALYSIS_REPORT.md",
   "docs/ANALYSIS_REPORT.zh-CN.md",
@@ -58,7 +58,6 @@ export interface UpdaterConfig {
   repoUrl?: string;
   editsFormat?: "auto" | "array" | "string";
   toolLoading?: ToolLoadingMode;
-  autoCompactTokens?: number;
 }
 
 export interface ResolvedUpdaterSettings {
@@ -531,6 +530,10 @@ export async function detectInstallKind(pluginDir: string): Promise<InstallKind>
     return "copied";
   }
 
+  const norm = resolved.split(path.sep).join("/").toLowerCase();
+  const isPluginInstallDir =
+    norm.endsWith("/plugins/agy-fast") || norm.includes("/plugins/agy-fast/");
+
   const hasGit = await pathExists(path.join(resolved, ".git"));
   if (hasGit) {
     const statusRes = await execBinaryAsync("git", ["status", "--porcelain"], {
@@ -543,16 +546,13 @@ export async function detectInstallKind(pluginDir: string): Promise<InstallKind>
     }
     // Only auto-update git clones inside a plugins/agy-fast directory unless forced manually;
     // a standalone source repo outside plugins/ is treated as a developer workspace.
-    const norm = resolved.split(path.sep).join("/").toLowerCase();
-    const isPluginInstallDir =
-      norm.endsWith("/plugins/agy-fast") || norm.includes("/plugins/agy-fast/");
     if (!isPluginInstallDir) {
       return "dev-source";
     }
     return "git-clone";
   }
 
-  if (await pathExists(path.join(resolved, "src"))) {
+  if (!isPluginInstallDir && (await pathExists(path.join(resolved, "src")))) {
     return "dev-source";
   }
   return "copied";
@@ -853,10 +853,13 @@ export async function verifyStagedPlugin(stagingDir: string): Promise<{
 
   // Live MCP handshake smoke test on staged bundle before replacing live files
   const mcpPath = path.join(stagingDir, "dist", "mcp-server.mjs");
+  const cleanMcpEnv = { ...process.env };
+  delete cleanMcpEnv.AGY_FAST_TOOLS;
   const smokeOk = await new Promise<boolean>((resolve) => {
     const child = spawn(process.execPath, [mcpPath], {
       stdio: ["pipe", "pipe", "ignore"],
       windowsHide: true,
+      env: cleanMcpEnv,
     });
     let stdout = "";
     const timer = setTimeout(() => {

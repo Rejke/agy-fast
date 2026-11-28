@@ -10,6 +10,7 @@ import {
   clearSkippedVersion,
   compareSemver,
   consumeSnapshotUpdateNotice,
+  detectInstallKind,
   extractGithubSlug,
   fetchLatestRemoteVersion,
   getHomeDir,
@@ -19,6 +20,7 @@ import {
   runPluginUpdate,
   shouldTriggerBackgroundCheck,
   skipUpdateVersion,
+  UPDATER_OPTIONAL_FILES,
   UPDATER_RUNTIME_FILES,
   validateRepoUrl,
   verifyStagedPlugin,
@@ -28,6 +30,12 @@ import {
 const REPO_ROOT = process.cwd();
 const INSTALL_SCRIPT = path.join(REPO_ROOT, "scripts", "install.mjs");
 const UPDATER_DIST = path.join(REPO_ROOT, "dist", "updater.mjs");
+
+describe("updater optional files", () => {
+  it("includes README.zh-TW.md in the optional updater file set", () => {
+    assert.ok(UPDATER_OPTIONAL_FILES.includes("README.zh-TW.md"));
+  });
+});
 
 function makeNoGitEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const cleaned: NodeJS.ProcessEnv = {};
@@ -606,6 +614,19 @@ rl.on("line", (line) => {
     );
     const loudCheck = await verifyStagedPlugin(loudStage);
     assert.equal(loudCheck.ok, true);
+
+    // 4. verifyStagedPlugin succeeds even when ambient AGY_FAST_TOOLS is set in parent env
+    const ambientStage = path.join(rootTmp, "ambient-tools-stage");
+    await copyRuntimeFixture(ambientStage, "0.9.2", "ambient");
+    const prevTools = process.env.AGY_FAST_TOOLS;
+    process.env.AGY_FAST_TOOLS = "batch_search,quick_outline,run_checks";
+    try {
+      const ambientCheck = await verifyStagedPlugin(ambientStage);
+      assert.equal(ambientCheck.ok, true, ambientCheck.reason);
+    } finally {
+      if (prevTools === undefined) delete process.env.AGY_FAST_TOOLS;
+      else process.env.AGY_FAST_TOOLS = prevTools;
+    }
   });
 
   it("hardens GitHub API fallbacks (no release->main downgrade on error, sanitized html_url, cross-platform home dir)", async () => {
@@ -1091,5 +1112,30 @@ rl.on("line", (line) => {
     );
     assert.match(mainDoc, /update available: main \(abcdef1\)/);
     assert.match(mainDoc, /Release: https:\/\/github\.com\/INK-Q\/agy-fast\/commit\/abcdef1234567890/);
+  });
+
+  it("treats copied installs inside plugins/agy-fast with src/ as copied instead of dev-source", async () => {
+    const pluginWithSrc = path.join(rootTmp, "profile", "plugins", "agy-fast");
+    await copyRuntimeFixture(pluginWithSrc, "0.2.0", "plugin-with-src");
+    await fs.mkdir(path.join(pluginWithSrc, "src"), { recursive: true });
+    await fs.writeFile(path.join(pluginWithSrc, "src", "dummy.ts"), "export {};\n", "utf8");
+    assert.equal(await detectInstallKind(pluginWithSrc), "copied");
+
+    const mixedCaseWithSrc = path.join(rootTmp, "profile-case", "Plugins", "AGY-FAST");
+    await copyRuntimeFixture(mixedCaseWithSrc, "0.2.0", "mixed-case-with-src");
+    await fs.mkdir(path.join(mixedCaseWithSrc, "src"), { recursive: true });
+    await fs.writeFile(path.join(mixedCaseWithSrc, "src", "dummy.ts"), "export {};\n", "utf8");
+    assert.equal(await detectInstallKind(mixedCaseWithSrc), "copied");
+
+    const outsideWithSrc = path.join(rootTmp, "workspace", "agy-fast");
+    await copyRuntimeFixture(outsideWithSrc, "0.2.0", "outside-with-src");
+    await fs.mkdir(path.join(outsideWithSrc, "src"), { recursive: true });
+    await fs.writeFile(path.join(outsideWithSrc, "src", "dummy.ts"), "export {};\n", "utf8");
+    assert.equal(await detectInstallKind(outsideWithSrc), "dev-source");
+
+    const linkedPluginDir = path.join(rootTmp, "profile-link", "plugins", "agy-fast");
+    await fs.mkdir(path.dirname(linkedPluginDir), { recursive: true });
+    await fs.symlink(outsideWithSrc, linkedPluginDir, process.platform === "win32" ? "junction" : "dir");
+    assert.equal(await detectInstallKind(linkedPluginDir), "symlink");
   });
 });

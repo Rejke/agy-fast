@@ -71,6 +71,52 @@ export function parseMaybeJsonArray(value: unknown): ParsedArrayResult {
   };
 }
 
+/**
+ * Accept a native array, a stringified JSON array, or a bare non-empty string
+ * (wrapped into a single-element array). Never coerces corrupted boolean/null
+ * literals, malformed JSON fragments starting with `[` or `{`, valid non-array
+ * JSON values (e.g. `{}`, `123`), markdown fences, or multiline strings.
+ */
+export function parseMaybeStringOrJsonArray(value: unknown): ParsedArrayResult {
+  const parsed = parseMaybeJsonArray(value);
+  if (parsed.ok || parsed.kind === "corrupted_literal" || parsed.kind === "missing") {
+    return parsed;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return parsed;
+    }
+    if (
+      trimmed.startsWith("[") ||
+      trimmed.startsWith("{") ||
+      trimmed.startsWith("```") ||
+      /[\r\n]/.test(trimmed)
+    ) {
+      return parsed;
+    }
+    if (parsed.kind === "invalid_json" && parsed.detail.startsWith("decoded to ")) {
+      return parsed;
+    }
+    return { ok: true, value: [trimmed] };
+  }
+  return parsed;
+}
+
+export const TOOL_VALIDATION_EXAMPLES = {
+  batch_search: '{"queries":[{"type":"text","pattern":"foo","path":"src"}]}',
+  apply_edits:
+    '{"edits":[{"path":"src/app.ts","hunks":[{"target":"old","replacement":"new"}]}]}',
+  read_slices: '{"outlines":["src/app.ts"],"lineRanges":["src/app.ts:1-60"]}',
+  read_slices_line_range: '{"lineRanges":["src/app.ts:1-60"]}',
+  quick_outline: '{"paths":["src/app.ts"]}',
+  run_checks: '{"commands":[{"name":"test","command":"npm test"}]}',
+} as const;
+
+export function withValidationExample(message: string, exampleJson: string): string {
+  return `${message}\nExample: ${exampleJson}`;
+}
+
 export interface CorruptedItem {
   label: string;
   value: unknown;
