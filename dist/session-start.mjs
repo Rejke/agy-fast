@@ -167,21 +167,41 @@ function decodeProcessOutput(buf, truncated = false, fallbackEncoding) {
     if (!label || label === "utf-8") {
       return buf.toString("utf8");
     }
+    let decoder;
     try {
-      let decoder = fallbackDecoderCache.get(label);
-      if (!decoder) {
+      const cached = fallbackDecoderCache.get(label);
+      if (cached) {
+        decoder = cached;
+      } else {
         decoder = new TextDecoder(label);
         fallbackDecoderCache.set(label, decoder);
       }
-      return decoder.decode(buf);
     } catch {
       return buf.toString("utf8");
     }
+    if (buf.indexOf(10) === -1) {
+      return decoder.decode(buf);
+    }
+    const parts = [];
+    let offset = 0;
+    while (offset < buf.length) {
+      const nl = buf.indexOf(10, offset);
+      const end = nl === -1 ? buf.length : nl + 1;
+      const line = buf.subarray(offset, end);
+      const lineCandidate = truncated && end === buf.length ? stripTrailingIncompleteUtf8(line) : line;
+      try {
+        parts.push(strictUtf8Decoder.decode(lineCandidate));
+      } catch {
+        parts.push(decoder.decode(line));
+      }
+      offset = end;
+    }
+    return parts.join("");
   }
 }
-var MCP_CALL_BUDGET_SEC = 170;
+var MCP_CALL_BUDGET_SEC = 150;
 function killChildTree(pid, detached) {
-  if (!pid) return;
+  if (!pid) return null;
   if (process.platform === "win32") {
     const fallbackKill = () => {
       try {
@@ -201,7 +221,7 @@ function killChildTree(pid, detached) {
     } catch {
       fallbackKill();
     }
-    return;
+    return null;
   }
   try {
     if (detached) {
@@ -211,7 +231,7 @@ function killChildTree(pid, detached) {
     }
   } catch {
   }
-  setTimeout(() => {
+  const sigkillTimer = setTimeout(() => {
     try {
       if (detached) {
         process.kill(-pid, "SIGKILL");
@@ -220,10 +240,33 @@ function killChildTree(pid, detached) {
       }
     } catch {
     }
-  }, 400).unref();
+  }, 400);
+  sigkillTimer.unref();
+  return sigkillTimer;
 }
 function execBinaryAsync(bin, args, options) {
   return spawnAndCollect(bin, args, false, options);
+}
+function hasDefinedEnvKey(env, key, platform) {
+  if (env[key] !== void 0) return true;
+  if (platform !== "win32") return false;
+  const upper = key.toUpperCase();
+  for (const existing of Object.keys(env)) {
+    if (existing.toUpperCase() === upper && env[existing] !== void 0) {
+      return true;
+    }
+  }
+  return false;
+}
+function withNonInteractiveGitEnv(baseEnv = process.env, platform = process.platform) {
+  const result = { ...baseEnv };
+  if (!hasDefinedEnvKey(baseEnv, "GIT_TERMINAL_PROMPT", platform)) {
+    result.GIT_TERMINAL_PROMPT = "0";
+  }
+  if (!hasDefinedEnvKey(baseEnv, "GCM_INTERACTIVE", platform)) {
+    result.GCM_INTERACTIVE = "never";
+  }
+  return result;
 }
 function spawnAndCollect(commandOrBin, args, shell, options) {
   const startMs = Date.now();
@@ -262,9 +305,10 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
       return;
     }
     let settleFallbackTimer = null;
+    let sigkillTimer = null;
     const timer = setTimeout(() => {
       timedOut = true;
-      killChildTree(child.pid, detached);
+      sigkillTimer = killChildTree(child.pid, detached);
       settleFallbackTimer = setTimeout(() => {
         child.stdout?.destroy();
         child.stderr?.destroy();
@@ -277,6 +321,7 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (sigkillTimer) clearTimeout(sigkillTimer);
       if (settleFallbackTimer) clearTimeout(settleFallbackTimer);
       resolve({
         exitCode,
@@ -660,6 +705,8 @@ var HARDENED_GIT_BASE_ARGS = [
   "-c",
   "core.fsmonitor=false",
   "-c",
+  "core.quotePath=false",
+  "-c",
   "diff.external=",
   "-c",
   "gpg.program=false",
@@ -671,52 +718,199 @@ var HARDENED_GIT_BASE_ARGS = [
   "gpg.x509.program=false",
   "--no-pager"
 ];
-async function getGitSummary(workspaceDir, timeoutMs) {
-  const [branchRes, symRefRes, statusRes, logRes] = await Promise.all([
-    execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "rev-parse", "--abbrev-ref", "HEAD"], {
-      cwd: workspaceDir,
-      timeoutMs,
-      maxOutputBytes: 4096
-    }),
-    execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "symbolic-ref", "--short", "HEAD"], {
-      cwd: workspaceDir,
-      timeoutMs,
-      maxOutputBytes: 4096
-    }),
-    execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "status", "--porcelain=v1"], {
-      cwd: workspaceDir,
-      timeoutMs,
-      maxOutputBytes: 32768
-    }),
-    execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "log", "-n", "3", "--format=%h %s"], {
-      cwd: workspaceDir,
-      timeoutMs,
-      maxOutputBytes: 8192
-    })
-  ]);
-  const hasValidRepo = !branchRes.error && branchRes.exitCode === 0 || !symRefRes.error && symRefRes.exitCode === 0 || !statusRes.error && statusRes.exitCode === 0;
-  if (!hasValidRepo) {
+async function findGitEntry(workspaceDir) {
+  let cur = path3.resolve(workspaceDir);
+  while (true) {
+    const candidate = path3.join(cur, ".git");
+    try {
+      await fs.lstat(candidate);
+      return candidate;
+    } catch {
+    }
+    const parent = path3.dirname(cur);
+    if (parent === cur) return null;
+    cur = parent;
+  }
+}
+async function readBranchFromGitEntry(gitEntry) {
+  if (!gitEntry) return null;
+  try {
+    const st = await fs.stat(gitEntry);
+    let gitDir = gitEntry;
+    if (st.isFile()) {
+      const ptr = await fs.readFile(gitEntry, "utf8");
+      const m = /^gitdir:\s*(.+)$/im.exec(ptr.trim());
+      if (!m?.[1]) return null;
+      gitDir = path3.resolve(path3.dirname(gitEntry), m[1].trim());
+    }
+    const headRaw = (await fs.readFile(path3.join(gitDir, "HEAD"), "utf8")).trim();
+    const refMatch = /^ref:\s*refs\/heads\/(.+)$/.exec(headRaw);
+    return refMatch?.[1]?.trim() || "HEAD";
+  } catch {
     return null;
   }
-  const branch = branchRes.exitCode === 0 && branchRes.stdout.trim() || symRefRes.exitCode === 0 && symRefRes.stdout.trim() || "HEAD";
-  const isUnborn = branchRes.exitCode !== 0 && symRefRes.exitCode === 0;
-  const statusLines = statusRes.exitCode === 0 ? statusRes.stdout.split(/\r?\n/).filter((l) => {
-    const trimmed = l.trim();
-    if (!trimmed) return false;
-    if (trimmed.startsWith("?? ")) {
-      const topSeg = trimmed.slice(3).split("/")[0]?.replace(/\/$/, "");
-      if (topSeg && DEFAULT_IGNORE_DIRS.has(topSeg)) return false;
+}
+function parsePorcelainBranchHeader(headerLine) {
+  const body = headerLine.slice(3).trim();
+  const unbornMatch = /^(?:No commits yet|Initial commit) on (.+)$/.exec(body);
+  if (unbornMatch?.[1]) {
+    const branchOnly2 = unbornMatch[1].split("...")[0]?.trim() || "HEAD";
+    return { branch: branchOnly2, isUnborn: true };
+  }
+  if (/^HEAD\s*\(no branch\)$/i.test(body)) {
+    return { branch: "HEAD", isUnborn: false };
+  }
+  const branchOnly = body.split("...")[0]?.trim() || "HEAD";
+  return { branch: branchOnly, isUnborn: false };
+}
+async function resolveNestedRepoInfo(workspaceDir, gitEntry) {
+  if (path3.dirname(gitEntry) === path3.resolve(workspaceDir)) {
+    return { nestingDepth: 0, effectiveGitEntry: gitEntry };
+  }
+  const realWorkspace = await fs.realpath(workspaceDir).catch(() => path3.resolve(workspaceDir));
+  const realEntry = await findGitEntry(realWorkspace);
+  if (!realEntry) {
+    return { nestingDepth: 0, effectiveGitEntry: gitEntry };
+  }
+  const rel = path3.relative(path3.dirname(realEntry), realWorkspace);
+  if (!rel || rel.startsWith("..") || path3.isAbsolute(rel)) {
+    return { nestingDepth: 0, effectiveGitEntry: realEntry };
+  }
+  return {
+    nestingDepth: rel.split(path3.sep).filter(Boolean).length,
+    effectiveGitEntry: realEntry
+  };
+}
+function toWorkspaceRelativeStatusLine(line, nestingDepth) {
+  if (nestingDepth <= 0 || line.length < 4) return line;
+  let containsWorkspace = false;
+  const strip = (p) => {
+    const quoted = p.startsWith('"');
+    const segs = (quoted ? p.slice(1) : p).split("/");
+    const last = segs[segs.length - 1] ?? "";
+    const isDirEntry = last === "" || last === '"';
+    const nameCount = isDirEntry ? segs.length - 1 : segs.length;
+    if (nameCount <= nestingDepth) {
+      containsWorkspace = isDirEntry;
+      return p;
     }
-    return true;
-  }) : [];
-  const logLines = logRes.exitCode === 0 ? logRes.stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean) : [];
+    return `${quoted ? '"' : ""}${segs.slice(nestingDepth).join("/")}`;
+  };
+  const code = line.slice(0, 2);
+  const rawBody = line.slice(3);
+  const isRenameOrCopy = code[0] === "R" || code[0] === "C";
+  const rest = isRenameOrCopy ? rawBody.split(" -> ").map(strip).join(" -> ") : strip(rawBody);
+  if (containsWorkspace && (code === "??" || code === "!!")) return null;
+  return `${line.slice(0, 3)}${rest}`;
+}
+async function getGitSummary(workspaceDir, timeoutMs, gitExec = execBinaryAsync) {
+  const hasExplicitGitEnv = Boolean(process.env.GIT_DIR || process.env.GIT_WORK_TREE);
+  const gitEntry = hasExplicitGitEnv ? null : await findGitEntry(workspaceDir);
+  if (!hasExplicitGitEnv && !gitEntry) {
+    return null;
+  }
+  const { nestingDepth, effectiveGitEntry } = gitEntry ? await resolveNestedRepoInfo(workspaceDir, gitEntry) : { nestingDepth: 0, effectiveGitEntry: null };
+  const isNested = nestingDepth > 0;
+  const gitEnv = withNonInteractiveGitEnv();
+  const [statusRes, logRes, headTreeRes] = await Promise.all([
+    gitExec(
+      "git",
+      [
+        ...HARDENED_GIT_BASE_ARGS,
+        "status",
+        "--porcelain=v1",
+        "--branch",
+        ...isNested ? ["--", "."] : []
+      ],
+      {
+        cwd: workspaceDir,
+        timeoutMs,
+        maxOutputBytes: 32768,
+        env: gitEnv
+      }
+    ),
+    gitExec("git", [...HARDENED_GIT_BASE_ARGS, "log", "-n", "3", "--format=%h %s"], {
+      cwd: workspaceDir,
+      timeoutMs,
+      maxOutputBytes: 8192,
+      env: gitEnv
+    }),
+    // Nested only: does HEAD contain the workspace directory at all? (single tree lookup)
+    isNested ? gitExec(
+      "git",
+      [...HARDENED_GIT_BASE_ARGS, "rev-parse", "--verify", "--quiet", "HEAD:./"],
+      { cwd: workspaceDir, timeoutMs, maxOutputBytes: 256, env: gitEnv }
+    ) : null
+  ]);
+  const statusOk = !statusRes.error && !statusRes.timedOut && statusRes.exitCode === 0;
+  const logOk = !logRes.error && !logRes.timedOut && logRes.exitCode === 0;
+  const headConfirmedMissing = Boolean(
+    headTreeRes && !headTreeRes.error && !headTreeRes.timedOut && headTreeRes.exitCode !== 0
+  );
+  const fallbackBranch = !statusOk && effectiveGitEntry ? await readBranchFromGitEntry(effectiveGitEntry) : null;
+  if (!statusOk && !logOk && !(statusRes.timedOut && fallbackBranch)) {
+    return null;
+  }
+  if (isNested && !statusOk && headConfirmedMissing) {
+    return null;
+  }
+  let branch = "HEAD";
+  let isUnborn = false;
+  let statusLines = [];
+  if (statusOk) {
+    let rawLines = statusRes.stdout.split(/\r?\n/);
+    if (statusRes.truncated && rawLines.length > 1) {
+      rawLines.pop();
+    }
+    const headerIdx = rawLines.findIndex((l) => l.startsWith("## "));
+    if (headerIdx !== -1) {
+      const parsed = parsePorcelainBranchHeader(rawLines[headerIdx]);
+      branch = parsed.branch;
+      isUnborn = parsed.isUnborn;
+      rawLines.splice(headerIdx, 1);
+    } else {
+      branch = await readBranchFromGitEntry(effectiveGitEntry) ?? "HEAD";
+    }
+    if (isNested) {
+      const relLines = rawLines.map((l) => toWorkspaceRelativeStatusLine(l, nestingDepth));
+      const workspaceReportedUntracked = relLines.some((l) => l === null);
+      const hasTrackedChange = relLines.some(
+        (l) => l !== null && l.trim() !== "" && !/^(?:\?\?|!!) /.test(l)
+      );
+      if ((headConfirmedMissing || workspaceReportedUntracked) && !hasTrackedChange) return null;
+      rawLines = relLines.filter((l) => l !== null);
+    }
+    statusLines = rawLines.filter((l) => {
+      const trimmed = l.trim();
+      if (!trimmed) return false;
+      if (trimmed.startsWith("?? ")) {
+        const rawPath = trimmed.slice(3).replace(/^"/, "");
+        const topSeg = rawPath.split("/")[0]?.replace(/\/$/, "");
+        if (topSeg && DEFAULT_IGNORE_DIRS.has(topSeg)) return false;
+      }
+      return true;
+    });
+  } else {
+    branch = fallbackBranch ?? "HEAD";
+  }
+  const logLines = logOk ? logRes.stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean) : [];
+  const branchNotes = [];
+  if (isUnborn) branchNotes.push("unborn, no commits yet");
+  if (isNested) {
+    branchNotes.push(`repo root: ${Array.from({ length: nestingDepth }, () => "..").join("/")}`);
+  }
   const parts = [
-    isUnborn ? `Git: branch \`${branch}\` (unborn, no commits yet)` : `Git: branch \`${branch}\``
+    `Git: branch \`${branch}\`${branchNotes.length > 0 ? ` (${branchNotes.join("; ")})` : ""}`
   ];
-  if (statusLines.length === 0) {
+  if (!statusOk) {
+    parts.push(
+      statusRes.timedOut ? "Working tree: unknown (git status timed out)" : "Working tree: unknown (git status failed)"
+    );
+  } else if (statusLines.length === 0) {
     parts.push("Working tree: clean");
   } else {
-    const prefix = `Modified (${statusLines.length}): `;
+    const countLabel = statusRes.truncated ? `${statusLines.length}+` : `${statusLines.length}`;
+    const prefix = `Modified (${countLabel}): `;
     const maxModifiedChars = 260;
     const maxItems = 8;
     const shown = [];
@@ -726,14 +920,14 @@ async function getGitSummary(workspaceDir, timeoutMs) {
       const item = raw.length > 100 ? `${sliceSafeChars(raw, 97)}...` : raw;
       const sepLen = shown.length > 0 ? 2 : 0;
       const remainingAfter = statusLines.length - (i + 1);
-      const moreReserve = remainingAfter > 0 ? ` (+${remainingAfter} more)`.length : 0;
+      const moreReserve = remainingAfter > 0 || statusRes.truncated ? ` (+${remainingAfter} more)`.length : 0;
       if (shown.length > 0 && currentLen + sepLen + item.length + moreReserve > maxModifiedChars) {
         break;
       }
       shown.push(item);
       currentLen += sepLen + item.length;
     }
-    const more = shown.length < statusLines.length ? ` (+${statusLines.length - shown.length} more)` : "";
+    const more = shown.length < statusLines.length ? ` (+${statusLines.length - shown.length}${statusRes.truncated ? "+" : ""} more)` : statusRes.truncated ? " (+more)" : "";
     parts.push(`${prefix}${shown.join(", ")}${more}`);
   }
   if (logLines.length > 0) {
@@ -932,7 +1126,6 @@ async function raceWithDeadline(promise, deadlineMs) {
   let timer;
   const timeoutPromise = new Promise((resolve) => {
     timer = setTimeout(() => resolve(TIMEOUT_SENTINEL), remaining);
-    timer.unref();
   });
   try {
     const res = await Promise.race([promise, timeoutPromise]);
@@ -996,6 +1189,18 @@ async function getTwoLevelTree(workspaceDir, topRes, isHomeRoot, deadlineMs) {
   const lines = [];
   const maxTop = 20;
   const shownTop = filteredTop.slice(0, maxTop);
+  if (isHomeRoot) {
+    for (const entry of shownTop) {
+      lines.push(
+        entry.isDirectory() ? `  ${entry.name}/` : `  ${shortEntryName(entry.name)}`
+      );
+    }
+    if (filteredTop.length > maxTop) {
+      lines.push(`  ... (+${filteredTop.length - maxTop} more top-level entries)`);
+    }
+    return `Layout (1 level):
+${lines.join("\n")}`;
+  }
   const subResults = new Array(shownTop.length);
   let nextIdx = 0;
   const workerCount = Math.min(4, shownTop.length);
@@ -1107,16 +1312,19 @@ async function getTwoLevelTree(workspaceDir, topRes, isHomeRoot, deadlineMs) {
   return `Layout (2 levels):
 ${lines.join("\n")}`;
 }
-async function detectManifestsInDir(dirPath, prefix) {
+async function detectManifestsInDir(dirPath, prefix, knownFiles) {
   const hints = [];
+  const hasFile = (name) => !knownFiles || knownFiles.has(name);
   await Promise.all([
     // package.json
     (async () => {
+      if (!hasFile("package.json")) return;
       try {
         const raw = await fs.readFile(path3.join(dirPath, "package.json"), "utf8");
         const pkg = JSON.parse(raw);
-        const scriptNames = pkg.scripts ? Object.keys(pkg.scripts).slice(0, 12) : [];
-        const label = pkg.name ? `${prefix}package.json (${pkg.name})` : `${prefix}package.json`;
+        const pkgName = typeof pkg.name === "string" ? pkg.name.trim() : "";
+        const scriptNames = pkg.scripts && typeof pkg.scripts === "object" && !Array.isArray(pkg.scripts) ? Object.keys(pkg.scripts).slice(0, 12) : [];
+        const label = pkgName ? `${prefix}package.json (${pkgName})` : `${prefix}package.json`;
         hints.push(
           scriptNames.length > 0 ? `${label} scripts: ${scriptNames.join(", ")}` : label
         );
@@ -1127,6 +1335,7 @@ async function detectManifestsInDir(dirPath, prefix) {
     (async () => {
       if (prefix) return;
       for (const name of ["Makefile", "makefile"]) {
+        if (!hasFile(name)) continue;
         try {
           const raw = await fs.readFile(path3.join(dirPath, name), "utf8");
           const targets = [];
@@ -1147,6 +1356,7 @@ async function detectManifestsInDir(dirPath, prefix) {
     })(),
     // pom.xml (Maven)
     (async () => {
+      if (!hasFile("pom.xml")) return;
       try {
         const raw = await fs.readFile(path3.join(dirPath, "pom.xml"), "utf8");
         const stripped = raw.replace(/<parent>[\s\S]*?<\/parent>/i, "");
@@ -1160,6 +1370,7 @@ async function detectManifestsInDir(dirPath, prefix) {
     // build.gradle / build.gradle.kts
     (async () => {
       for (const name of ["build.gradle.kts", "build.gradle"]) {
+        if (!hasFile(name)) continue;
         try {
           await fs.access(path3.join(dirPath, name));
           hints.push(`${prefix}${name} (gradle)`);
@@ -1170,6 +1381,7 @@ async function detectManifestsInDir(dirPath, prefix) {
     })(),
     // pyproject.toml
     (async () => {
+      if (!hasFile("pyproject.toml")) return;
       try {
         const raw = await fs.readFile(path3.join(dirPath, "pyproject.toml"), "utf8");
         const tools = [];
@@ -1186,6 +1398,7 @@ async function detectManifestsInDir(dirPath, prefix) {
     })(),
     // Cargo.toml
     (async () => {
+      if (!hasFile("Cargo.toml")) return;
       try {
         const raw = await fs.readFile(path3.join(dirPath, "Cargo.toml"), "utf8");
         const isWorkspace = /\[workspace\]/.test(raw);
@@ -1197,6 +1410,7 @@ async function detectManifestsInDir(dirPath, prefix) {
     })(),
     // go.mod
     (async () => {
+      if (!hasFile("go.mod")) return;
       try {
         const raw = await fs.readFile(path3.join(dirPath, "go.mod"), "utf8");
         const m = /^module\s+(\S+)/m.exec(raw);
@@ -1208,12 +1422,14 @@ async function detectManifestsInDir(dirPath, prefix) {
   return hints;
 }
 async function getProjectManifestSummary(workspaceDir, topRes, isHomeRoot, deadlineMs) {
+  const rootKnownFiles = topRes.ok ? new Set(topRes.value.filter((e) => !e.isDirectory()).map((e) => e.name)) : void 0;
   const rootRes = await raceWithDeadline(
-    detectManifestsInDir(workspaceDir, ""),
+    detectManifestsInDir(workspaceDir, "", rootKnownFiles),
     deadlineMs
   );
-  const allHints = rootRes.ok ? [...rootRes.value] : [];
-  if (performance.now() < deadlineMs && topRes.ok) {
+  const rootHints = rootRes.ok ? [...rootRes.value].sort() : [];
+  const subHints = [];
+  if (!isHomeRoot && performance.now() < deadlineMs && topRes.ok) {
     const subdirs = topRes.value.filter(
       (e) => e.isDirectory() && !shouldSkipSnapshotEntry(e.name, true, false, isHomeRoot) && !MANIFEST_SKIP_SUBDIRS_LOWER.has(e.name.toLowerCase())
     ).sort((a, b) => a.name.localeCompare(b.name)).slice(0, 8);
@@ -1230,14 +1446,15 @@ async function getProjectManifestSummary(workspaceDir, topRes, isHomeRoot, deadl
             deadlineMs
           );
           if (res.ok) {
-            allHints.push(...res.value);
+            subHints.push(...res.value);
           }
         }
       })
     );
   }
+  subHints.sort();
+  const allHints = [...rootHints, ...subHints];
   if (allHints.length === 0) return null;
-  allHints.sort();
   return `Project:
 ${allHints.slice(0, 6).map((h) => `  - ${h}`).join("\n")}`;
 }
@@ -1285,7 +1502,7 @@ async function buildWorkspaceSnapshot(workspaceDir, options = {}) {
   const scanDeadline = performance.now() + scanTimeoutMs;
   const statRes = await raceWithDeadline(fs.stat(workspaceDir), scanDeadline);
   if (!statRes.ok || !statRes.value.isDirectory()) return null;
-  const gitPromise = getGitSummary(workspaceDir, gitTimeoutMs);
+  const gitPromise = getGitSummary(workspaceDir, gitTimeoutMs, options.gitExec);
   const [isHomeRoot, topRes] = await Promise.all([
     isHomeOrSystemRoot(workspaceDir, scanDeadline),
     raceWithDeadline(
@@ -1364,8 +1581,17 @@ import path4 from "node:path";
 var DEFAULT_REPO_URL = "https://github.com/INK-Q/agy-fast.git";
 var DEFAULT_CHECK_INTERVAL_HOURS = 4;
 var LOCK_STALE_MS = 10 * 60 * 1e3;
-function getHomeDir(env = process.env) {
-  return process.platform === "win32" ? env.USERPROFILE || env.HOME || os3.homedir() : env.HOME || env.USERPROFILE || os3.homedir();
+function getHomeDir(env = process.env, platform = process.platform) {
+  if (platform === "win32") {
+    const userProfile = env.USERPROFILE?.trim();
+    if (userProfile) return userProfile;
+    const driveHome = env.HOMEDRIVE && env.HOMEPATH ? `${env.HOMEDRIVE}${env.HOMEPATH}`.trim() : "";
+    if (driveHome) return driveHome;
+    const home = env.HOME?.trim();
+    if (home) return home;
+    return os3.homedir();
+  }
+  return env.HOME?.trim() || env.USERPROFILE?.trim() || os3.homedir();
 }
 function getUpdaterPaths(env = process.env) {
   const custom = env.AGY_FAST_CACHE_DIR?.trim();
@@ -1427,9 +1653,10 @@ async function readJsonFile(filePath) {
   }
   return null;
 }
+var tmpWriteSeq = 0;
 async function writeJsonAtomically(filePath, data) {
   await fs2.mkdir(path4.dirname(filePath), { recursive: true });
-  const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}`;
+  const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}.${++tmpWriteSeq}`;
   await fs2.writeFile(tmpPath, `${JSON.stringify(data, null, 2)}
 `, "utf8");
   try {
@@ -1517,15 +1744,39 @@ async function consumeSnapshotUpdateNotice(pluginDir, currentVersion, env = proc
     );
     return `[agy-fast] Auto-updated v${state.lastAppliedFrom} -> v${currentVersion} (rules/hooks active now; reload Desktop/IDE window if MCP was already running).`;
   }
-  if (state.availableVersion && compareSemver(state.availableVersion, currentVersion) > 0 && state.notifiedAvailableVersion !== state.availableVersion) {
+  const installerPath = path4.join(pluginDir, "scripts", "install.mjs");
+  const isManualInstall = state.availableInstallKind === "symlink" || state.availableInstallKind === "dev-source" || state.availableInstallKind === "git-dirty";
+  if (state.availableVersion && compareSemver(state.availableVersion, currentVersion) > 0) {
+    if (state.skippedVersion === state.availableVersion || state.notifiedAvailableVersion === state.availableVersion) {
+      return null;
+    }
     await writeUpdateState(
       { notifiedAvailableVersion: state.availableVersion },
       env
     ).catch(() => {
     });
+    const ver = state.availableVersion;
     const reason = state.availableReason ? ` (${state.availableReason})` : "";
-    const installerPath = path4.join(pluginDir, "scripts", "install.mjs");
-    return `[agy-fast] Update available: v${currentVersion} -> v${state.availableVersion}${reason}. Run: node "${installerPath}" update`;
+    const urlSuffix = state.availableReleaseUrl ? ` | ${state.availableReleaseUrl}` : "";
+    if (isManualInstall) {
+      return `[agy-fast] Update available: v${currentVersion} -> v${ver}${reason}. Pull & build in repo, or skip: node "${installerPath}" update --skip-version ${ver}${urlSuffix}`;
+    }
+    return `[agy-fast] Update available: v${currentVersion} -> v${ver}${reason}. Run: node "${installerPath}" update --prompt (or --skip-version ${ver})${urlSuffix}`;
+  }
+  if (!state.availableVersion && state.availableCommit && state.availableCommit !== state.lastAppliedCommit && state.notifiedAvailableCommit !== state.availableCommit) {
+    await writeUpdateState(
+      { notifiedAvailableCommit: state.availableCommit },
+      env
+    ).catch(() => {
+    });
+    const refLabel = state.availableRef || "main";
+    const shortSha = state.availableCommit.slice(0, 7);
+    const reason = state.availableReason ? ` (${state.availableReason})` : "";
+    const urlSuffix = state.availableReleaseUrl ? ` | ${state.availableReleaseUrl}` : "";
+    if (isManualInstall) {
+      return `[agy-fast] Update available on ${refLabel} (${shortSha})${reason}. Pull & build in repo.${urlSuffix}`;
+    }
+    return `[agy-fast] Update available on ${refLabel} (${shortSha})${reason}. Run: node "${installerPath}" update --prompt${urlSuffix}`;
   }
   return null;
 }
@@ -1566,6 +1817,24 @@ async function readStdin(timeoutMs = 1500) {
     const chunks = [];
     let totalBytes = 0;
     let settled = false;
+    const endsWithCloseBrace = (buf) => {
+      for (let i = buf.length - 1; i >= 0; i--) {
+        const b = buf[i];
+        if (b === 32 || b === 9 || b === 10 || b === 13) continue;
+        return b === 125;
+      }
+      return false;
+    };
+    const hasCompleteJsonObject = () => {
+      const text = Buffer.concat(chunks).toString("utf8").trim();
+      if (!text.startsWith("{") || !text.endsWith("}")) return false;
+      try {
+        const parsed = JSON.parse(text);
+        return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed);
+      } catch {
+        return false;
+      }
+    };
     const onData = (chunk) => {
       if (settled) return;
       const buf = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
@@ -1581,6 +1850,9 @@ async function readStdin(timeoutMs = 1500) {
       } else {
         chunks.push(buf);
         totalBytes += buf.length;
+        if (endsWithCloseBrace(buf) && hasCompleteJsonObject()) {
+          finish();
+        }
       }
     };
     const onEnd = () => finish();

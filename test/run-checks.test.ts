@@ -13,6 +13,7 @@ import {
   resetWindowsShellCache,
   resolveWindowsPowerShell,
   unwrapTrivialWindowsPowerShellCommand,
+  withNonInteractiveGitEnv,
 } from "../src/utils/exec-utils.js";
 import {
   fitSectionsToByteBudget,
@@ -62,7 +63,7 @@ describe("run_checks", () => {
       "for (let i = 0; i < 40; i++) console.log('info step ' + i);",
       "console.error('\\x1b[31mError: TS2322 type mismatch at src/a.ts:12\\x1b[0m');",
       "console.log('progress 10%\\rprogress 100%');",
-      "process.exit(2);",
+      "process.exitCode = 2;",
     ].join(" ");
 
     const res = await runChecks({
@@ -155,7 +156,7 @@ describe("run_checks", () => {
       "console.error('npm ERR! code ELIFECYCLE');",
       "console.error('npm ERR! errno 1');",
       "for (let i = 0; i < 40; i++) console.log('trailing line ' + i + ' padding padding');",
-      "process.exit(1);",
+      "process.exitCode = 1;",
     ].join(" ");
 
     const res = await runChecks({
@@ -265,6 +266,20 @@ describe("run_checks", () => {
       formatPowerShellCommand('node "$env:USERPROFILE\\a.js"'),
       'node "$env:USERPROFILE\\a.js"',
     );
+    assert.equal(
+      formatPowerShellCommand('"$env:FOO"\nGet-Date'),
+      '"$env:FOO"\nGet-Date',
+    );
+    assert.equal(
+      formatPowerShellCommand('"$env:FOO" \nGet-Date'),
+      '"$env:FOO" \nGet-Date',
+    );
+    assert.equal(
+      formatPowerShellCommand('"$env:FOO"  \t\r\nGet-Date'),
+      '"$env:FOO"  \t\r\nGet-Date',
+    );
+    assert.equal(needsPowerShellOnWindows('echo "C:\\\\" && Get-ChildItem'), true);
+    assert.equal(needsPowerShellOnWindows('echo "foo``" && Get-ChildItem'), true);
 
     // UTF-8 prefix guards non-console hosts and avoids BOM
     const wrapped = buildPowerShellUtf8Command('Write-Output "ok"');
@@ -311,6 +326,93 @@ describe("run_checks", () => {
     }
   });
 
+  it("routes unquoted Windows ';' chaining to PowerShell while keeping cmd.exe and PS 5.1-incompatible chains intact", () => {
+    const mustRouteToPowerShell = [
+      "agent-reach --version 2>&1; agent-reach --help 2>&1",
+      "git status; git diff --stat",
+      "node -v ; npm -v ; python --version",
+      'echo "a && b"; echo "c || d"',
+      "echo 'a && b'; echo 'c || d'",
+      'echo "a; b"; echo "c; d"',
+      'echo "C:\\\\"; echo ok',
+      "echo a | findstr a; echo b",
+      "dir C:\\; dir D:\\",
+      '& "C:\\bin\\a.exe" -v; & "C:\\bin\\b.exe" -v',
+      'echo a | & "C:\\bin\\b.exe"; echo c',
+      'git log -n 5 --format="%h %s"; git status',
+      'echo "set FOO=bar"; echo baz',
+      'echo "if errorlevel 1"; echo baz',
+      'echo "2>nul"; echo baz',
+      "npm run build && echo $LASTEXITCODE; echo done",
+      "call-api --check; echo done",
+      "rem-tool --version; rem-tool --help",
+      "goto-def --check; echo done",
+    ];
+    for (const cmd of mustRouteToPowerShell) {
+      assert.equal(
+        needsPowerShellOnWindows(cmd),
+        true,
+        `Expected PowerShell routing for: ${cmd}`,
+      );
+    }
+
+    const mustStayOnCmd = [
+      // Quoted semicolons only
+      `node -e "console.log('a; b')"`,
+      "echo 'foo; bar'",
+      // Compact non-whitespace semicolon parameters
+      "java -cp a.jar;b.jar Main",
+      'java -cp a.jar;"C:\\Program Files\\b.jar" Main',
+      'java -cp "C:\\a.jar";b.jar Main',
+      'java -cp "C:\\a.jar";"C:\\b.jar" Main',
+      "msbuild /p:Configuration=Release;Platform=x64",
+      "cmake -DCMAKE_PREFIX_PATH=C:\\a;C:\\b .",
+      "foo --opt=a;b",
+      // Explicit cmd.exe env vars and syntax
+      "echo %USERPROFILE%; echo done",
+      'echo "%USERPROFILE%"; echo done',
+      "echo %ProgramFiles(x86)%; echo done",
+      "set FOO=bar; echo baz",
+      "@set FOO=bar; echo baz",
+      'set "FOO=bar"; echo baz',
+      '@set "FOO=bar"; echo baz',
+      'echo ok; set "FOO=bar"',
+      "set /a x=1; echo done",
+      "setlocal; echo done",
+      "if errorlevel 1 echo fail; echo done",
+      "if not exist dist mkdir dist; echo done",
+      "if defined NODE_ENV echo ok; echo done",
+      'if /i "a"=="A" echo eq; echo done',
+      'if "a"=="b" echo eq; echo done',
+      'for /f "tokens=1" %i in (a.txt) do echo %i; echo done',
+      "cd /d D:\\project; dir",
+      "rem note; see docs",
+      ":: note; see docs",
+      "echo a 2>nul; echo b 2>nul",
+      // Mixed unquoted ';' with PowerShell 5.1-incompatible chain operators
+      "npm run build && npm test; echo done",
+      "npm test || echo fail; echo done",
+      "echo a & echo b; echo c",
+      '"C:\\bin\\a.exe" & echo b; echo c',
+      "echo a&echo b; echo c",
+      // Escaped, trailing, or leading semicolons
+      "find . -exec echo {} \\; -print",
+      "echo foo^; bar",
+      "echo foo`; bar",
+      "git status;",
+      "git status;   ",
+      "git status;   \ngit diff",
+      "; echo leading",
+    ];
+    for (const cmd of mustStayOnCmd) {
+      assert.equal(
+        needsPowerShellOnWindows(cmd),
+        false,
+        `Expected cmd.exe routing for: ${cmd}`,
+      );
+    }
+  });
+
   it("decodes UTF-8, truncated UTF-8 tails, and legacy codepage buffers cleanly", () => {
     assert.equal(parseWindowsCodePage("Active code page: 936\r\n"), "gb18030");
     assert.equal(parseWindowsCodePage("Active code page: 866\r\n"), "ibm866");
@@ -332,6 +434,31 @@ describe("run_checks", () => {
     // GBK bytes for "'x' 不是"
     const gbk = Buffer.from("27782720b2bbcac7", "hex");
     assert.equal(decodeProcessOutput(gbk, false, "gb18030"), "'x' 不是");
+
+    // Multi-line pure GBK preserves line endings and decodes every line
+    const multiGbk = Buffer.from("27782720b2bbcac70d0a27792720b2bbcac7", "hex");
+    assert.equal(decodeProcessOutput(multiGbk, false, "gb18030"), "'x' 不是\r\n'y' 不是");
+
+    // Mixed UTF-8 + GBK lines (e.g. chained `python && node` on Windows CP936)
+    // must keep valid UTF-8 lines intact instead of turning the whole buffer into mojibake
+    const mixed = Buffer.concat([
+      Buffer.from("ℹ pass 11\r\n", "utf8"),
+      Buffer.from("构建产物校验通过 → 404\n", "utf8"),
+      Buffer.from("27782720b2bbcac70d0a", "hex"),
+      Buffer.from("尾部 UTF-8 保留", "utf8"),
+    ]);
+    assert.equal(
+      decodeProcessOutput(mixed, false, "gb18030"),
+      "ℹ pass 11\r\n构建产物校验通过 → 404\n'x' 不是\r\n尾部 UTF-8 保留",
+    );
+
+    // Mixed GBK line followed by a UTF-8 final line truncated mid-character
+    const mixedTrunc = Buffer.concat([
+      Buffer.from("27782720b2bbcac70a", "hex"),
+      Buffer.from("中文", "utf8"),
+      Buffer.from([0xe8, 0xbe]),
+    ]);
+    assert.equal(decodeProcessOutput(mixedTrunc, true, "gb18030"), "'x' 不是\n中文");
   });
 
   it("folds oversized command output with Head-Tail preservation and UTF-8/surrogate safety", async () => {
@@ -407,7 +534,7 @@ describe("run_checks", () => {
       "console.error(h + ': Error in module A');",
       "for (let i = 0; i < 60; i++) console.error('Error: duplicate noisy failure line ' + i + ' ' + 'z'.repeat(60));",
       "console.error(t + ': 61 errors found in suite');",
-      "process.exit(1);",
+      "process.exitCode = 1;",
     ].join(" ");
     const compactRes = await runChecks({
       outputMode: "compact",
@@ -474,7 +601,7 @@ describe("run_checks", () => {
       "console.error('src/root.ts(1,1): error TS2304: FIRST_' + 'LONG_FAIL_ROOT');",
       "for (let i = 0; i < 45; i++) console.error('src/mid-' + i + '.ts(10,2): error TS2322: cascade line ' + i + ' ' + 'a'.repeat(30));",
       "console.error('src/end.ts(99,5): error TS2345: FINAL_' + 'LONG_FAIL_TAIL');",
-      "process.exit(1);",
+      "process.exitCode = 1;",
     ].join(" ");
 
     const compactWf = await runChecks({
@@ -500,7 +627,7 @@ describe("run_checks", () => {
       "console.error('Error: 首个中文根因_' + 'CJK_ROOT');",
       "for (let i = 0; i < 120; i++) console.error('Error: 中文编译报错详情行_' + i + '_类型不匹配需要检查字段定义和接口约束');",
       "console.error('Error: 最终中文尾部_' + 'CJK_TAIL_FINAL');",
-      "process.exit(1);",
+      "process.exitCode = 1;",
     ].join(" ");
     const cjkRes = await runChecks({
       outputMode: "compact",
@@ -661,6 +788,26 @@ describe("run_checks", () => {
       }
     });
 
+    it("executes unquoted ';'-chained commands end-to-end on Windows without cmd.exe swallowing trailing commands", async () => {
+      const res = await runChecks({
+        outputMode: "full",
+        commands: [
+          {
+            name: "win-semicolon-chain",
+            command: `node -e "console.log('SEMI_' + 'FIRST')" 2>&1; node -e "console.log('SEMI_' + 'SECOND')" 2>&1`,
+          },
+          {
+            name: "win-semicolon-call-op",
+            command: `& ${nodeBin} -e "console.log('CALL_' + 'ONE')" 2>&1; & ${nodeBin} -e "console.log('CALL_' + 'TWO')" 2>&1`,
+          },
+        ],
+      });
+      assert.equal(res.isError, false);
+      assert.match(res.text, /Checks: 2\/2 passed/);
+      assert.match(res.text, /SEMI_FIRST[\r\n]+SEMI_SECOND/);
+      assert.match(res.text, /CALL_ONE[\r\n]+CALL_TWO/);
+    });
+
     it("falls back cleanly without crashing when taskkill is unavailable on command timeout", async () => {
       const savedEnv = { ...process.env };
       const savedPath = process.env.PATH;
@@ -710,4 +857,129 @@ describe("run_checks", () => {
       }
     });
   }
+
+  it("injects non-interactive git env defaults without overriding caller values", async () => {
+    const base: NodeJS.ProcessEnv = { CUSTOM_VAR: "keep" };
+    const defaulted = withNonInteractiveGitEnv(base);
+    assert.equal(defaulted.CUSTOM_VAR, "keep");
+    assert.equal(defaulted.GIT_TERMINAL_PROMPT, "0");
+    assert.equal(defaulted.GCM_INTERACTIVE, "never");
+    assert.equal(base.GIT_TERMINAL_PROMPT, undefined);
+    assert.equal(base.GCM_INTERACTIVE, undefined);
+
+    const overridden = withNonInteractiveGitEnv({
+      GIT_TERMINAL_PROMPT: "1",
+      GCM_INTERACTIVE: "always",
+    });
+    assert.equal(overridden.GIT_TERMINAL_PROMPT, "1");
+    assert.equal(overridden.GCM_INTERACTIVE, "always");
+
+    // Plain shallow-cloned env objects on Windows must respect case-insensitive caller keys
+    const winLower = withNonInteractiveGitEnv(
+      { git_terminal_prompt: "1", gcm_interactive: "auto" },
+      "win32",
+    );
+    assert.equal(winLower.git_terminal_prompt, "1");
+    assert.equal(winLower.gcm_interactive, "auto");
+    assert.equal(winLower.GIT_TERMINAL_PROMPT, undefined);
+    assert.equal(winLower.GCM_INTERACTIVE, undefined);
+
+    const posixLower = withNonInteractiveGitEnv(
+      { git_terminal_prompt: "1", gcm_interactive: "auto" },
+      "linux",
+    );
+    assert.equal(posixLower.GIT_TERMINAL_PROMPT, "0");
+    assert.equal(posixLower.GCM_INTERACTIVE, "never");
+
+    const prevPrompt = process.env.GIT_TERMINAL_PROMPT;
+    const prevGcm = process.env.GCM_INTERACTIVE;
+    try {
+      delete process.env.GIT_TERMINAL_PROMPT;
+      delete process.env.GCM_INTERACTIVE;
+      const defaultRes = await runChecks({
+        outputMode: "full",
+        commands: [
+          {
+            name: "git-env-default",
+            command: `${nodeBin} -e "console.log(process.env.GIT_TERMINAL_PROMPT, process.env.GCM_INTERACTIVE)"`,
+          },
+        ],
+      });
+      assert.equal(defaultRes.isError, false);
+      assert.match(defaultRes.text, /\b0 never\b/);
+
+      process.env.GIT_TERMINAL_PROMPT = "1";
+      process.env.GCM_INTERACTIVE = "auto";
+      const overrideRes = await runChecks({
+        outputMode: "full",
+        commands: [
+          {
+            name: "git-env-override",
+            command: `${nodeBin} -e "console.log(process.env.GIT_TERMINAL_PROMPT, process.env.GCM_INTERACTIVE)"`,
+          },
+        ],
+      });
+      assert.equal(overrideRes.isError, false);
+      assert.match(overrideRes.text, /\b1 auto\b/);
+    } finally {
+      if (prevPrompt === undefined) delete process.env.GIT_TERMINAL_PROMPT;
+      else process.env.GIT_TERMINAL_PROMPT = prevPrompt;
+      if (prevGcm === undefined) delete process.env.GCM_INTERACTIVE;
+      else process.env.GCM_INTERACTIVE = prevGcm;
+    }
+  });
+
+  it("surfaces OOM/fatal exit codes and POSIX signal names in run_checks output", async () => {
+    const compactRes = await runChecks({
+      outputMode: "compact",
+      commands: [
+        {
+          name: "oom-exit-137",
+          command: `${nodeBin} -e "process.exit(137)"`,
+        },
+      ],
+    });
+    assert.equal(compactRes.isError, false);
+    assert.match(compactRes.text, /FAIL \(exit 137 \/ SIGKILL - possible OOM\)/);
+    assert.match(compactRes.text, /Terminated \(exit 137 \/ SIGKILL - possible OOM\)/);
+
+    const fullRes = await runChecks({
+      outputMode: "full",
+      commands: [
+        {
+          name: "segv-exit-139",
+          command: `${nodeBin} -e "process.exit(139)"`,
+        },
+      ],
+    });
+    assert.equal(fullRes.isError, false);
+    assert.match(fullRes.text, /\[FAIL \(exit 139 \/ SIGSEGV - segmentation fault\)\]/);
+
+    if (process.platform !== "win32") {
+      const sigRes = await runChecks({
+        outputMode: "compact",
+        commands: [
+          {
+            name: "direct-sigkill",
+            command: `exec ${nodeBin} -e "process.kill(process.pid, 'SIGKILL')"`,
+          },
+        ],
+      });
+      assert.equal(sigRes.isError, false);
+      assert.match(sigRes.text, /FAIL \(SIGKILL - possible OOM\)/);
+      assert.match(sigRes.text, /Terminated by SIGKILL - possible OOM/);
+    }
+  });
+
+  it("appends a parseable 1-line Example JSON on validation errors", async () => {
+    const emptyRes = await runChecks({ commands: [] });
+    assert.equal(emptyRes.isError, true);
+    const match = emptyRes.text.match(/\nExample: (\{.*\})$/);
+    assert.ok(match, emptyRes.text);
+    assert.ok(Array.isArray(JSON.parse(match[1]!).commands));
+
+    const missingCmd = await runChecks({ commands: [{ command: "   " }] });
+    assert.equal(missingCmd.isError, true);
+    assert.match(missingCmd.text, /\nExample: \{"commands":/);
+  });
 });

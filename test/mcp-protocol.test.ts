@@ -3,8 +3,11 @@ import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import { pathToFileURL } from "node:url";
 import { after, before, describe, it } from "node:test";
+import { MAX_FRAME_BYTES, McpStdioServer } from "../src/protocol/mcp.js";
+import { createAgyFastServer } from "../src/mcp-server-core.js";
 
 const MCP_SERVER_SCRIPT = path.resolve(process.cwd(), "dist", "mcp-server.mjs");
 
@@ -16,9 +19,12 @@ function buildCleanServerEnv(
   delete env.ANTIGRAVITY_APP_DATA_DIR;
   delete env.AGY_FAST_HOST;
   delete env.AGY_FAST_EDITS_FORMAT;
+  delete env.AGY_FAST_SCHEMA_COMPAT;
+  delete env.AGY_FAST_TOOLS;
   delete env.AGY_FAST_CACHE_DIR;
   delete env.PLUGIN_ROOT;
   delete env.AGY_PLUGIN_ROOT;
+  delete env.NODE_USE_ENV_PROXY;
   for (const [k, v] of Object.entries(extraEnv)) {
     if (v === undefined) delete env[k];
     else env[k] = v;
@@ -29,9 +35,10 @@ function buildCleanServerEnv(
 function sendMessagesToServer(
   rawChunks: Array<string | Buffer>,
   extraEnv: Record<string, string | undefined> = {},
+  extraArgs: string[] = [],
 ): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [MCP_SERVER_SCRIPT], {
+    const child = spawn(process.execPath, [MCP_SERVER_SCRIPT, ...extraArgs], {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
       env: buildCleanServerEnv(extraEnv),
@@ -342,6 +349,52 @@ describe("MCP Stdio Server end-to-end", () => {
     );
   });
 
+  it("keeps every serialized tools/list entry <= 1280 UTF-8 bytes in both array and string modes", async () => {
+    const MAX_TOOL_SCHEMA_BYTES = 1280;
+    for (const mode of ["array", "string"] as const) {
+      const res = await sendMessagesToServer(
+        [
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "initialize",
+            params: {
+              protocolVersion: "2025-03-26",
+              capabilities: {},
+              clientInfo: { name: "test", version: "1.0.0" },
+            },
+          }) + "\n",
+          JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }) + "\n",
+        ],
+        { AGY_FAST_EDITS_FORMAT: mode },
+      );
+      assert.equal(res.code, 0);
+      assert.equal(res.stderr, "");
+      const lines = res.stdout.trim().split("\n").map((l) => JSON.parse(l));
+      const tools = lines.find((l) => l.id === 2)?.result?.tools as Array<{
+        name: string;
+        description: string;
+        inputSchema: Record<string, unknown>;
+      }>;
+      assert.equal(tools.length, 5);
+      for (const tool of tools) {
+        const bytes = Buffer.byteLength(JSON.stringify(tool), "utf8");
+        assert.ok(
+          bytes <= MAX_TOOL_SCHEMA_BYTES,
+          `tool ${tool.name} (${mode} mode) is ${bytes} UTF-8 bytes, exceeding ${MAX_TOOL_SCHEMA_BYTES}B budget`,
+        );
+      }
+      const applyTool = tools.find((t) => t.name === "apply_edits")!;
+      if (mode === "array") {
+        assert.doesNotMatch(
+          applyTool.description,
+          /JSON array string/i,
+          "array-mode apply_edits must not bait strict JSON Schema hosts into sending stringified edits",
+        );
+      }
+    }
+  });
+
   it("resolves tool paths against the client's workspace root instead of its own cwd", async () => {
     const msgs = [
       {
@@ -618,6 +671,7 @@ describe("MCP Stdio Server end-to-end", () => {
       await new Promise<void>((resolve, reject) => {
         const child = spawn(process.execPath, [MCP_SERVER_SCRIPT], {
           stdio: ["pipe", "pipe", "pipe"],
+          env: buildCleanServerEnv(),
           windowsHide: true,
         });
         let buf = "";
@@ -994,5 +1048,513 @@ describe("MCP Stdio Server end-to-end", () => {
     } finally {
       await fs.rm(fakeRoot, { recursive: true, force: true });
     }
+  });
+
+  it("refuses to fall back to the home directory or the filesystem root when cwd is omitted or relative without MCP roots/list", async () => {
+    const fakeHome = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-home-cwd-"));
+    const project = path.join(fakeHome, "project");
+    try {
+      await fs.mkdir(project, { recursive: true });
+      await fs.writeFile(path.join(project, "app.ts"), "export function homeApp() { return 1; }\n", "utf8");
+
+      const runIn = (
+        cwd: string,
+        msgs: unknown[],
+      ): Promise<{ code: number | null; stdout: string; stderr: string }> =>
+        new Promise((resolve, reject) => {
+          const child = spawn(process.execPath, [MCP_SERVER_SCRIPT], {
+            cwd,
+            stdio: ["pipe", "pipe", "pipe"],
+            windowsHide: true,
+            env: buildCleanServerEnv({ HOME: fakeHome, USERPROFILE: fakeHome }),
+          });
+          let stdout = "";
+          let stderr = "";
+          const timer = setTimeout(() => {
+            child.kill("SIGKILL");
+            reject(new Error("MCP server test timed out"));
+          }, 10_000);
+          timer.unref();
+          child.stdout.on("data", (d) => (stdout += d.toString("utf8")));
+          child.stderr.on("data", (d) => (stderr += d.toString("utf8")));
+          child.on("error", (err) => {
+            clearTimeout(timer);
+            reject(err);
+          });
+          child.on("close", (code) => {
+            clearTimeout(timer);
+            resolve({ code, stdout, stderr });
+          });
+          for (const m of msgs) {
+            child.stdin.write(`${JSON.stringify(m)}\n`);
+          }
+          child.stdin.end();
+        });
+      const init = (name: string) => [
+        {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name, version: "1.0.0" } },
+        },
+        { jsonrpc: "2.0", method: "notifications/initialized" },
+      ];
+      const parse = (stdout: string) => stdout.trim().split("\n").map((l) => JSON.parse(l));
+
+      // 1. Started in the home directory: omitted/relative cwd fails fast, nothing is written,
+      //    and an explicit absolute cwd still works.
+      const homeRes = await runIn(fakeHome, [
+        ...init("no-roots-host"),
+        { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "apply_edits", arguments: { edits: [{ path: "rogue.txt", create: "nope" }] } } },
+        { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "batch_search", arguments: { queries: [{ type: "glob", pattern: "**/*.ts" }] } } },
+        { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "run_checks", arguments: { commands: [{ command: "echo hi" }] } } },
+        { jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "quick_outline", arguments: { cwd: "project", paths: ["app.ts"] } } },
+        { jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "quick_outline", arguments: { cwd: project, paths: ["app.ts"] } } },
+        { jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "read_slices", arguments: { outlines: ["project/app.ts"] } } },
+        { jsonrpc: "2.0", id: 8, method: "tools/call", params: { name: "quick_outline", arguments: { cwd: "~", paths: ["project/app.ts"] } } },
+        { jsonrpc: "2.0", id: 9, method: "tools/call", params: { name: "quick_outline", arguments: { cwd: fakeHome, paths: ["project/app.ts"] } } },
+      ]);
+      assert.equal(homeRes.code, 0);
+      assert.equal(homeRes.stderr, "");
+      const homeLines = parse(homeRes.stdout);
+      for (const id of [2, 3, 4, 7]) {
+        const resp = homeLines.find((l) => l.id === id);
+        assert.equal(resp?.result?.isError, true, `Expected fail-fast error for call id=${id}`);
+        assert.match(resp?.result?.content?.[0]?.text ?? "", /'cwd' is required.*home directory/i);
+      }
+      const relResp = homeLines.find((l) => l.id === 5);
+      assert.equal(relResp?.result?.isError, true);
+      assert.match(relResp?.result?.content?.[0]?.text ?? "", /'cwd' must be an absolute workspace path.*home directory/i);
+      await assert.rejects(fs.access(path.join(fakeHome, "rogue.txt")));
+      for (const id of [6, 8, 9]) {
+        const explicitResp = homeLines.find((l) => l.id === id);
+        assert.equal(explicitResp?.result?.isError, false, `Expected explicit cwd call id=${id} to succeed`);
+        assert.match(explicitResp?.result?.content?.[0]?.text ?? "", /homeApp/);
+      }
+
+      // 2. Started inside a project under the home directory: the process cwd is still used.
+      const projectRes = await runIn(project, [
+        ...init("no-roots-host"),
+        { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "quick_outline", arguments: { paths: ["app.ts"] } } },
+      ]);
+      assert.equal(projectRes.code, 0);
+      assert.equal(projectRes.stderr, "");
+      const projectResp = parse(projectRes.stdout).find((l) => l.id === 2);
+      assert.equal(projectResp?.result?.isError, false);
+      assert.match(projectResp?.result?.content?.[0]?.text ?? "", /homeApp/);
+
+      // 3. Started in the home directory but the host reports roots: the root is used.
+      const rootsRes = await runIn(fakeHome, [
+        {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: "2025-11-25", capabilities: { roots: {} }, clientInfo: { name: "roots-host", version: "1.0.0" } },
+        },
+        { jsonrpc: "2.0", method: "notifications/initialized" },
+        { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "quick_outline", arguments: { paths: ["app.ts"] } } },
+        { jsonrpc: "2.0", id: "agy-fast-roots-1", result: { roots: [{ uri: pathToFileURL(project).href }] } },
+      ]);
+      assert.equal(rootsRes.code, 0);
+      assert.equal(rootsRes.stderr, "");
+      const rootsResp = parse(rootsRes.stdout).find((l) => l.id === 2);
+      assert.equal(rootsResp?.result?.isError, false);
+      assert.match(rootsResp?.result?.content?.[0]?.text ?? "", /homeApp/);
+
+      // 4. Started in the filesystem root: same fail-fast (calls that would be harmless if run).
+      const fsRoot = path.parse(fakeHome).root;
+      const rootRes = await runIn(fsRoot, [
+        ...init("no-roots-host"),
+        { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "quick_outline", arguments: { paths: ["agy-fast-missing.ts"] } } },
+        { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "run_checks", arguments: { commands: [{ command: "echo hi" }] } } },
+        { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "quick_outline", arguments: { cwd: "agy-fast-missing-dir", paths: ["a.ts"] } } },
+      ]);
+      assert.equal(rootRes.code, 0);
+      assert.equal(rootRes.stderr, "");
+      const rootLines = parse(rootRes.stdout);
+      for (const id of [2, 3]) {
+        const resp = rootLines.find((l) => l.id === id);
+        assert.equal(resp?.result?.isError, true, `Expected fail-fast error for call id=${id}`);
+        assert.match(resp?.result?.content?.[0]?.text ?? "", /'cwd' is required.*filesystem root/i);
+      }
+      const rootRelResp = rootLines.find((l) => l.id === 4);
+      assert.equal(rootRelResp?.result?.isError, true);
+      assert.match(rootRelResp?.result?.content?.[0]?.text ?? "", /'cwd' must be an absolute workspace path.*filesystem root/i);
+    } finally {
+      await fs.rm(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  it("enforces frame size cap on NDJSON stdio framing without OOM and resumes cleanly on the next valid line", async () => {
+    assert.equal(MAX_FRAME_BYTES, 64 * 1024 * 1024);
+
+    const runInMemory = async (
+      maxFrameBytes: number,
+      chunks: Array<string | Buffer>,
+    ): Promise<Array<Record<string, unknown>>> => {
+      const input = new PassThrough();
+      const output = new PassThrough();
+      const outChunks: Buffer[] = [];
+      output.on("data", (d: Buffer) => outChunks.push(d));
+
+      const server = new McpStdioServer({
+        name: "test-cap",
+        version: "0.0.1",
+        maxFrameBytes,
+      });
+
+      const drained = new Promise<void>((resolve) => {
+        server.listen(input, output, resolve);
+      });
+
+      for (const chunk of chunks) {
+        input.write(chunk);
+        await new Promise((r) => setImmediate(r));
+      }
+      input.end();
+      await drained;
+
+      const rawOut = Buffer.concat(outChunks).toString("utf8").trim();
+      return rawOut ? rawOut.split("\n").map((line) => JSON.parse(line)) : [];
+    };
+
+    const ping = (id: number) => JSON.stringify({ jsonrpc: "2.0", id, method: "ping" });
+
+    // 1. Chunked oversized NDJSON without newline emits -32600 immediately, discards continuation
+    //    chunks without duplicate errors, and resumes cleanly on a chunk starting with \n
+    const chunkedRes = await runInMemory(128, [
+      `{"jsonrpc":"2.0","id":1,"params":"${"a".repeat(80)}`,
+      `${"b".repeat(80)}`, // crosses 128 bytes with no \n -> triggers -32600 and discarding state
+      `${"c".repeat(200)}`, // still discarding, must NOT emit a second error
+      `\n${ping(2)}\n`, // leading \n closes discarded line; id=2 must succeed
+    ]);
+    assert.equal(chunkedRes.length, 2);
+    assert.equal((chunkedRes[0]!.error as { code: number; message: string }).code, -32600);
+    assert.match(
+      (chunkedRes[0]!.error as { message: string }).message,
+      /NDJSON message exceeds maximum allowed size/,
+    );
+    assert.equal(chunkedRes[1]!.id, 2);
+    assert.deepEqual(chunkedRes[1]!.result, {});
+
+    // 2. Single-chunk oversized NDJSON line (with \n) pipelined with a valid next request in the same chunk
+    const pipelinedRes = await runInMemory(128, [
+      `{"jsonrpc":"2.0","id":9,"data":"${"x".repeat(200)}"}\n${ping(3)}\n`,
+    ]);
+    assert.equal(pipelinedRes.length, 2);
+    assert.equal((pipelinedRes[0]!.error as { code: number }).code, -32600);
+    assert.equal(pipelinedRes[1]!.id, 3);
+    assert.deepEqual(pipelinedRes[1]!.result, {});
+
+    // 3. Oversized NDJSON terminated by EOF (no \n) emits exactly one -32600 and no spurious -32700
+    const eofRes = await runInMemory(128, [`{"jsonrpc":"2.0","data":"${"z".repeat(200)}`]);
+    assert.equal(eofRes.length, 1);
+    assert.equal((eofRes[0]!.error as { code: number }).code, -32600);
+
+    // 4. Exact boundary (LF and CRLF) succeeds, and multi-line chunks > maxFrameBytes total succeed when each line fits
+    const exactPing = ping(4);
+    const exactLimit = Buffer.byteLength(exactPing, "utf8");
+    const boundaryRes = await runInMemory(exactLimit, [
+      `${exactPing}\n${ping(5)}\r\n${ping(6)}\n`,
+    ]);
+    assert.deepEqual(
+      boundaryRes.map((r) => r.id),
+      [4, 5, 6],
+    );
+
+    // 5. Split CRLF right at the exact boundary (\r at end of chunk 1, \n at start of chunk 2) succeeds
+    const crlfSplitRes = await runInMemory(exactLimit, [
+      `${exactPing}\r`,
+      `\n${ping(7)}\n`,
+    ]);
+    assert.deepEqual(
+      crlfSplitRes.map((r) => r.id),
+      [4, 7],
+    );
+  });
+
+  it("supports --schema-compat=minimal and AGY_FAST_SCHEMA_COMPAT=minimal while preserving property names and runtime validation", async () => {
+    const ALLOWED_MINIMAL_KEYWORDS = new Set([
+      "type",
+      "properties",
+      "required",
+      "additionalProperties",
+      "items",
+      "enum",
+      "const",
+      "description",
+      "title",
+      "default",
+      "examples",
+    ]);
+
+    const assertStrictMinimalSubset = (node: unknown, pointer = "$"): void => {
+      assert.ok(node && typeof node === "object" && !Array.isArray(node), `${pointer} must be an object`);
+      for (const [key, val] of Object.entries(node as Record<string, unknown>)) {
+        assert.ok(
+          ALLOWED_MINIMAL_KEYWORDS.has(key),
+          `unexpected JSON Schema keyword '${key}' at ${pointer}`,
+        );
+        if (key === "properties") {
+          assert.ok(val && typeof val === "object" && !Array.isArray(val));
+          for (const [propName, propSchema] of Object.entries(val as Record<string, unknown>)) {
+            assertStrictMinimalSubset(propSchema, `${pointer}.properties.${propName}`);
+          }
+        } else if (key === "items") {
+          assertStrictMinimalSubset(val, `${pointer}.items`);
+        }
+      }
+    };
+
+    const listTools = async (
+      extraEnv: Record<string, string | undefined> = {},
+      extraArgs: string[] = [],
+    ) => {
+      const res = await sendMessagesToServer(
+        [
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "initialize",
+            params: {
+              protocolVersion: "2025-03-26",
+              capabilities: {},
+              clientInfo: { name: "strict-subset-client", version: "1.0.0" },
+            },
+          }) + "\n",
+          JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }) + "\n",
+        ],
+        extraEnv,
+        extraArgs,
+      );
+      assert.equal(res.code, 0, res.stderr);
+      assert.equal(res.stderr, "");
+      const lines = res.stdout.trim().split("\n").map((l) => JSON.parse(l));
+      return lines.find((l) => l.id === 2)?.result?.tools as Array<{
+        name: string;
+        description: string;
+        inputSchema: Record<string, unknown>;
+      }>;
+    };
+
+    const standardTools = await listTools();
+    const minimalCliTools = await listTools({}, ["--schema-compat=minimal"]);
+    const minimalEnvTools = await listTools({ AGY_FAST_SCHEMA_COMPAT: "minimal" });
+    // CLI flag overrides env var in both directions
+    const cliOverrideStandard = await listTools(
+      { AGY_FAST_SCHEMA_COMPAT: "minimal" },
+      ["--schema-compat", "standard"],
+    );
+    // Unrecognized env var falls back safely to standard
+    const invalidEnvFallback = await listTools({ AGY_FAST_SCHEMA_COMPAT: "bogus" });
+
+    assert.deepEqual(minimalCliTools, minimalEnvTools);
+    assert.deepEqual(cliOverrideStandard, standardTools);
+    assert.deepEqual(invalidEnvFallback, standardTools);
+
+    assert.equal(minimalCliTools.length, 5);
+    for (let i = 0; i < minimalCliTools.length; i++) {
+      const stdTool = standardTools[i]!;
+      const minTool = minimalCliTools[i]!;
+      assert.equal(minTool.name, stdTool.name);
+      assert.equal(hasDisallowedSchemaKeyword(minTool.inputSchema), false);
+      assertStrictMinimalSubset(minTool.inputSchema, minTool.name);
+      const stdBytes = Buffer.byteLength(JSON.stringify(stdTool), "utf8");
+      const minBytes = Buffer.byteLength(JSON.stringify(minTool), "utf8");
+      assert.ok(minBytes <= 1280, `${minTool.name} minimal schema exceeds 1280B (${minBytes}B)`);
+      assert.ok(
+        minBytes < stdBytes,
+        `${minTool.name} minimal schema (${minBytes}B) should be smaller than standard (${stdBytes}B)`,
+      );
+    }
+
+    // Crucial regression guard: stripping JSON Schema 'pattern' keyword must NEVER
+    // remove the tool property literally named 'pattern' in batch_search.queries.
+    const batchSearchMin = minimalCliTools.find((t) => t.name === "batch_search")!;
+    const queryItemProps = (
+      (
+        (batchSearchMin.inputSchema.properties as Record<string, unknown>)
+          .queries as Record<string, unknown>
+      ).items as Record<string, unknown>
+    ).properties as Record<string, unknown>;
+    assert.deepEqual(queryItemProps.pattern, { type: "string" });
+
+    // Runtime validation remains intact even when minItems/minimum are stripped from schema
+    const runtimeCheck = await sendMessagesToServer(
+      [
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: "2025-03-26", capabilities: {} },
+        }) + "\n",
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 2,
+          method: "tools/call",
+          params: {
+            name: "batch_search",
+            arguments: { cwd: tmpDir, queries: [] },
+          },
+        }) + "\n",
+      ],
+      {},
+      ["--schema-compat=minimal"],
+    );
+    assert.equal(runtimeCheck.code, 0);
+    const callReply = runtimeCheck.stdout
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l))
+      .find((l) => l.id === 2);
+    assert.equal(callReply.result.isError, true);
+
+    // Invalid CLI flag values fail fast; --help prints usage and exits 0
+    const badVal = await sendMessagesToServer([], {}, ["--schema-compat=invalid"]);
+    assert.equal(badVal.code, 1);
+    assert.match(badVal.stderr, /Invalid --schema-compat/);
+
+    const missingVal = await sendMessagesToServer([], {}, ["--schema-compat"]);
+    assert.equal(missingVal.code, 1);
+    assert.match(missingVal.stderr, /Missing value for --schema-compat/);
+
+    const unknownFlag = await sendMessagesToServer([], {}, ["--does-not-exist"]);
+    assert.equal(unknownFlag.code, 1);
+    assert.match(unknownFlag.stderr, /Unknown argument/);
+
+    const helpRes = await sendMessagesToServer([], {}, ["--help"]);
+    assert.equal(helpRes.code, 0);
+    assert.match(helpRes.stdout, /--schema-compat/);
+  });
+
+  it("enforces zero runtime dependencies, bundle size budget, and portable bin packaging", async () => {
+    const pkgPath = path.resolve(process.cwd(), "package.json");
+    const pkg = JSON.parse(await fs.readFile(pkgPath, "utf8")) as {
+      dependencies?: Record<string, string>;
+      bin?: Record<string, string>;
+      files?: string[];
+    };
+
+    assert.equal(
+      Object.keys(pkg.dependencies ?? {}).length,
+      0,
+      "agy-fast must keep zero runtime dependencies",
+    );
+    assert.equal(pkg.bin?.["agy-fast"], "./scripts/install.mjs");
+    assert.equal(pkg.bin?.["agy-fast-mcp"], "./dist/mcp-server.mjs");
+    assert.ok(Array.isArray(pkg.files) && pkg.files.includes("dist/*.mjs"));
+    assert.ok(Array.isArray(pkg.files) && pkg.files.includes("scripts/install.mjs"));
+
+    const serverBuf = await fs.readFile(MCP_SERVER_SCRIPT);
+    assert.ok(
+      serverBuf.subarray(0, 32).toString("utf8").startsWith("#!/usr/bin/env node\n"),
+      "dist/mcp-server.mjs must start with a node shebang for portable npx/bin execution",
+    );
+    const MAX_MCP_BUNDLE_BYTES = 512 * 1024;
+    assert.ok(
+      serverBuf.byteLength <= MAX_MCP_BUNDLE_BYTES,
+      `dist/mcp-server.mjs is ${serverBuf.byteLength} bytes, exceeding ${MAX_MCP_BUNDLE_BYTES}-byte anti-bloat budget`,
+    );
+  });
+
+  it("filters registered MCP tools via --tools and AGY_FAST_TOOLS and rejects invalid tool names", async () => {
+    const runWithArgs = (
+      cliArgs: string[],
+      rawChunks: string[],
+      extraEnv: Record<string, string | undefined> = {},
+    ): Promise<{ code: number | null; stdout: string; stderr: string }> =>
+      new Promise((resolve, reject) => {
+        const child = spawn(process.execPath, [MCP_SERVER_SCRIPT, ...cliArgs], {
+          stdio: ["pipe", "pipe", "pipe"],
+          env: buildCleanServerEnv(extraEnv),
+          windowsHide: true,
+        });
+        let stdout = "";
+        let stderr = "";
+        const timer = setTimeout(() => {
+          child.kill("SIGKILL");
+          reject(new Error(`runWithArgs timed out for args: ${cliArgs.join(" ")}`));
+        }, 6_000);
+        timer.unref();
+        child.stdout.on("data", (d) => {
+          stdout += d.toString("utf8");
+        });
+        child.stderr.on("data", (d) => {
+          stderr += d.toString("utf8");
+        });
+        child.on("error", (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+        child.on("close", (code) => {
+          clearTimeout(timer);
+          resolve({ code, stdout, stderr });
+        });
+        for (const chunk of rawChunks) child.stdin.write(chunk);
+        child.stdin.end();
+      });
+
+    const listReq = [
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "codex", version: "1.0.0" } },
+      })}\n`,
+      `${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`,
+      `${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" })}\n`,
+      `${JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "apply_edits", arguments: { edits: [] } } })}\n`,
+    ];
+
+    // 1. --tools comma-separated subset exposes only selected tools and rejects excluded tool calls
+    const subsetRes = await runWithArgs(["--tools", "batch_search,quick_outline,run_checks"], listReq);
+    assert.equal(subsetRes.code, 0, subsetRes.stderr);
+    const subsetLines = subsetRes.stdout.trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>);
+    const toolsList = ((subsetLines[1]!.result as { tools: Array<{ name: string }> }).tools).map((t) => t.name);
+    assert.deepEqual(toolsList, ["batch_search", "quick_outline", "run_checks"]);
+    const excludedCallErr = subsetLines[2]!.error as { code: number; message: string };
+    assert.equal(excludedCallErr.code, -32602);
+    assert.match(excludedCallErr.message, /Unknown tool/i);
+
+    // 2. AGY_FAST_TOOLS env var fallback works and --tools=... overrides it
+    const envRes = await runWithArgs([], listReq.slice(0, 3), { AGY_FAST_TOOLS: "quick_outline,run_checks" });
+    assert.equal(envRes.code, 0, envRes.stderr);
+    const envLines = envRes.stdout.trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>);
+    assert.deepEqual(
+      ((envLines[1]!.result as { tools: Array<{ name: string }> }).tools).map((t) => t.name),
+      ["quick_outline", "run_checks"],
+    );
+
+    const overrideRes = await runWithArgs(["--tools=batch_search"], listReq.slice(0, 3), { AGY_FAST_TOOLS: "run_checks" });
+    assert.equal(overrideRes.code, 0, overrideRes.stderr);
+    const overrideLines = overrideRes.stdout.trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>);
+    assert.deepEqual(
+      ((overrideLines[1]!.result as { tools: Array<{ name: string }> }).tools).map((t) => t.name),
+      ["batch_search"],
+    );
+
+    // 3. Invalid tool name, empty --tools, missing --tools value, duplicate invalid --tools, unknown flags, or extra args fail fast
+    for (const badArgs of [
+      ["--tools", "not_a_tool"],
+      ["--tools="],
+      ["--tools"],
+      ["--tools", "bogus", "--tools", "batch_search"],
+      ["--tool=batch_search"],
+      ["--tools", "batch_search", "quick_outline"],
+      ["--tools=batch_search", "--cli", "search", "foo"],
+    ]) {
+      const badRes = await runWithArgs(badArgs, []);
+      assert.equal(badRes.code, 1, `Expected exit 1 for ${badArgs.join(" ")}`);
+      assert.ok(badRes.stderr.length > 0);
+    }
+
+    // 4. --help succeeds even when AGY_FAST_TOOLS is invalid
+    const helpRes = await runWithArgs(["--help"], [], { AGY_FAST_TOOLS: "bogus" });
+    assert.equal(helpRes.code, 0, helpRes.stderr);
+    assert.match(helpRes.stdout, /--tools/);
+
+    // 5. Programmatic createAgyFastServer({ tools }) validates empty/unknown entries
+    assert.throws(() => createAgyFastServer({ tools: [] }), /empty/i);
+    assert.throws(() => createAgyFastServer({ tools: ["bogus" as never] }), /Unknown tool/i);
   });
 });

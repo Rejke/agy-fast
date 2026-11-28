@@ -1,24 +1,41 @@
-import { promises as fs } from "node:fs";
+import { createReadStream, promises as fs } from "node:fs";
 import path from "node:path";
+import readline from "node:readline";
 
 export interface TranscriptToolCall {
+  id?: string;
+  call_id?: string;
+  tool_call_id?: string;
   name?: string;
   args?: Record<string, unknown> | string;
   arguments?: Record<string, unknown> | string;
+}
+
+export interface SkippedTranscriptFile {
+  path: string;
+  reason: string;
 }
 
 export interface AnalyzeOptions {
   recent?: number;
   sinceMs?: number;
   untilMs?: number;
+  concurrency?: number;
+  skippedFiles?: SkippedTranscriptFile[];
+  onSkippedFile?: (skipped: SkippedTranscriptFile) => void;
 }
 
 export interface TranscriptStep {
   step_index?: number;
+  id?: string;
+  call_id?: string;
+  tool_call_id?: string;
   source?: string;
   type?: string;
   status?: string;
+  error?: unknown;
   created_at?: string;
+  model?: string;
   input_tokens?: number;
   cache_read_tokens?: number;
   output_tokens?: number;
@@ -47,15 +64,23 @@ export interface BenchmarkMetrics {
   runCommandCalls: number;
   readonlySearchRunCommandCalls: number;
   agyFastToolCalls: Record<string, number>;
+  agyEagerCalls: number;
+  agyLazyCalls: number;
+  agyCliCalls: number;
   mcpSpillCalls: number;
   agyTruncatedCalls: number;
+  agyMaxResultsCappedCalls: number;
   agyErrorCalls: number;
+  agyVerifyFailedCalls: number;
+  agyUnpairedResultCalls: number;
   agyCorruptedArgCalls: number;
   agyCorruptedArgWastedSec: number;
   agyCorruptedArgWastedOutTokens: number;
   swarmWorkerSessions: number;
   swarmWorkerSessionsWithAgyFast: number;
   multiMcpTurns: number;
+  multiSameMcpTurns: number;
+  multiDiffMcpTurns: number;
   multiRunCommandTurns: number;
   mediaLoadedCount: number;
   multimodalHighCtxTurns: number;
@@ -63,6 +88,23 @@ export interface BenchmarkMetrics {
   over150kContextRatio: number;
   avgCacheHitRate: number;
   over60sGapRatio: number;
+  cacheMissAttribution: CacheMissAttribution;
+}
+
+export interface CacheMissAttribution {
+  total: number;
+  planModeSwitch: number;
+  modelSwitch: number;
+  errorRetry: number;
+  activeSlowGap: number;
+  idleOrWaitGap: number;
+  asyncWakeupFast: number;
+  fastReplicaOrPrefixMiss: number;
+  compactionResets: number;
+  contextDilutionTurns: number;
+  sustainedCollapseRuns: number;
+  sustainedCollapseTurns: number;
+  maxConsecutiveMisses: number;
 }
 
 export interface UsageSplitMetrics {
@@ -79,6 +121,9 @@ const BLOCKING_TOOLS = new Set([
   "wait_for_subagents",
 ]);
 
+const PLAN_MODE_TOOLS = new Set(["enter_plan_mode", "exit_plan_mode"]);
+const PLAN_MODE_NOTICE_RE = /\[plan review(?: due)?\]|Plan mode is (?:on|off):/i;
+
 const READONLY_SIMPLE_CMDS = new Set([
   "rg",
   "grep",
@@ -92,7 +137,16 @@ const READONLY_SIMPLE_CMDS = new Set([
   "cat",
   "stat",
   "file",
+  "get-childitem",
+  "gci",
+  "select-string",
+  "sls",
+  "get-content",
+  "gc",
+  "test-path",
 ]);
+
+const NULL_REDIRECT_TARGET_RE = /^(?:\/dev\/null|nul|\$null)$/i;
 
 const BENIGN_GLUE_CMDS = new Set([
   "cd",
@@ -455,7 +509,7 @@ function parseSafeShellSegments(cmd: string): ShellToken[][] | null {
         i += cmd[i + 2] === ">" ? 3 : 2;
         while (i < len && (cmd[i] === " " || cmd[i] === "\t")) i += 1;
         const target = readWord();
-        if (!target || target.value !== "/dev/null") return null;
+        if (!target || !NULL_REDIRECT_TARGET_RE.test(target.value)) return null;
         continue;
       }
       // Single `&` (background job)
@@ -494,7 +548,7 @@ function parseSafeShellSegments(cmd: string): ShellToken[][] | null {
       if (cmd[i] === ">" || cmd[i] === "|") i += 1;
       while (i < len && (cmd[i] === " " || cmd[i] === "\t")) i += 1;
       const target = readWord();
-      if (!target || target.value !== "/dev/null") return null;
+      if (!target || !NULL_REDIRECT_TARGET_RE.test(target.value)) return null;
       continue;
     }
 
@@ -802,9 +856,12 @@ function classifyShellSegment(
   }
 
   const cmdName = normalizeCommandName(tokens[idx]!.value);
+  const lowerCmd = cmdName.toLowerCase();
   const args = tokens.slice(idx + 1).map((t) => t.value);
 
-  if (READONLY_SIMPLE_CMDS.has(cmdName)) return "readonly_search";
+  if (READONLY_SIMPLE_CMDS.has(cmdName) || READONLY_SIMPLE_CMDS.has(lowerCmd)) {
+    return "readonly_search";
+  }
   if (cmdName === "find") {
     return args.some((a) => FIND_MUTATING_ARGS.has(a))
       ? "other"
@@ -848,21 +905,135 @@ function isReadonlySearchShell(cmd: string): boolean {
   return hasReadonlySearch;
 }
 
+type ParsedJsonlLineResult =
+  | { kind: "empty" }
+  | { kind: "step"; step: TranscriptStep }
+  | { kind: "malformed" };
+
+function parseTranscriptJsonlLine(rawLine: string): ParsedJsonlLineResult {
+  const trimmed = rawLine.trim();
+  if (!trimmed) return { kind: "empty" };
+  try {
+    const parsed = JSON.parse(trimmed) as TranscriptStep;
+    if (parsed && typeof parsed === "object") {
+      return { kind: "step", step: parsed };
+    }
+    return { kind: "malformed" };
+  } catch {
+    return { kind: "malformed" };
+  }
+}
+
 export function parseTranscriptJsonl(content: string): TranscriptStep[] {
   const steps: TranscriptStep[] = [];
   for (const rawLine of content.split(/\r?\n/)) {
-    const trimmed = rawLine.trim();
-    if (!trimmed) continue;
-    try {
-      const parsed = JSON.parse(trimmed) as TranscriptStep;
-      if (parsed && typeof parsed === "object") {
-        steps.push(parsed);
-      }
-    } catch {
-      // Skip malformed line
+    const res = parseTranscriptJsonlLine(rawLine);
+    if (res.kind === "step") {
+      steps.push(res.step);
     }
   }
   return steps;
+}
+
+async function parseTranscriptJsonlFileDetailed(
+  filePath: string,
+): Promise<{ steps: TranscriptStep[]; malformedLines: number }> {
+  const steps: TranscriptStep[] = [];
+  let malformedLines = 0;
+  const stream = createReadStream(filePath, { encoding: "utf8" });
+  const rl = readline.createInterface({
+    input: stream,
+    crlfDelay: Infinity,
+  });
+  try {
+    for await (const line of rl) {
+      const res = parseTranscriptJsonlLine(line);
+      if (res.kind === "step") {
+        steps.push(res.step);
+      } else if (res.kind === "malformed") {
+        malformedLines++;
+      }
+    }
+  } finally {
+    // Prevent late stream errors during cleanup from becoming unhandled events
+    stream.on("error", () => {});
+    rl.close();
+    stream.destroy();
+  }
+  return { steps, malformedLines };
+}
+
+export async function parseTranscriptJsonlFile(
+  filePath: string,
+): Promise<TranscriptStep[]> {
+  const { steps } = await parseTranscriptJsonlFileDetailed(filePath);
+  return steps;
+}
+
+const AGY_FAST_CLI_SEGMENT_RE =
+  /^\s*(?:(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s;&|]+)\s+)*)(?:(?:"[^"]*[/\\]?node(?:\.exe)?"|'[^']*[/\\]?node(?:\.exe)?'|(?:[^\s"']*[/\\])?node(?:\.exe)?)\s+)(?:--\S+\s+)*(?:"[^"]*[/\\]?mcp-server\.mjs"|'[^']*[/\\]?mcp-server\.mjs'|(?:[^\s"']*[/\\])?mcp-server\.mjs)\s+--cli\s+(search|batch_search|outline|quick_outline|slice|slices|read_slices|edit|apply_edits|check|checks|run_checks)(?=\s|$)/i;
+
+const AGY_FAST_CLI_ALIAS_MAP: Record<string, string> = {
+  search: "batch_search",
+  batch_search: "batch_search",
+  outline: "quick_outline",
+  quick_outline: "quick_outline",
+  slice: "read_slices",
+  slices: "read_slices",
+  read_slices: "read_slices",
+  edit: "apply_edits",
+  apply_edits: "apply_edits",
+  check: "run_checks",
+  checks: "run_checks",
+  run_checks: "run_checks",
+};
+
+function splitUnquotedShellSegments(cmd: string): string[] {
+  const out: string[] = [];
+  let start = 0;
+  let quote: '"' | "'" | null = null;
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i]!;
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === "\\" && i + 1 < cmd.length) {
+        i += 1;
+        continue;
+      }
+      if (ch === '"') quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (ch === "\\" && i + 1 < cmd.length) {
+      i += 1;
+      continue;
+    }
+    if (ch === ";" || ch === "\n" || ch === "|" || ch === "&") {
+      out.push(cmd.slice(start, i));
+      if ((ch === "|" || ch === "&") && cmd[i + 1] === ch) i += 1;
+      start = i + 1;
+    }
+  }
+  out.push(cmd.slice(start));
+  return out;
+}
+
+function extractAgyFastCliToolName(cmd: string): string | null {
+  if (!cmd || !cmd.includes("--cli")) return null;
+  for (const seg of splitUnquotedShellSegments(cmd)) {
+    if (!seg.includes("--cli")) continue;
+    const m = AGY_FAST_CLI_SEGMENT_RE.exec(seg);
+    if (m?.[1]) {
+      return AGY_FAST_CLI_ALIAS_MAP[m[1].toLowerCase()] ?? null;
+    }
+  }
+  return null;
 }
 
 function extractAgyFastToolName(call: TranscriptToolCall): string | null {
@@ -881,6 +1052,9 @@ function extractAgyFastToolName(call: TranscriptToolCall): string | null {
       /agy-fast/i.test(serverName);
     const m = isFastServer ? AGY_FAST_TOOL_RE.exec(toolName) : null;
     return m?.[1] ?? null;
+  }
+  if (name === "run_command") {
+    return extractAgyFastCliToolName(getCommandString(getCallArgs(call)));
   }
   const m = AGY_FAST_TOOL_RE.exec(name);
   return m?.[1] ?? null;
@@ -941,6 +1115,10 @@ function maybeParseJsonValue(val: unknown): unknown {
 
 function getCanonicalToolName(call: TranscriptToolCall): string {
   const name = call.name ?? "";
+  if (name === "run_command") {
+    const cliTool = extractAgyFastCliToolName(getCommandString(getCallArgs(call)));
+    return cliTool ? `agy-fast-cli:${cliTool}` : name;
+  }
   if (name !== "call_mcp_tool") return name;
   const callArgs = getCallArgs(call);
   const serverName = unwrapJsonString(
@@ -991,10 +1169,19 @@ function hasCorruptedAgyFastArgs(
     if (Array.isArray(outlines) && outlines.some((p) => typeof p !== "string")) {
       return true;
     }
+    const lineRanges = maybeParseJsonValue(inner.lineRanges);
+    if (typeof lineRanges === "boolean" || lineRanges === null) return true;
+    if (
+      Array.isArray(lineRanges) &&
+      lineRanges.some((lr) => typeof lr !== "string" || lr.trim().length === 0)
+    ) {
+      return true;
+    }
     const slices = maybeParseJsonValue(inner.slices);
     if (typeof slices === "boolean" || slices === null) return true;
     if (Array.isArray(slices)) {
       return slices.some((s) => {
+        if (typeof s === "string") return s.trim().length === 0;
         if (!isPlainRecord(s)) return true;
         if (s.ranges !== undefined) {
           const ranges = maybeParseJsonValue(s.ranges);
@@ -1083,6 +1270,92 @@ export function filterStepsByTime(
   return out;
 }
 
+const HOST_METADATA_PREFIX_RE =
+  /^(?:(?:Created At|Completed At):[^\r\n]*(?:\r?\n|$)|\r?\n)+/;
+
+const HOST_SPILL_FIRST_LINE_RE =
+  /^(?:The output was large and was saved to:|(?:The (?:tool's |command's )?|Tool |Command )?output was truncated\b[^\r\n]*output\.txt)/i;
+
+const HOST_SPILL_MULTILINE_HEAD_RE =
+  /^(?:The (?:tool's |command's )?|Tool |Command )?output was truncated\b/i;
+
+const AGY_BUDGET_TRUNCATED_RE = /(?:^|\n)\.\.\.\s*\[truncated:/;
+const AGY_MAX_RESULTS_CAPPED_RE =
+  /(?:^|\n)\.\.\.\s*\[truncated(?: at \d+|; showing )/;
+const AGY_ERROR_HEAD_RE =
+  /^(?:Encountered error in step execution|Error invalid tool call|Partial edit applied|Atomic edit aborted)\b/;
+const AGY_VERIFY_FAILED_RE = /(?:^|\n)Verify \[(?:FAIL\b|TIMEOUT\b|ERROR\b)/;
+
+function stripHostMetadataPrefix(resText: string): string {
+  return resText.replace(HOST_METADATA_PREFIX_RE, "");
+}
+
+function isHostSpillBody(body: string): boolean {
+  const headLines = body.split(/\r?\n/, 3);
+  const firstLine = headLines[0] ?? "";
+  if (HOST_SPILL_FIRST_LINE_RE.test(firstLine)) return true;
+  if (
+    HOST_SPILL_MULTILINE_HEAD_RE.test(firstLine) &&
+    headLines.join("\n").includes("output.txt")
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function getToolCallId(obj: {
+  id?: unknown;
+  call_id?: unknown;
+  tool_call_id?: unknown;
+}): string | null {
+  for (const val of [obj.tool_call_id, obj.call_id, obj.id]) {
+    if (typeof val === "string" && val.trim().length > 0) {
+      return val.trim();
+    }
+  }
+  return null;
+}
+
+function pairToolCallResult(
+  plannerStep: TranscriptStep,
+  call: TranscriptToolCall,
+  callIdx: number,
+  totalCalls: number,
+  genericSteps: TranscriptStep[],
+  genericById: Map<string, TranscriptStep>,
+  genericByIndex: Map<number, TranscriptStep>,
+  anyGenericHasToolCallId: boolean,
+): TranscriptStep | undefined {
+  // 1. Pair by verifiable tool-call ID first
+  const callId = getToolCallId(call);
+  if (callId !== null) {
+    const byId = genericById.get(callId);
+    if (byId) return byId;
+    if (anyGenericHasToolCallId) return undefined;
+  }
+
+  // 2. Pair deterministically by step_index === planner.step_index + 1 + callIdx
+  const plannerIdx = plannerStep.step_index;
+  if (typeof plannerIdx === "number" && Number.isInteger(plannerIdx)) {
+    if (genericByIndex.size > 0) {
+      return genericByIndex.get(plannerIdx + 1 + callIdx);
+    }
+    return undefined;
+  }
+
+  // 3. Only when planner.step_index is absent (minimal synthetic fixtures),
+  //    fall back to positional pairing when counts match 1:1.
+  if (
+    plannerIdx === undefined &&
+    genericByIndex.size === 0 &&
+    genericSteps.length === totalCalls
+  ) {
+    return genericSteps[callIdx];
+  }
+
+  return undefined;
+}
+
 export function analyzeTranscriptSessions(
   sessions: TranscriptStep[][],
 ): BenchmarkMetrics {
@@ -1110,15 +1383,23 @@ export function analyzeTranscriptSessions(
     quick_outline: 0,
     run_checks: 0,
   };
+  let agyEagerCalls = 0;
+  let agyLazyCalls = 0;
+  let agyCliCalls = 0;
   let mcpSpillCalls = 0;
   let agyTruncatedCalls = 0;
+  let agyMaxResultsCappedCalls = 0;
   let agyErrorCalls = 0;
+  let agyVerifyFailedCalls = 0;
+  let agyUnpairedResultCalls = 0;
   let agyCorruptedArgCalls = 0;
   let agyCorruptedArgWastedSec = 0;
   let agyCorruptedArgWastedOutTokens = 0;
   let swarmWorkerSessions = 0;
   let swarmWorkerSessionsWithAgyFast = 0;
   let multiMcpTurns = 0;
+  let multiSameMcpTurns = 0;
+  let multiDiffMcpTurns = 0;
   let multiRunCommandTurns = 0;
   let mediaLoadedCount = 0;
   let multimodalHighCtxTurns = 0;
@@ -1130,6 +1411,21 @@ export function analyzeTranscriptSessions(
   let cacheHitCount = 0;
   let turnGapsTotal = 0;
   let turnGapsOver60s = 0;
+  const cacheMissAttribution: CacheMissAttribution = {
+    total: 0,
+    planModeSwitch: 0,
+    modelSwitch: 0,
+    errorRetry: 0,
+    activeSlowGap: 0,
+    idleOrWaitGap: 0,
+    asyncWakeupFast: 0,
+    fastReplicaOrPrefixMiss: 0,
+    compactionResets: 0,
+    contextDilutionTurns: 0,
+    sustainedCollapseRuns: 0,
+    sustainedCollapseTurns: 0,
+    maxConsecutiveMisses: 0,
+  };
 
   for (const steps of sessions) {
     if (steps.length === 0) continue;
@@ -1142,6 +1438,26 @@ export function analyzeTranscriptSessions(
     let prevTurnHadUserInputBetween = false;
     let prevTurnHadCalls = false;
 
+    let prevCacheCtxTok: number | null = null;
+    let prevCachePlannerMs: number | null = null;
+    let prevCacheModel: string | null = null;
+    let prevCacheHadCalls = false;
+    let prevCacheHadBlockingTool = false;
+    let prevCacheHadPlanSwitch = false;
+    let betweenCacheUserInput = false;
+    let betweenCacheSysMsg = false;
+    let betweenCachePlanNotice = false;
+    let betweenCacheError = false;
+    let missStreak = 0;
+
+    const flushMissStreak = (): void => {
+      if (missStreak >= 3) {
+        cacheMissAttribution.sustainedCollapseRuns += 1;
+        cacheMissAttribution.sustainedCollapseTurns += missStreak;
+      }
+      missStreak = 0;
+    };
+
     for (let i = 0; i < steps.length; i++) {
       const step = steps[i]!;
       if (Array.isArray(step.media) && step.media.length > 0) {
@@ -1151,15 +1467,24 @@ export function analyzeTranscriptSessions(
         prevSingleToolName = null;
         prevTurnHadUserInputBetween = true;
         prevTurnHadCalls = false;
+        betweenCacheUserInput = true;
         continue;
       }
       if (step.type === "SYSTEM_MESSAGE") {
+        betweenCacheSysMsg = true;
+        if (typeof step.content === "string" && PLAN_MODE_NOTICE_RE.test(step.content)) {
+          betweenCachePlanNotice = true;
+        }
         // An idle turn (calls=0) woken up later by an async background-task / subagent SYSTEM_MESSAGE
         // is an external wait, not active LLM latency or an active-turn gap.
         if (!prevTurnHadCalls) {
           prevSingleToolName = null;
           prevTurnHadUserInputBetween = true;
         }
+        continue;
+      }
+      if (step.type === "ERROR_MESSAGE") {
+        betweenCacheError = true;
         continue;
       }
       if (step.type !== "PLANNER_RESPONSE") continue;
@@ -1189,9 +1514,21 @@ export function analyzeTranscriptSessions(
 
       const inTok = Number(step.input_tokens ?? 0);
       const cacheTok = Number(step.cache_read_tokens ?? 0);
-      const ctxTok =
-        (Number.isFinite(inTok) ? inTok : 0) +
-        (Number.isFinite(cacheTok) ? cacheTok : 0);
+      const safeInTok = Number.isFinite(inTok) && inTok > 0 ? inTok : 0;
+      const safeCacheTok = Number.isFinite(cacheTok) && cacheTok > 0 ? cacheTok : 0;
+      const ctxTok = safeInTok + safeCacheTok;
+      const curModel =
+        typeof step.model === "string" && step.model.trim()
+          ? step.model.trim()
+          : null;
+      const calls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
+      const hasBlockingTool = calls.some(
+        (c) => typeof c.name === "string" && BLOCKING_TOOLS.has(c.name),
+      );
+      const hasPlanModeTool = calls.some(
+        (c) => typeof c.name === "string" && PLAN_MODE_TOOLS.has(c.name),
+      );
+
       if (ctxTok > 0) {
         contextSum += ctxTok;
         contextCount += 1;
@@ -1200,17 +1537,98 @@ export function analyzeTranscriptSessions(
           multimodalHighCtxTurns += 1;
         }
         if (ctxTok >= 10_000) {
-          cacheHitSum += cacheTok / ctxTok;
+          cacheHitSum += safeCacheTok / ctxTok;
           cacheHitCount += 1;
         }
+
+        if (prevCacheCtxTok !== null) {
+          const isCompacted =
+            prevCacheCtxTok >= 30_000 && ctxTok < prevCacheCtxTok * 0.78;
+          if (isCompacted) {
+            flushMissStreak();
+            cacheMissAttribution.compactionResets += 1;
+          } else if (prevCacheCtxTok >= 10_000 && ctxTok >= 10_000) {
+            const hitRate = safeCacheTok / ctxTok;
+            const retainedRatio = safeCacheTok / prevCacheCtxTok;
+            if (hitRate < 0.5 && retainedRatio < 0.75) {
+              cacheMissAttribution.total += 1;
+              missStreak += 1;
+              if (missStreak > cacheMissAttribution.maxConsecutiveMisses) {
+                cacheMissAttribution.maxConsecutiveMisses = missStreak;
+              }
+              const rawGapSec =
+                prevCachePlannerMs !== null && tPlanner !== null
+                  ? (tPlanner - prevCachePlannerMs) / 1000
+                  : null;
+              const validGapSec =
+                rawGapSec !== null && rawGapSec >= 0 ? rawGapSec : null;
+
+              if (prevCacheHadPlanSwitch || betweenCachePlanNotice) {
+                cacheMissAttribution.planModeSwitch += 1;
+              } else if (prevCacheModel && curModel && prevCacheModel !== curModel) {
+                cacheMissAttribution.modelSwitch += 1;
+              } else if (betweenCacheError) {
+                cacheMissAttribution.errorRetry += 1;
+              } else if (validGapSec !== null && validGapSec >= 60) {
+                if (
+                  betweenCacheUserInput ||
+                  !prevCacheHadCalls ||
+                  prevCacheHadBlockingTool
+                ) {
+                  cacheMissAttribution.idleOrWaitGap += 1;
+                } else {
+                  cacheMissAttribution.activeSlowGap += 1;
+                }
+              } else if (
+                !prevCacheHadCalls &&
+                (betweenCacheSysMsg || betweenCacheUserInput)
+              ) {
+                cacheMissAttribution.asyncWakeupFast += 1;
+              } else {
+                cacheMissAttribution.fastReplicaOrPrefixMiss += 1;
+              }
+            } else {
+              flushMissStreak();
+              if (hitRate < 0.5 && retainedRatio >= 0.75) {
+                cacheMissAttribution.contextDilutionTurns += 1;
+              }
+            }
+          } else {
+            flushMissStreak();
+          }
+        }
+
+        prevCacheCtxTok = ctxTok;
+        prevCachePlannerMs = tPlanner;
+        prevCacheModel = curModel;
+        prevCacheHadCalls = calls.length > 0;
+        prevCacheHadBlockingTool = hasBlockingTool;
+        prevCacheHadPlanSwitch = hasPlanModeTool;
+        betweenCacheUserInput = false;
+        betweenCacheSysMsg = false;
+        betweenCachePlanNotice = false;
+        betweenCacheError = step.status === "ERROR";
+      } else if (step.status === "ERROR") {
+        betweenCacheError = true;
+      } else {
+        flushMissStreak();
+        prevCacheCtxTok = null;
+        prevCachePlannerMs = null;
+        prevCacheModel = null;
+        prevCacheHadCalls = false;
+        prevCacheHadBlockingTool = false;
+        prevCacheHadPlanSwitch = false;
+        betweenCacheUserInput = false;
+        betweenCacheSysMsg = false;
+        betweenCachePlanNotice = false;
+        betweenCacheError = false;
       }
 
-      const calls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
-      const hasBlockingTool = calls.some(
-        (c) => typeof c.name === "string" && BLOCKING_TOOLS.has(c.name),
-      );
-
-      const agyCallIndices: number[] = [];
+      const agyCallsThisTurn: Array<{
+        callIdx: number;
+        call: TranscriptToolCall;
+        fastTool: string;
+      }> = [];
       let turnCorruptedAgyCalls = 0;
       if (calls.length > 0) {
         toolTurns += 1;
@@ -1228,6 +1646,7 @@ export function analyzeTranscriptSessions(
         }
 
         const editedFilesThisTurn = new Map<string, number>();
+        const agyToolsThisTurn = new Map<string, number>();
         let mcpCallsThisTurn = 0;
         let runCmdCallsThisTurn = 0;
         for (let callIdx = 0; callIdx < calls.length; callIdx++) {
@@ -1243,19 +1662,38 @@ export function analyzeTranscriptSessions(
               if (cnt > 1) redundantSameTurnEditFileCalls += 1;
             }
           } else if (name === "run_command") {
-            runCommandCalls += 1;
-            runCmdCallsThisTurn += 1;
             const cmd = getCommandString(callArgs);
-            if (isReadonlySearchShell(cmd)) {
-              readonlySearchRunCommandCalls += 1;
+            const cliFastTool = extractAgyFastCliToolName(cmd);
+            if (cliFastTool && agyFastToolCalls[cliFastTool] !== undefined) {
+              agyFastToolCalls[cliFastTool] = (agyFastToolCalls[cliFastTool] ?? 0) + 1;
+              agyCliCalls += 1;
+              sessionFastCalls += 1;
+              mcpCallsThisTurn += 1;
+              agyToolsThisTurn.set(
+                cliFastTool,
+                (agyToolsThisTurn.get(cliFastTool) ?? 0) + 1,
+              );
+              agyCallsThisTurn.push({ callIdx, call, fastTool: cliFastTool });
+            } else {
+              runCommandCalls += 1;
+              runCmdCallsThisTurn += 1;
+              if (isReadonlySearchShell(cmd)) {
+                readonlySearchRunCommandCalls += 1;
+              }
             }
           } else {
             const fastTool = extractAgyFastToolName(call);
             if (fastTool && agyFastToolCalls[fastTool] !== undefined) {
               agyFastToolCalls[fastTool] = (agyFastToolCalls[fastTool] ?? 0) + 1;
+              if (name === "call_mcp_tool") {
+                agyLazyCalls += 1;
+              } else {
+                agyEagerCalls += 1;
+              }
               sessionFastCalls += 1;
               mcpCallsThisTurn += 1;
-              agyCallIndices.push(callIdx);
+              agyToolsThisTurn.set(fastTool, (agyToolsThisTurn.get(fastTool) ?? 0) + 1);
+              agyCallsThisTurn.push({ callIdx, call, fastTool });
               if (hasCorruptedAgyFastArgs(call, fastTool)) {
                 agyCorruptedArgCalls += 1;
                 turnCorruptedAgyCalls += 1;
@@ -1263,7 +1701,21 @@ export function analyzeTranscriptSessions(
             }
           }
         }
-        if (mcpCallsThisTurn >= 2) multiMcpTurns += 1;
+        if (mcpCallsThisTurn >= 2) {
+          multiMcpTurns += 1;
+          let hasSameToolDuplicate = false;
+          for (const cnt of agyToolsThisTurn.values()) {
+            if (cnt >= 2) {
+              hasSameToolDuplicate = true;
+              break;
+            }
+          }
+          if (hasSameToolDuplicate) {
+            multiSameMcpTurns += 1;
+          } else {
+            multiDiffMcpTurns += 1;
+          }
+        }
         if (runCmdCallsThisTurn >= 2) multiRunCommandTurns += 1;
       } else {
         prevSingleToolName = null;
@@ -1290,37 +1742,116 @@ export function analyzeTranscriptSessions(
         }
       }
 
-      for (const callIdx of agyCallIndices) {
-        const resStep = genericSteps[callIdx];
-        if (!resStep) continue;
-        const resText = typeof resStep.content === "string" ? resStep.content : "";
-        const isSpill =
-          resText.includes("The output was large and was saved to:") ||
-          (/output was truncated/i.test(resText) && resText.includes("output.txt"));
-        if (isSpill) {
-          mcpSpillCalls += 1;
-        } else if (
-          resText.includes("[truncated:") ||
-          resText.includes("[truncated at ") ||
-          resText.includes("[truncated; showing ")
-        ) {
-          agyTruncatedCalls += 1;
+      if (agyCallsThisTurn.length > 0) {
+        const callIds = new Set<string>();
+        for (const c of calls) {
+          const cid = getToolCallId(c);
+          if (cid !== null) callIds.add(cid);
         }
-        if (
-          resStep.status === "ERROR" ||
-          resText.includes("Encountered error in step execution") ||
-          resText.includes("Partial edit applied") ||
-          resText.includes("Atomic edit aborted")
-        ) {
-          agyErrorCalls += 1;
+        const genericById = new Map<string, TranscriptStep>();
+        const genericByIndex = new Map<number, TranscriptStep>();
+        let anyGenericHasExplicitCallId = false;
+        let anyGenericMatchesCallId = false;
+        for (const gs of genericSteps) {
+          if (
+            (typeof gs.tool_call_id === "string" && gs.tool_call_id.trim().length > 0) ||
+            (typeof gs.call_id === "string" && gs.call_id.trim().length > 0)
+          ) {
+            anyGenericHasExplicitCallId = true;
+          }
+          const gid = getToolCallId(gs);
+          if (gid !== null) {
+            if (!genericById.has(gid)) genericById.set(gid, gs);
+            if (callIds.has(gid)) anyGenericMatchesCallId = true;
+          }
+          if (typeof gs.step_index === "number" && Number.isInteger(gs.step_index)) {
+            if (!genericByIndex.has(gs.step_index)) {
+              genericByIndex.set(gs.step_index, gs);
+            }
+          }
+        }
+        const anyGenericHasToolCallId =
+          anyGenericHasExplicitCallId || anyGenericMatchesCallId;
+
+        for (const { callIdx, call, fastTool } of agyCallsThisTurn) {
+          const resStep = pairToolCallResult(
+            step,
+            call,
+            callIdx,
+            calls.length,
+            genericSteps,
+            genericById,
+            genericByIndex,
+            anyGenericHasToolCallId,
+          );
+          if (!resStep) {
+            agyUnpairedResultCalls += 1;
+            continue;
+          }
+          const resText = typeof resStep.content === "string" ? resStep.content : "";
+          const rawBody = stripHostMetadataPrefix(resText);
+          let cliExitCode: number | null = null;
+          let body = rawBody;
+          if ((call.name ?? "") === "run_command") {
+            const exitMatch =
+              /^Command exited with code (\d+)\.\s*(?:\r?\n)+(?:Command output:\r?\n)?/.exec(
+                rawBody,
+              );
+            if (exitMatch) {
+              cliExitCode = Number.parseInt(exitMatch[1]!, 10);
+              body = rawBody.slice(exitMatch[0].length);
+            }
+          }
+          const isSpill = isHostSpillBody(body);
+          if (isSpill) {
+            mcpSpillCalls += 1;
+          } else {
+            if (AGY_BUDGET_TRUNCATED_RE.test(body)) {
+              agyTruncatedCalls += 1;
+            }
+            if (AGY_MAX_RESULTS_CAPPED_RE.test(body)) {
+              agyMaxResultsCappedCalls += 1;
+            }
+          }
+          const isVerifyFailure =
+            fastTool === "apply_edits" && !isSpill && AGY_VERIFY_FAILED_RE.test(body);
+          const isNormalFailedCheckRun =
+            fastTool === "run_checks" &&
+            cliExitCode !== null &&
+            cliExitCode !== 0 &&
+            /^Checks:\s+\d+\/\d+\s+passed,/.test(body);
+          const isCliError =
+            cliExitCode !== null &&
+            cliExitCode !== 0 &&
+            !isVerifyFailure &&
+            !isNormalFailedCheckRun;
+          const isError =
+            resStep.status === "ERROR" ||
+            resStep.status === "INVALID" ||
+            isCliError ||
+            AGY_ERROR_HEAD_RE.test(body) ||
+            ((call.name ?? "") === "run_command" &&
+              !isVerifyFailure &&
+              !isNormalFailedCheckRun &&
+              /^Error:/.test(body));
+          if (isError) {
+            agyErrorCalls += 1;
+          } else if (isVerifyFailure) {
+            agyVerifyFailedCalls += 1;
+          }
         }
       }
 
       let turnActiveSec = 0;
       if (tPlanner !== null && !hasBlockingTool) {
         if (genericTimes.length > 0) {
-          const firstGeneric = genericTimes[0]!;
-          const lastGeneric = genericTimes[genericTimes.length - 1]!;
+          let firstGeneric = genericTimes[0]!;
+          let lastGeneric = genericTimes[0]!;
+          for (let k = 1; k < genericTimes.length; k++) {
+            const gt = genericTimes[k]!;
+            if (gt < firstGeneric) firstGeneric = gt;
+            if (gt > lastGeneric) lastGeneric = gt;
+          }
           const llmSec = Math.max(0, (firstGeneric - tPlanner) / 1000);
           const spreadSec = Math.max(0, (lastGeneric - firstGeneric) / 1000);
           const execSec =
@@ -1361,6 +1892,8 @@ export function analyzeTranscriptSessions(
       }
     }
 
+    flushMissStreak();
+
     if (hasPlanner) {
       validSessions += 1;
       mediaLoadedCount += sessionMediaCount;
@@ -1393,15 +1926,23 @@ export function analyzeTranscriptSessions(
     runCommandCalls,
     readonlySearchRunCommandCalls,
     agyFastToolCalls,
+    agyEagerCalls,
+    agyLazyCalls,
+    agyCliCalls,
     mcpSpillCalls,
     agyTruncatedCalls,
+    agyMaxResultsCappedCalls,
     agyErrorCalls,
+    agyVerifyFailedCalls,
+    agyUnpairedResultCalls,
     agyCorruptedArgCalls,
     agyCorruptedArgWastedSec: round2(agyCorruptedArgWastedSec),
     agyCorruptedArgWastedOutTokens,
     swarmWorkerSessions,
     swarmWorkerSessionsWithAgyFast,
     multiMcpTurns,
+    multiSameMcpTurns,
+    multiDiffMcpTurns,
     multiRunCommandTurns,
     mediaLoadedCount,
     multimodalHighCtxTurns,
@@ -1409,6 +1950,7 @@ export function analyzeTranscriptSessions(
     over150kContextRatio: contextCount > 0 ? over150kCount / contextCount : 0,
     avgCacheHitRate: cacheHitCount > 0 ? cacheHitSum / cacheHitCount : 0,
     over60sGapRatio: turnGapsTotal > 0 ? turnGapsOver60s / turnGapsTotal : 0,
+    cacheMissAttribution,
   };
 }
 
@@ -1587,7 +2129,31 @@ export async function collectTranscriptFiles(
   return found.sort();
 }
 
-async function sortFilesByRecentMtime(files: string[]): Promise<string[]> {
+const DEFAULT_TRANSCRIPT_READ_CONCURRENCY = 8;
+const MAX_TRANSCRIPT_READ_CONCURRENCY = 32;
+
+function formatReadErrorReason(err: unknown): string {
+  if (err && typeof err === "object") {
+    const code = "code" in err && typeof err.code === "string" ? err.code : "";
+    const msg = err instanceof Error ? err.message : String(err);
+    if (code && !msg.includes(code)) return `${code}: ${msg}`;
+    return msg;
+  }
+  return String(err);
+}
+
+function normalizeReadConcurrency(concurrency?: number): number {
+  if (concurrency === undefined) return DEFAULT_TRANSCRIPT_READ_CONCURRENCY;
+  if (!Number.isSafeInteger(concurrency) || concurrency < 1) {
+    throw new RangeError("concurrency must be a positive integer");
+  }
+  return Math.min(concurrency, MAX_TRANSCRIPT_READ_CONCURRENCY);
+}
+
+async function sortFilesByRecentMtime(
+  files: string[],
+  onSkipped?: (skipped: SkippedTranscriptFile) => void,
+): Promise<string[]> {
   const withMtime: Array<{ file: string; mtimeMs: number }> = [];
   const batchSize = 64;
   for (let i = 0; i < files.length; i += batchSize) {
@@ -1596,14 +2162,21 @@ async function sortFilesByRecentMtime(files: string[]): Promise<string[]> {
       slice.map(async (file) => {
         try {
           const stat = await fs.stat(file);
-          return { file, mtimeMs: stat.mtimeMs };
-        } catch {
-          return null;
+          return { ok: true as const, file, mtimeMs: stat.mtimeMs };
+        } catch (err) {
+          return {
+            ok: false as const,
+            skipped: { path: file, reason: formatReadErrorReason(err) },
+          };
         }
       }),
     );
     for (const item of results) {
-      if (item !== null) withMtime.push(item);
+      if (item.ok) {
+        withMtime.push({ file: item.file, mtimeMs: item.mtimeMs });
+      } else {
+        onSkipped?.(item.skipped);
+      }
     }
   }
   withMtime.sort(
@@ -1614,11 +2187,118 @@ async function sortFilesByRecentMtime(files: string[]): Promise<string[]> {
   return withMtime.map((x) => x.file);
 }
 
+type LoadedTranscriptOutcome =
+  | { kind: "session"; steps: TranscriptStep[]; rawSteps: TranscriptStep[] }
+  | { kind: "empty" }
+  | { kind: "skipped"; skipped: SkippedTranscriptFile };
+
+async function loadSingleTranscriptFile(
+  file: string,
+  sinceMs?: number,
+  untilMs?: number,
+): Promise<LoadedTranscriptOutcome> {
+  try {
+    const { steps: rawSteps, malformedLines } =
+      await parseTranscriptJsonlFileDetailed(file);
+    if (rawSteps.length === 0 && malformedLines > 0) {
+      return {
+        kind: "skipped",
+        skipped: {
+          path: file,
+          reason: `corrupted JSONL (0 valid steps, ${malformedLines} malformed line${malformedLines === 1 ? "" : "s"})`,
+        },
+      };
+    }
+    const steps = filterStepsByTime(rawSteps, sinceMs, untilMs);
+    if (!steps.some((s) => s.type === "PLANNER_RESPONSE")) {
+      return { kind: "empty" };
+    }
+    return { kind: "session", steps, rawSteps };
+  } catch (err) {
+    return {
+      kind: "skipped",
+      skipped: {
+        path: file,
+        reason: formatReadErrorReason(err),
+      },
+    };
+  }
+}
+
+export async function loadSessionsFromFiles(
+  orderedFiles: string[],
+  options: AnalyzeOptions = {},
+): Promise<TranscriptStep[][]> {
+  const { recent, sinceMs, untilMs, skippedFiles, onSkippedFile } = options;
+  const concurrency = normalizeReadConcurrency(options.concurrency);
+  const sessions: TranscriptStep[][] = [];
+
+  const recordOutcome = (outcome: LoadedTranscriptOutcome): void => {
+    if (outcome.kind === "skipped") {
+      skippedFiles?.push(outcome.skipped);
+      onSkippedFile?.(outcome.skipped);
+      return;
+    }
+    if (outcome.kind === "session") {
+      if (outcome.steps !== outcome.rawSteps) {
+        fullSessionStepsMap.set(outcome.steps, outcome.rawSteps);
+      }
+      sessions.push(outcome.steps);
+    }
+  };
+
+  if (recent !== undefined) {
+    let cursor = 0;
+    while (cursor < orderedFiles.length && sessions.length < recent) {
+      const remaining = recent - sessions.length;
+      const batchLen = Math.min(
+        concurrency,
+        remaining,
+        orderedFiles.length - cursor,
+      );
+      const batch = orderedFiles.slice(cursor, cursor + batchLen);
+      cursor += batchLen;
+      const outcomes = await Promise.all(
+        batch.map((file) => loadSingleTranscriptFile(file, sinceMs, untilMs)),
+      );
+      for (const outcome of outcomes) {
+        recordOutcome(outcome);
+        if (sessions.length >= recent) break;
+      }
+    }
+    return sessions;
+  }
+
+  if (orderedFiles.length === 0) return sessions;
+
+  const outcomes = new Array<LoadedTranscriptOutcome>(orderedFiles.length);
+  let nextIdx = 0;
+  const workerCount = Math.min(concurrency, orderedFiles.length);
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (true) {
+        const idx = nextIdx++;
+        if (idx >= orderedFiles.length) break;
+        outcomes[idx] = await loadSingleTranscriptFile(
+          orderedFiles[idx]!,
+          sinceMs,
+          untilMs,
+        );
+      }
+    }),
+  );
+
+  for (const outcome of outcomes) {
+    if (outcome) recordOutcome(outcome);
+  }
+  return sessions;
+}
+
 async function loadFilteredSessions(
   inputs: string[],
   options: AnalyzeOptions = {},
 ): Promise<TranscriptStep[][]> {
-  const { recent, sinceMs, untilMs } = options;
+  const { recent, sinceMs, untilMs, skippedFiles, onSkippedFile } = options;
   if (recent !== undefined && (!Number.isSafeInteger(recent) || recent < 1)) {
     throw new RangeError("recent must be a positive integer");
   }
@@ -1631,28 +2311,19 @@ async function loadFilteredSessions(
   if (sinceMs !== undefined && untilMs !== undefined && sinceMs > untilMs) {
     throw new RangeError("sinceMs must be less than or equal to untilMs");
   }
+  normalizeReadConcurrency(options.concurrency);
 
   const files = await collectTranscriptFiles(inputs);
+  const recordSkipped = (skipped: SkippedTranscriptFile): void => {
+    skippedFiles?.push(skipped);
+    onSkippedFile?.(skipped);
+  };
   const orderedFiles =
-    recent !== undefined ? await sortFilesByRecentMtime(files) : files;
+    recent !== undefined
+      ? await sortFilesByRecentMtime(files, recordSkipped)
+      : files;
 
-  const sessions: TranscriptStep[][] = [];
-  for (const file of orderedFiles) {
-    try {
-      const content = await fs.readFile(file, "utf8");
-      const rawSteps = parseTranscriptJsonl(content);
-      const steps = filterStepsByTime(rawSteps, sinceMs, untilMs);
-      if (!steps.some((s) => s.type === "PLANNER_RESPONSE")) continue;
-      if (steps !== rawSteps) {
-        fullSessionStepsMap.set(steps, rawSteps);
-      }
-      sessions.push(steps);
-      if (recent !== undefined && sessions.length >= recent) break;
-    } catch {
-      // Skip unreadable file
-    }
-  }
-  return sessions;
+  return loadSessionsFromFiles(orderedFiles, options);
 }
 
 export async function analyzePaths(
@@ -1717,8 +2388,12 @@ export function formatMetricsMarkdown(m: BenchmarkMetrics): string {
     `| Turns >= 150k context | ${pct(m.over150kContextRatio)} |`,
     `| Average Prompt Cache hit rate | ${pct(m.avgCacheHitRate)} |`,
     `| Turn gaps > 60s | ${pct(m.over60sGapRatio)} |`,
-    `| agy-fast tool calls | ${fastTotal} (search:${m.agyFastToolCalls.batch_search}, edit:${m.agyFastToolCalls.apply_edits}, slice:${m.agyFastToolCalls.read_slices}, outline:${m.agyFastToolCalls.quick_outline ?? 0}, check:${m.agyFastToolCalls.run_checks}) |`,
-    `| agy-fast health (spills / truncs / errs) | ${m.mcpSpillCalls} / ${m.agyTruncatedCalls} / ${m.agyErrorCalls} |`,
+    ...formatCacheMissRows(m.cacheMissAttribution),
+    `| agy-fast tool calls | ${fastTotal} (search:${m.agyFastToolCalls.batch_search}, edit:${m.agyFastToolCalls.apply_edits}, slice:${m.agyFastToolCalls.read_slices}, outline:${m.agyFastToolCalls.quick_outline ?? 0}, check:${m.agyFastToolCalls.run_checks}; eager:${m.agyEagerCalls}, lazy:${m.agyLazyCalls}${m.agyCliCalls > 0 ? `, cli:${m.agyCliCalls}` : ""}) |`,
+    `| agy-fast health (spills / budget-truncs / max-results / errs / verify-fails) | ${m.mcpSpillCalls} / ${m.agyTruncatedCalls} / ${m.agyMaxResultsCappedCalls} / ${m.agyErrorCalls} / ${m.agyVerifyFailedCalls} |`,
+    ...(m.agyUnpairedResultCalls > 0
+      ? [`| agy-fast unpaired results | ${m.agyUnpairedResultCalls} |`]
+      : []),
     ...(m.agyCorruptedArgCalls > 0
       ? [
           `| agy-fast corrupted-arg calls | ${m.agyCorruptedArgCalls} (wasted ${m.agyCorruptedArgWastedSec.toFixed(1)}s, ${m.agyCorruptedArgWastedOutTokens.toLocaleString("en-US")} out tok) |`,
@@ -1729,9 +2404,29 @@ export function formatMetricsMarkdown(m: BenchmarkMetrics): string {
           `| Swarm worker coverage | ${m.swarmWorkerSessionsWithAgyFast}/${m.swarmWorkerSessions} using agy-fast |`,
         ]
       : []),
-    `| Parallel batching leaks (multi-MCP / multi-run_command turns) | ${m.multiMcpTurns} / ${m.multiRunCommandTurns} |`,
+    `| Parallel batching leaks (same-MCP (diff-MCP) / multi-run_command) | ${m.multiSameMcpTurns} (${m.multiDiffMcpTurns}) / ${m.multiRunCommandTurns} |`,
     `| Multimodal >=180k turns (media loaded) | ${m.multimodalHighCtxTurns} (${m.mediaLoadedCount} media) |`,
   ].join("\n");
+}
+
+function formatCacheMissRows(a: CacheMissAttribution): string[] {
+  const rows: string[] = [];
+  if (a.total > 0 || a.compactionResets > 0 || a.contextDilutionTurns > 0) {
+    const extras: string[] = [];
+    if (a.modelSwitch > 0) extras.push(`model:${a.modelSwitch}`);
+    if (a.compactionResets > 0) extras.push(`compact:${a.compactionResets}`);
+    if (a.contextDilutionTurns > 0) extras.push(`dilute:${a.contextDilutionTurns}`);
+    const extraSuffix = extras.length > 0 ? `; ${extras.join(", ")}` : "";
+    rows.push(
+      `| Prompt Cache misses (active>=60s / idle>=60s / plan / err / async<60s / fast-other) | ${a.total} (${a.activeSlowGap} / ${a.idleOrWaitGap} / ${a.planModeSwitch} / ${a.errorRetry} / ${a.asyncWakeupFast} / ${a.fastReplicaOrPrefixMiss}${extraSuffix}) |`,
+    );
+  }
+  if (a.sustainedCollapseRuns > 0) {
+    rows.push(
+      `| Sustained cache collapse (>=3 consecutive misses) | ${a.sustainedCollapseRuns} runs (${a.sustainedCollapseTurns} turns, max streak: ${a.maxConsecutiveMisses}) |`,
+    );
+  }
+  return rows;
 }
 
 function formatDelta(before: number, after: number): string {
@@ -1759,8 +2454,26 @@ export function formatCompareMarkdown(
     `| Average context (tokens) | ${before.avgContextTokens} | ${after.avgContextTokens} | ${formatDelta(before.avgContextTokens, after.avgContextTokens)} |`,
     `| Prompt Cache hit rate | ${pct(before.avgCacheHitRate)} | ${pct(after.avgCacheHitRate)} | ${formatDelta(before.avgCacheHitRate, after.avgCacheHitRate)} |`,
     `| Turn gaps > 60s | ${pct(before.over60sGapRatio)} | ${pct(after.over60sGapRatio)} | ${formatDelta(before.over60sGapRatio, after.over60sGapRatio)} |`,
+    ...(before.cacheMissAttribution.total > 0 || after.cacheMissAttribution.total > 0
+      ? [
+          `| Prompt Cache misses (non-compact) | ${before.cacheMissAttribution.total} | ${after.cacheMissAttribution.total} | ${formatDelta(before.cacheMissAttribution.total, after.cacheMissAttribution.total)} |`,
+        ]
+      : []),
+    ...(before.cacheMissAttribution.sustainedCollapseRuns > 0 ||
+    after.cacheMissAttribution.sustainedCollapseRuns > 0
+      ? [
+          `| Sustained cache collapse (>=3 misses) | ${before.cacheMissAttribution.sustainedCollapseRuns} runs (${before.cacheMissAttribution.sustainedCollapseTurns}t) | ${after.cacheMissAttribution.sustainedCollapseRuns} runs (${after.cacheMissAttribution.sustainedCollapseTurns}t) | - |`,
+        ]
+      : []),
     `| agy-fast MCP spills (output.txt) | ${before.mcpSpillCalls} | ${after.mcpSpillCalls} | ${formatDelta(before.mcpSpillCalls, after.mcpSpillCalls)} |`,
-    `| agy-fast internal truncations | ${before.agyTruncatedCalls} | ${after.agyTruncatedCalls} | ${formatDelta(before.agyTruncatedCalls, after.agyTruncatedCalls)} |`,
+    `| agy-fast budget truncations | ${before.agyTruncatedCalls} | ${after.agyTruncatedCalls} | ${formatDelta(before.agyTruncatedCalls, after.agyTruncatedCalls)} |`,
+    `| agy-fast maxResults caps | ${before.agyMaxResultsCappedCalls} | ${after.agyMaxResultsCappedCalls} | ${formatDelta(before.agyMaxResultsCappedCalls, after.agyMaxResultsCappedCalls)} |`,
+    `| agy-fast tool errors | ${before.agyErrorCalls} | ${after.agyErrorCalls} | ${formatDelta(before.agyErrorCalls, after.agyErrorCalls)} |`,
+    `| agy-fast verify failures | ${before.agyVerifyFailedCalls} | ${after.agyVerifyFailedCalls} | ${formatDelta(before.agyVerifyFailedCalls, after.agyVerifyFailedCalls)} |`,
+    before.agyCliCalls > 0 || after.agyCliCalls > 0
+      ? `| agy-fast dispatch (eager / lazy / cli) | ${before.agyEagerCalls} / ${before.agyLazyCalls} / ${before.agyCliCalls} | ${after.agyEagerCalls} / ${after.agyLazyCalls} / ${after.agyCliCalls} | - |`
+      : `| agy-fast dispatch (eager / lazy) | ${before.agyEagerCalls} / ${before.agyLazyCalls} | ${after.agyEagerCalls} / ${after.agyLazyCalls} | - |`,
+    `| Parallel leaks (same-MCP (diff-MCP) / multi-run_command) | ${before.multiSameMcpTurns} (${before.multiDiffMcpTurns}) / ${before.multiRunCommandTurns} | ${after.multiSameMcpTurns} (${after.multiDiffMcpTurns}) / ${after.multiRunCommandTurns} | - |`,
     `| Multimodal >=180k turns | ${before.multimodalHighCtxTurns} | ${after.multimodalHighCtxTurns} | ${formatDelta(before.multimodalHighCtxTurns, after.multimodalHighCtxTurns)} |`,
   ].join("\n");
 }
@@ -1792,8 +2505,23 @@ export function formatUsageSplitMarkdown(split: UsageSplitMetrics): string {
     `| Average context (tokens) | ${overall.avgContextTokens.toLocaleString("en-US")} | ${wo.avgContextTokens.toLocaleString("en-US")} | ${wf.avgContextTokens.toLocaleString("en-US")} | ${formatDelta(wo.avgContextTokens, wf.avgContextTokens)} |`,
     `| Prompt Cache hit rate | ${pct(overall.avgCacheHitRate)} | ${pct(wo.avgCacheHitRate)} | ${pct(wf.avgCacheHitRate)} | ${formatDelta(wo.avgCacheHitRate, wf.avgCacheHitRate)} |`,
     `| Turn gaps > 60s | ${pct(overall.over60sGapRatio)} | ${pct(wo.over60sGapRatio)} | ${pct(wf.over60sGapRatio)} | ${formatDelta(wo.over60sGapRatio, wf.over60sGapRatio)} |`,
-    `| agy-fast tool calls | ${fastSum(overall)} | 0 | ${fastSum(wf)} (search:${wf.agyFastToolCalls.batch_search}, edit:${wf.agyFastToolCalls.apply_edits}, slice:${wf.agyFastToolCalls.read_slices}, outline:${wf.agyFastToolCalls.quick_outline ?? 0}, check:${wf.agyFastToolCalls.run_checks}) | - |`,
-    `| agy-fast health (spills / truncs / errs) | ${overall.mcpSpillCalls} / ${overall.agyTruncatedCalls} / ${overall.agyErrorCalls} | 0 / 0 / 0 | ${wf.mcpSpillCalls} / ${wf.agyTruncatedCalls} / ${wf.agyErrorCalls} | - |`,
+    ...(overall.cacheMissAttribution.total > 0
+      ? [
+          `| Prompt Cache misses (non-compact) | ${overall.cacheMissAttribution.total} | ${wo.cacheMissAttribution.total} | ${wf.cacheMissAttribution.total} | ${formatDelta(wo.cacheMissAttribution.total, wf.cacheMissAttribution.total)} |`,
+        ]
+      : []),
+    ...(overall.cacheMissAttribution.sustainedCollapseRuns > 0
+      ? [
+          `| Sustained cache collapse (>=3 misses) | ${overall.cacheMissAttribution.sustainedCollapseRuns} runs (${overall.cacheMissAttribution.sustainedCollapseTurns}t) | ${wo.cacheMissAttribution.sustainedCollapseRuns} runs (${wo.cacheMissAttribution.sustainedCollapseTurns}t) | ${wf.cacheMissAttribution.sustainedCollapseRuns} runs (${wf.cacheMissAttribution.sustainedCollapseTurns}t) | - |`,
+        ]
+      : []),
+    `| agy-fast tool calls | ${fastSum(overall)} (eager:${overall.agyEagerCalls}, lazy:${overall.agyLazyCalls}${overall.agyCliCalls > 0 ? `, cli:${overall.agyCliCalls}` : ""}) | 0 | ${fastSum(wf)} (search:${wf.agyFastToolCalls.batch_search}, edit:${wf.agyFastToolCalls.apply_edits}, slice:${wf.agyFastToolCalls.read_slices}, outline:${wf.agyFastToolCalls.quick_outline ?? 0}, check:${wf.agyFastToolCalls.run_checks}; eager:${wf.agyEagerCalls}, lazy:${wf.agyLazyCalls}${wf.agyCliCalls > 0 ? `, cli:${wf.agyCliCalls}` : ""}) | - |`,
+    `| agy-fast health (spills / budget-truncs / max-results / errs / verify-fails) | ${overall.mcpSpillCalls} / ${overall.agyTruncatedCalls} / ${overall.agyMaxResultsCappedCalls} / ${overall.agyErrorCalls} / ${overall.agyVerifyFailedCalls} | 0 / 0 / 0 / 0 / 0 | ${wf.mcpSpillCalls} / ${wf.agyTruncatedCalls} / ${wf.agyMaxResultsCappedCalls} / ${wf.agyErrorCalls} / ${wf.agyVerifyFailedCalls} | - |`,
+    ...(overall.agyUnpairedResultCalls > 0
+      ? [
+          `| agy-fast unpaired results | ${overall.agyUnpairedResultCalls} | 0 | ${wf.agyUnpairedResultCalls} | - |`,
+        ]
+      : []),
     ...(overall.agyCorruptedArgCalls > 0
       ? [
           `| agy-fast corrupted-arg calls | ${overall.agyCorruptedArgCalls} (${overall.agyCorruptedArgWastedSec.toFixed(1)}s) | 0 | ${wf.agyCorruptedArgCalls} (${wf.agyCorruptedArgWastedSec.toFixed(1)}s) | - |`,
@@ -1804,7 +2532,7 @@ export function formatUsageSplitMarkdown(split: UsageSplitMetrics): string {
           `| Swarm worker sessions | ${overall.swarmWorkerSessions} | ${wo.swarmWorkerSessions} | ${wf.swarmWorkerSessions} | - |`,
         ]
       : []),
-    `| Parallel leaks (multi-MCP / multi-run_command) | ${overall.multiMcpTurns} / ${overall.multiRunCommandTurns} | ${wo.multiMcpTurns} / ${wo.multiRunCommandTurns} | ${wf.multiMcpTurns} / ${wf.multiRunCommandTurns} | - |`,
+    `| Parallel leaks (same-MCP (diff-MCP) / multi-run_command) | ${overall.multiSameMcpTurns} (${overall.multiDiffMcpTurns}) / ${overall.multiRunCommandTurns} | ${wo.multiSameMcpTurns} (${wo.multiDiffMcpTurns}) / ${wo.multiRunCommandTurns} | ${wf.multiSameMcpTurns} (${wf.multiDiffMcpTurns}) / ${wf.multiRunCommandTurns} | - |`,
     `| Multimodal >=180k turns (media) | ${overall.multimodalHighCtxTurns} (${overall.mediaLoadedCount}) | ${wo.multimodalHighCtxTurns} (${wo.mediaLoadedCount}) | ${wf.multimodalHighCtxTurns} (${wf.mediaLoadedCount}) | - |`,
   ].join("\n");
 }

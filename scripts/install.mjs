@@ -3,7 +3,8 @@ import { spawn, spawnSync } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { createInterface } from "node:readline/promises";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..");
@@ -14,6 +15,12 @@ const EXPECTED_MCP_TOOLS = [
   "read_slices",
   "quick_outline",
   "run_checks",
+];
+const SUPPORTED_MCP_CONFIG_HOSTS = [
+  "mcp-only",
+  "json",
+  "generic",
+  "antigravity",
 ];
 const MAX_LOCAL_RULE_BYTES = 256 * 1024;
 
@@ -40,15 +47,33 @@ const OPTIONAL_DOC_FILES = [
   "assets/architecture-zh-dark.svg",
   "README.md",
   "README.zh-CN.md",
+  "README.zh-TW.md",
   "CHANGELOG.md",
   "docs/ANALYSIS_REPORT.md",
   "docs/ANALYSIS_REPORT.zh-CN.md",
 ];
 
 function getHomeDir() {
-  return process.platform === "win32"
-    ? process.env.USERPROFILE || process.env.HOME || os.homedir()
-    : process.env.HOME || process.env.USERPROFILE || os.homedir();
+  if (process.platform === "win32") {
+    const driveHome =
+      process.env.HOMEDRIVE && process.env.HOMEPATH
+        ? `${process.env.HOMEDRIVE}${process.env.HOMEPATH}`
+        : "";
+    return process.env.USERPROFILE || driveHome || process.env.HOME || os.homedir();
+  }
+  return process.env.HOME || process.env.USERPROFILE || os.homedir();
+}
+
+function compareSemverSimple(a, b) {
+  const pa = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(String(a || "").trim());
+  const pb = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(String(b || "").trim());
+  if (!pa || !pb) return null;
+  for (let i = 1; i <= 3; i++) {
+    const na = Number.parseInt(pa[i], 10);
+    const nb = Number.parseInt(pb[i], 10);
+    if (na !== nb) return na > nb ? 1 : -1;
+  }
+  return 0;
 }
 
 function getGlobalPluginDir() {
@@ -105,6 +130,8 @@ function parseArgs(argv) {
   let quiet = false;
   let showHelp = false;
   let checkOnly = false;
+  let promptUpdate = false;
+  let skipVersion = "";
   let force = false;
   let autoUpdate = "";
   let intervalHours = null;
@@ -112,6 +139,10 @@ function parseArgs(argv) {
   let repoUrl = "";
   let editsFormat = "";
   let toolLoading = "";
+  let mcpHost = "";
+  let mcpToolsRaw = null;
+  let schemaCompat = "";
+  let printRules = false;
 
   const positional = [];
   for (let i = 0; i < args.length; i++) {
@@ -128,6 +159,16 @@ function parseArgs(argv) {
       quiet = true;
     } else if (a === "--check") {
       checkOnly = true;
+    } else if (a === "--prompt" || a === "--interactive" || a === "-i") {
+      promptUpdate = true;
+    } else if (a === "--skip-version") {
+      const next = args[i + 1];
+      if (!next || next.startsWith("-")) {
+        throw new Error(
+          "Missing version after --skip-version (expected e.g. 0.3.0 or 'none' to clear)",
+        );
+      }
+      skipVersion = args[++i].trim();
     } else if (a === "--force") {
       force = true;
     } else if (a === "--auto-update") {
@@ -172,6 +213,49 @@ function parseArgs(argv) {
         );
       }
       toolLoading = args[++i].toLowerCase();
+    } else if (a === "--host" || a.startsWith("--host=")) {
+      const next = a.startsWith("--host=") ? a.slice("--host=".length) : args[i + 1];
+      if (!next || (!a.startsWith("--host=") && next.startsWith("-"))) {
+        throw new Error(
+          `Missing value after --host (expected: ${SUPPORTED_MCP_CONFIG_HOSTS.join(" | ")})`,
+        );
+      }
+      if (!a.startsWith("--host=")) i++;
+      const normalizedHost = next.trim().toLowerCase();
+      if (!SUPPORTED_MCP_CONFIG_HOSTS.includes(normalizedHost)) {
+        throw new Error(
+          `Invalid value after --host '${next}' (expected: ${SUPPORTED_MCP_CONFIG_HOSTS.join(" | ")})`,
+        );
+      }
+      mcpHost = normalizedHost;
+    } else if (a === "--tools" || a.startsWith("--tools=")) {
+      const next = a.startsWith("--tools=") ? a.slice("--tools=".length) : args[i + 1];
+      if (next === undefined || (!a.startsWith("--tools=") && next.startsWith("-"))) {
+        throw new Error(
+          `Missing value after --tools (valid tools: ${EXPECTED_MCP_TOOLS.join(", ")})`,
+        );
+      }
+      if (!a.startsWith("--tools=")) i++;
+      mcpToolsRaw = next;
+    } else if (a === "--schema-compat" || a.startsWith("--schema-compat=")) {
+      const next = a.startsWith("--schema-compat=")
+        ? a.slice("--schema-compat=".length)
+        : args[i + 1];
+      if (!next || (!a.startsWith("--schema-compat=") && next.startsWith("-"))) {
+        throw new Error(
+          "Missing value after --schema-compat (expected: standard | minimal)",
+        );
+      }
+      if (!a.startsWith("--schema-compat=")) i++;
+      const normalizedCompat = next.trim().toLowerCase();
+      if (!["standard", "minimal"].includes(normalizedCompat)) {
+        throw new Error(
+          `Invalid value after --schema-compat '${next}' (expected: standard | minimal)`,
+        );
+      }
+      schemaCompat = normalizedCompat;
+    } else if (a === "--rules") {
+      printRules = true;
     } else if (a === "--target") {
       const next = args[i + 1];
       if (!next || next.startsWith("-")) {
@@ -219,6 +303,8 @@ function parseArgs(argv) {
     quiet,
     showHelp,
     checkOnly,
+    promptUpdate,
+    skipVersion,
     force,
     autoUpdate,
     intervalHours,
@@ -226,6 +312,10 @@ function parseArgs(argv) {
     repoUrl,
     editsFormat,
     toolLoading,
+    mcpHost,
+    mcpToolsRaw,
+    schemaCompat,
+    printRules,
   };
 }
 
@@ -239,9 +329,11 @@ Commands:
   install      Install agy-fast plugin (default)
   update       Check for and apply plugin updates from GitHub releases
   config       View or persist auto-update preferences
+  mcp-config   Print standard MCP JSON config snippet (or generic rules via --rules)
   uninstall    Remove installed agy-fast plugin
   status       Check installation and run live health checks
   doctor       Alias for status
+  mcp          Start standalone MCP stdio server (forwards extra args)
 
 Options:
   --project [dir]               Install/update <dir>/.agents/plugins/agy-fast
@@ -250,6 +342,8 @@ Options:
   --no-enable                   Skip running 'agy plugin enable agy-fast'
   --no-acp                      Skip syncing isolated T3 Code ACP / GEMINI_HOME profiles
   --check                       (update) Check for newer versions without applying
+  --prompt, --interactive, -i   (update) Check GitHub and ask before updating ([y]es/[n]o/[s]kip)
+  --skip-version <ver|none>     (update) Skip notifications/auto-updates for a version ('none' clears)
   --force                       (update) Re-apply even if already on the same version
   --auto-update auto|notify|off Configure background auto-update mode
   --interval <hours>            Configure background check interval in hours (default 4)
@@ -258,6 +352,11 @@ Options:
   --edits-format auto|array|string
                                 Configure apply_edits.edits schema preference (default auto)
   --tool-loading eager|lazy     Configure MCP tool loading mode in mcp_config.json (default eager)
+  --host <target>               (mcp-config) Target JSON format: mcp-only | json | generic | antigravity
+  --schema-compat standard|minimal
+                                (mcp-config) Include --schema-compat=minimal in emitted args
+  --tools <list>                (mcp-config) Comma-separated tool subset for server args and rules
+  --rules                       (mcp-config) Print host-agnostic Markdown routing rules
   -h, --help                    Show this help
 `);
 }
@@ -407,7 +506,7 @@ async function assertRemovableTarget(targetPath, stat) {
   }
 }
 
-async function removeTargetPath(targetPath, stat) {
+async function removeTargetPath(targetPath, stat, { quiet = false } = {}) {
   if (!stat) {
     return;
   }
@@ -415,14 +514,36 @@ async function removeTargetPath(targetPath, stat) {
     await fs.unlink(targetPath);
     return;
   }
-  await fs.rm(targetPath, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+  if (stat.isDirectory()) {
+    // Evacuate via atomic same-parent rename first so an EBUSY/EPERM lock fails before deleting any file.
+    const trashPath = path.join(
+      path.dirname(targetPath),
+      `.${path.basename(targetPath)}.agy-trash-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    );
+    await fs.rename(targetPath, trashPath);
+    try {
+      await fs.rm(trashPath, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    } catch (rmErr) {
+      // Target path is already vacated atomically; warn instead of misclassifying post-rename cleanup errors as a target lock.
+      if (!quiet) {
+        console.warn(
+          `Warning: removed ${targetPath}, but failed to clean up temporary staging directory ${trashPath}: ${rmErr instanceof Error ? rmErr.message : String(rmErr)}`,
+        );
+      }
+    }
+    return;
+  }
+  await fs.rm(targetPath, { force: true });
 }
 
 async function verifyMcpServerLive(mcpScriptPath) {
+  const cleanMcpEnv = { ...process.env };
+  delete cleanMcpEnv.AGY_FAST_TOOLS;
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [mcpScriptPath], {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
+      env: cleanMcpEnv,
     });
 
     let stdout = "";
@@ -575,6 +696,56 @@ async function copyRuntimeFiles(srcRoot, dstRoot) {
     const dst = path.join(dstRoot, rel);
     await fs.mkdir(path.dirname(dst), { recursive: true });
     await fs.copyFile(src, dst);
+  }
+}
+
+function isLockedTargetError(err) {
+  const code = err?.code;
+  return code === "EBUSY" || code === "EPERM";
+}
+
+function formatLockedTargetError(targetPath, err) {
+  const code = err?.code || "LOCKED";
+  return new Error(
+    `Cannot replace ${targetPath} (${code}): target is in use by a running MCP host process. Close the running host/MCP process and retry.`,
+  );
+}
+
+async function syncRuntimeFilesAtomically(srcRoot, dstRoot) {
+  await assertSourceFilesPresent(srcRoot);
+  await fs.mkdir(dstRoot, { recursive: true });
+  // Sync plugin.json LAST so a partial failure never advances the installed version marker
+  // while dist/*.mjs remain on the previous version.
+  const runtimeWithoutManifest = RUNTIME_FILES.filter((rel) => rel !== "plugin.json");
+  const toCopy = [...runtimeWithoutManifest];
+  for (const opt of OPTIONAL_DOC_FILES) {
+    if (await pathExists(path.join(srcRoot, opt))) {
+      toCopy.push(opt);
+    }
+  }
+  toCopy.push("plugin.json");
+
+  let seq = 0;
+  for (const rel of toCopy) {
+    const src = path.join(srcRoot, rel);
+    const dst = path.join(dstRoot, rel);
+    await fs.mkdir(path.dirname(dst), { recursive: true });
+    const tmp = `${dst}.agy-tmp.${process.pid}.${seq++}`;
+    try {
+      await fs.copyFile(src, tmp);
+    } catch (err) {
+      await fs.rm(tmp, { force: true }).catch(() => {});
+      throw err;
+    }
+    try {
+      await fs.rename(tmp, dst);
+    } catch {
+      try {
+        await fs.copyFile(tmp, dst);
+      } finally {
+        await fs.rm(tmp, { force: true }).catch(() => {});
+      }
+    }
   }
 }
 
@@ -860,35 +1031,59 @@ async function syncIsolatedPluginDir(resolvedSrc, primaryGlobalDir, isolated, op
   const { preserved: preservedIsoLocalRules, skipped: skippedIsoLocalRules } =
     await snapshotLocalRuleFiles(isolated.pluginDir);
   await fs.mkdir(path.dirname(isolated.pluginDir), { recursive: true });
-  await removeTargetPath(isolated.pluginDir, isoStat);
+  let mode = "symlink";
+  let migratedToPrimary = { restored: [], keptExisting: [] };
+  try {
+    await removeTargetPath(isolated.pluginDir, isoStat, { quiet: opts.quiet });
+  } catch (err) {
+    if (!opts.useLink && isoStat?.isDirectory() && !isoStat.isSymbolicLink() && isLockedTargetError(err)) {
+      try {
+        await syncRuntimeFilesAtomically(resolvedSrc, isolated.pluginDir);
+      } catch (syncErr) {
+        if (isLockedTargetError(syncErr)) {
+          throw formatLockedTargetError(isolated.pluginDir, syncErr);
+        }
+        throw syncErr;
+      }
+      if (opts.effectiveToolLoading) {
+        await applyToolLoadingToCopiedPluginDir(isolated.pluginDir, opts.effectiveToolLoading);
+      }
+      await restoreLocalRuleFiles(isolated.pluginDir, preservedIsoLocalRules);
+      mode = "copied-in-place";
+    } else if (isLockedTargetError(err)) {
+      throw formatLockedTargetError(isolated.pluginDir, err);
+    } else {
+      throw err;
+    }
+  }
 
   // Link directly to resolvedSrc in --link dev mode (avoids chained NTFS junctions on Windows),
   // otherwise link to primaryRealPath so auto-updates to ~/.gemini/config/plugins/agy-fast
   // propagate immediately to every isolated ACP profile.
   const linkSource = opts.useLink ? resolvedSrc : primaryRealPath;
-  const linkType = process.platform === "win32" ? "junction" : "dir";
-  let mode = "symlink";
-  let migratedToPrimary = { restored: [], keptExisting: [] };
-  try {
-    await fs.symlink(linkSource, isolated.pluginDir, linkType);
-  } catch (err) {
-    const code = err?.code;
-    if (code === "EPERM" || code === "ENOTSUP" || code === "EXDEV") {
-      await copyRuntimeFiles(resolvedSrc, isolated.pluginDir);
-      if (opts.effectiveToolLoading) {
-        await applyToolLoadingToCopiedPluginDir(isolated.pluginDir, opts.effectiveToolLoading);
+  if (mode !== "copied-in-place") {
+    const linkType = process.platform === "win32" ? "junction" : "dir";
+    try {
+      await fs.symlink(linkSource, isolated.pluginDir, linkType);
+    } catch (err) {
+      const code = err?.code;
+      if (code === "EPERM" || code === "ENOTSUP" || code === "EXDEV") {
+        await copyRuntimeFiles(resolvedSrc, isolated.pluginDir);
+        if (opts.effectiveToolLoading) {
+          await applyToolLoadingToCopiedPluginDir(isolated.pluginDir, opts.effectiveToolLoading);
+        }
+        await restoreLocalRuleFiles(isolated.pluginDir, preservedIsoLocalRules);
+        mode = "copied";
+      } else {
+        throw err;
       }
-      await restoreLocalRuleFiles(isolated.pluginDir, preservedIsoLocalRules);
-      mode = "copied";
-    } else {
-      throw err;
     }
-  }
-  if (mode === "symlink" && !opts.useLink && preservedIsoLocalRules.length > 0) {
-    migratedToPrimary = await restoreLocalRuleFiles(
-      primaryRealPath,
-      preservedIsoLocalRules,
-    );
+    if (mode === "symlink" && !opts.useLink && preservedIsoLocalRules.length > 0) {
+      migratedToPrimary = await restoreLocalRuleFiles(
+        primaryRealPath,
+        preservedIsoLocalRules,
+      );
+    }
   }
 
   if (!opts.quiet) {
@@ -909,6 +1104,10 @@ async function syncIsolatedPluginDir(resolvedSrc, primaryGlobalDir, isolated, op
           `Note: --link replaced ${isolated.pluginDir}; local rule file(s) were not copied into dev checkout: ${preservedIsoLocalRules.map((f) => `rules/${f.name}`).join(", ")}`,
         );
       }
+    } else if (mode === "copied-in-place") {
+      console.log(
+        `Note: ${isolated.pluginDir} was locked by a running process; updated files atomically in-place. Reload your host window to load the new MCP server.`,
+      );
     } else {
       console.log(`Synced ${isolated.label} (copied): ${isolated.pluginDir}`);
     }
@@ -1062,14 +1261,53 @@ async function runDoctor(targetDir, quiet = false, doctorOpts = {}) {
     console.log(
       `  - SessionStart: ${hookCheck.bytes > 0 ? "OK" : "EMPTY (FAILED)"} (${hookCheck.durationMs}ms, ${hookCheck.bytes} bytes)`,
     );
-    const checkSummary = updaterState.availableVersion
-      ? `update available: v${updaterState.availableVersion}`
-      : updaterState.lastCheckAt
-        ? `last check: ${updaterState.lastCheckAt}`
-        : "not checked yet";
+    const availCmp = updaterState.availableVersion
+      ? compareSemverSimple(updaterState.availableVersion, installedVersion)
+      : null;
+    const hasFreshSemverUpdate =
+      Boolean(updaterState.availableVersion) && (availCmp === null || availCmp > 0);
+    const skipCmp = updaterState.skippedVersion
+      ? compareSemverSimple(updaterState.skippedVersion, installedVersion)
+      : null;
+    const hasActiveSkip =
+      Boolean(updaterState.skippedVersion) && (skipCmp === null || skipCmp > 0);
+    const hasMainUpdate =
+      !updaterState.availableVersion &&
+      Boolean(updaterState.availableCommit) &&
+      updaterState.availableCommit !== updaterState.lastAppliedCommit;
+
+    const checkParts = [];
+    if (
+      hasFreshSemverUpdate &&
+      (!hasActiveSkip || updaterState.availableVersion !== updaterState.skippedVersion)
+    ) {
+      checkParts.push(`update available: v${updaterState.availableVersion}`);
+    } else if (hasMainUpdate) {
+      checkParts.push(
+        `update available: ${updaterState.availableRef || "main"} (${String(updaterState.availableCommit).slice(0, 7)})`,
+      );
+    } else if (hasActiveSkip) {
+      checkParts.push(`skipped: v${updaterState.skippedVersion}`);
+    }
+    if (updaterState.lastCheckAt) {
+      checkParts.push(`last check: ${updaterState.lastCheckAt}`);
+    } else if (checkParts.length === 0) {
+      checkParts.push("not checked yet");
+    }
+    if (updaterState.lastError) {
+      const compactErr = String(updaterState.lastError).replace(/\s+/g, " ").trim().slice(0, 120);
+      checkParts.push(`last error: ${compactErr}`);
+    }
     console.log(
-      `  - Auto-update : ${effectiveAutoMode} (interval: ${effectiveInterval}h, channel: ${effectiveChannel}; ${checkSummary})`,
+      `  - Auto-update : ${effectiveAutoMode} (interval: ${effectiveInterval}h, channel: ${effectiveChannel}; ${checkParts.join("; ")})`,
     );
+    if (
+      (hasFreshSemverUpdate || hasMainUpdate) &&
+      (!hasActiveSkip || updaterState.availableVersion !== updaterState.skippedVersion) &&
+      updaterState.availableReleaseUrl
+    ) {
+      console.log(`      Release: ${updaterState.availableReleaseUrl}`);
+    }
     if (hasAgy) {
       console.log(
         `  - agy validate: ${report.agyValidated ? "PASSED (--strict)" : "FAILED"}`,
@@ -1140,7 +1378,14 @@ async function runInstall(opts) {
     await assertRemovableTarget(resolvedDst, dstStat);
     const { preserved: replacedLocalRules } = await snapshotLocalRuleFiles(resolvedDst);
     await fs.mkdir(path.dirname(resolvedDst), { recursive: true });
-    await removeTargetPath(resolvedDst, dstStat);
+    try {
+      await removeTargetPath(resolvedDst, dstStat, { quiet: opts.quiet });
+    } catch (err) {
+      if (isLockedTargetError(err)) {
+        throw formatLockedTargetError(resolvedDst, err);
+      }
+      throw err;
+    }
     const linkType = process.platform === "win32" ? "junction" : "dir";
     await fs.symlink(resolvedSrc, resolvedDst, linkType);
     if (!opts.quiet) {
@@ -1156,12 +1401,40 @@ async function runInstall(opts) {
     await assertRemovableTarget(resolvedDst, dstStat);
     const { preserved: preservedLocalRules, skipped: skippedLocalRules } =
       await snapshotLocalRuleFiles(resolvedDst);
-    await removeTargetPath(resolvedDst, dstStat);
-    await copyRuntimeFiles(resolvedSrc, resolvedDst);
+    let inPlaceSynced = false;
+    if (dstStat) {
+      try {
+        await removeTargetPath(resolvedDst, dstStat, { quiet: opts.quiet });
+      } catch (err) {
+        if (dstStat.isDirectory() && !dstStat.isSymbolicLink() && isLockedTargetError(err)) {
+          try {
+            await syncRuntimeFilesAtomically(resolvedSrc, resolvedDst);
+          } catch (syncErr) {
+            if (isLockedTargetError(syncErr)) {
+              throw formatLockedTargetError(resolvedDst, syncErr);
+            }
+            throw syncErr;
+          }
+          inPlaceSynced = true;
+        } else if (isLockedTargetError(err)) {
+          throw formatLockedTargetError(resolvedDst, err);
+        } else {
+          throw err;
+        }
+      }
+    }
+    if (!inPlaceSynced) {
+      await copyRuntimeFiles(resolvedSrc, resolvedDst);
+    }
     await applyToolLoadingToCopiedPluginDir(resolvedDst, effectiveToolLoading);
     const { restored } = await restoreLocalRuleFiles(resolvedDst, preservedLocalRules);
     if (!opts.quiet) {
       console.log(`Installed agy-fast to ${resolvedDst}`);
+      if (inPlaceSynced) {
+        console.log(
+          `Note: ${resolvedDst} was locked by a running process; updated files atomically in-place. Reload your host window to load the new MCP server.`,
+        );
+      }
       if (effectiveToolLoading === "lazy") {
         console.log("Applied MCP tool loading mode: lazy (all 5 tools via call_mcp_tool).");
       }
@@ -1289,6 +1562,43 @@ async function runConfig(opts) {
   }
 }
 
+function invokeUpdaterJson(updaterPath, args) {
+  const res = spawnSync(process.execPath, [updaterPath, ...args, "--json"], {
+    encoding: "utf8",
+    timeout: 60_000,
+    windowsHide: true,
+  });
+  let parsed = null;
+  try {
+    parsed = JSON.parse((res.stdout || "").trim());
+  } catch {
+    // Non-JSON error output handled below
+  }
+  if (!parsed) {
+    const detail = (res.stderr || res.stdout || res.error?.message || "updater failed").trim();
+    throw new Error(detail);
+  }
+  return parsed;
+}
+
+async function promptUpdateDecision(question) {
+  const rl = createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  try {
+    const raw = await rl.question(question);
+    const ans = raw.trim().toLowerCase();
+    if (ans === "y" || ans === "yes") return "yes";
+    if (ans === "s" || ans === "skip") return "skip";
+    return "no";
+  } catch {
+    return "no";
+  } finally {
+    rl.close();
+  }
+}
+
 async function runUpdate(opts) {
   checkNodeVersion();
   const resolvedDst = path.resolve(opts.targetDir);
@@ -1307,44 +1617,129 @@ async function runUpdate(opts) {
     await writeUpdaterConfigFile(patch);
   }
 
-  const installedUpdater = path.join(resolvedDst, "dist", "updater.mjs");
+  // Prefer the updater paired with this install.mjs so new CLI flags (e.g. --skip-version)
+  // are never sent to an older installed dist/updater.mjs that might ignore unknown flags.
   const repoUpdater = path.join(REPO_ROOT, "dist", "updater.mjs");
-  const updaterPath = (await pathExists(installedUpdater))
-    ? installedUpdater
-    : repoUpdater;
+  const installedUpdater = path.join(resolvedDst, "dist", "updater.mjs");
+  const updaterPath = (await pathExists(repoUpdater))
+    ? repoUpdater
+    : installedUpdater;
   if (!(await pathExists(updaterPath))) {
     throw new Error("Missing dist/updater.mjs. Run 'npm run build' or reinstall agy-fast.");
   }
 
-  const updaterArgs = [updaterPath, "--plugin-dir", resolvedDst, "--json"];
-  if (opts.checkOnly) updaterArgs.push("--check");
-  if (opts.force) updaterArgs.push("--force");
-  if (opts.channel) updaterArgs.push("--channel", opts.channel);
-  if (opts.repoUrl) updaterArgs.push("--repo", opts.repoUrl);
+  const runSkipCommand = (rawVer) => {
+    const lower = rawVer.toLowerCase();
+    const isClear = lower === "none" || lower === "clear";
+    const expectedStatus = isClear ? "cleared-skip" : "skipped-version";
+    const skipArgs = isClear
+      ? ["--plugin-dir", resolvedDst, "--clear-skip"]
+      : ["--plugin-dir", resolvedDst, "--skip-version", rawVer];
+    const skipParsed = invokeUpdaterJson(updaterPath, skipArgs);
+    if (skipParsed.status === "error") {
+      throw new Error(skipParsed.error || skipParsed.message || "Failed to update skip preference.");
+    }
+    if (skipParsed.status !== expectedStatus) {
+      throw new Error(
+        `Updater at ${updaterPath} does not support --skip-version (returned status: '${skipParsed.status}').`,
+      );
+    }
+    if (!opts.quiet) {
+      console.log(skipParsed.message);
+    }
+  };
 
-  const res = spawnSync(process.execPath, updaterArgs, {
-    encoding: "utf8",
-    timeout: 60_000,
-    windowsHide: true,
-  });
+  if (opts.skipVersion) {
+    runSkipCommand(opts.skipVersion);
+    return;
+  }
+
+  const baseArgs = ["--plugin-dir", resolvedDst];
+  if (opts.channel) baseArgs.push("--channel", opts.channel);
+  if (opts.repoUrl) baseArgs.push("--repo", opts.repoUrl);
+
+  const installerScriptPath = path.join(resolvedDst, "scripts", "install.mjs");
+  let parsed = null;
+
+  if (opts.promptUpdate && !opts.checkOnly) {
+    const checkArgs = [...baseArgs, "--check"];
+    if (opts.force) checkArgs.push("--force");
+    const checkParsed = invokeUpdaterJson(updaterPath, checkArgs);
+    if (checkParsed.status === "error") {
+      if (!opts.quiet) console.log(checkParsed.message);
+      throw new Error(checkParsed.error || checkParsed.message);
+    }
+    if (checkParsed.status !== "available") {
+      // Reuse checkParsed without returning early so --tool-loading and isolated ACP sync still run on up-to-date
+      parsed = checkParsed;
+    } else {
+      if (!opts.quiet) {
+        console.log(checkParsed.message);
+        if (checkParsed.releaseUrl) {
+          console.log(`Release notes: ${checkParsed.releaseUrl}`);
+        }
+        if (checkParsed.publishedAt) {
+          console.log(`Published at : ${checkParsed.publishedAt}`);
+        }
+      }
+
+      const targetLabel = checkParsed.latestVersion
+        ? `v${checkParsed.currentVersion} -> v${checkParsed.latestVersion}`
+        : `branch '${checkParsed.latestRef || "main"}'`;
+      const isManagedUpdate =
+        checkParsed.installKind === "copied" || checkParsed.installKind === "git-clone";
+      const question = isManagedUpdate
+        ? `Update agy-fast ${targetLabel} now? [y]es / [n]o / [s]kip this version (default: n): `
+        : `This install (${checkParsed.installKind}) requires manual git pull/build. Skip notifications for ${targetLabel}? [s]kip / [n]o (default: n): `;
+
+      const decision = await promptUpdateDecision(question);
+      if (decision === "skip") {
+        if (checkParsed.latestVersion) {
+          runSkipCommand(checkParsed.latestVersion);
+        } else if (!opts.quiet) {
+          console.log("Skipped for now (no semver version tag to persist).");
+        }
+        return;
+      }
+      if (decision !== "yes" || !isManagedUpdate) {
+        if (!opts.quiet) {
+          console.log(
+            isManagedUpdate
+              ? `Update declined. Run \`node "${installerScriptPath}" update\` whenever you are ready.`
+              : "No changes made.",
+          );
+        }
+        return;
+      }
+    }
+  }
+
+  if (!parsed) {
+    const updaterArgs = [...baseArgs];
+    if (opts.checkOnly) updaterArgs.push("--check");
+    if (opts.force) updaterArgs.push("--force");
+    parsed = invokeUpdaterJson(updaterPath, updaterArgs);
+  }
   if (opts.toolLoading && !opts.checkOnly) {
     await applyToolLoadingToCopiedPluginDir(resolvedDst, opts.toolLoading);
   }
 
-  let parsed = null;
-  try {
-    parsed = JSON.parse((res.stdout || "").trim());
-  } catch {
-    // Non-JSON error output handled below
-  }
-
-  if (!parsed) {
-    const detail = (res.stderr || res.stdout || res.error?.message || "updater failed").trim();
-    throw new Error(detail);
-  }
-
   if (!opts.quiet) {
     console.log(parsed.message);
+    if (opts.checkOnly && parsed.status === "available") {
+      if (parsed.releaseUrl) {
+        console.log(`Release notes: ${parsed.releaseUrl}`);
+      }
+      console.log(`  - Update now : node "${installerScriptPath}" update`);
+      if (parsed.latestVersion) {
+        console.log(
+          `  - Skip v${parsed.latestVersion}: node "${installerScriptPath}" update --skip-version ${parsed.latestVersion}`,
+        );
+      }
+      console.log(
+        `  - Notify-only: node "${installerScriptPath}" config --auto-update notify`,
+      );
+    }
   }
 
   if (parsed.status === "error") {
@@ -1460,25 +1855,252 @@ async function runUninstall(opts) {
   }
 
   for (const { isolated, stat } of existingIsolated) {
-    await removeTargetPath(isolated.pluginDir, stat);
+    try {
+      await removeTargetPath(isolated.pluginDir, stat, { quiet: opts.quiet });
+    } catch (err) {
+      if (isLockedTargetError(err)) {
+        throw formatLockedTargetError(isolated.pluginDir, err);
+      }
+      throw err;
+    }
     if (!opts.quiet) {
       console.log(`Removed agy-fast from ${isolated.pluginDir} (${isolated.label})`);
     }
   }
 
   if (dstStat) {
-    await removeTargetPath(resolvedDst, dstStat);
+    try {
+      await removeTargetPath(resolvedDst, dstStat, { quiet: opts.quiet });
+    } catch (err) {
+      if (isLockedTargetError(err)) {
+        throw formatLockedTargetError(resolvedDst, err);
+      }
+      throw err;
+    }
     if (!opts.quiet) {
       console.log(`Removed agy-fast from ${resolvedDst}`);
     }
   }
 }
 
+function parseMcpConfigTools(rawTools) {
+  if (rawTools === null) return null;
+  const trimmed = String(rawTools).trim();
+  if (!trimmed) {
+    throw new Error(
+      `Invalid --tools value "${rawTools}". Expected comma-separated tool names from: ${EXPECTED_MCP_TOOLS.join(", ")}.`,
+    );
+  }
+  const parts = trimmed.split(",").map((s) => s.trim());
+  if (parts.some((p) => !p)) {
+    throw new Error(
+      `Invalid --tools value "${rawTools}": empty tool entry in comma-separated list. Valid tools: ${EXPECTED_MCP_TOOLS.join(", ")}.`,
+    );
+  }
+  const invalid = parts.filter((name) => !EXPECTED_MCP_TOOLS.includes(name));
+  if (invalid.length > 0) {
+    throw new Error(
+      `Unknown tool(s) in --tools: ${invalid.join(", ")}. Valid tools: ${EXPECTED_MCP_TOOLS.join(", ")}.`,
+    );
+  }
+  return [...new Set(parts)];
+}
+
+async function resolveMcpEntryPosix(opts) {
+  const targetMcp = path.join(path.resolve(opts.targetDir), "dist", "mcp-server.mjs");
+  const repoMcp = path.join(REPO_ROOT, "dist", "mcp-server.mjs");
+  let chosen = targetMcp;
+  if (!opts.isCustomTarget && !opts.isProject) {
+    if (!(await pathExists(targetMcp)) && (await pathExists(repoMcp))) {
+      chosen = repoMcp;
+    }
+  }
+  const exists = await pathExists(chosen);
+  return { posix: chosen.split(path.sep).join("/"), exists };
+}
+
+function renderMcpConfigSnippet(host, mcpEntryPosix, opts, selectedTools = null) {
+  const args = [mcpEntryPosix];
+  if (selectedTools !== null) {
+    args.push("--tools", selectedTools.join(","));
+  }
+  if (opts.schemaCompat === "minimal") {
+    args.push("--schema-compat=minimal");
+  }
+  if (host === "antigravity") {
+    const serverCfg = {
+      command: "node",
+      args,
+    };
+    if (opts.toolLoading !== "lazy") {
+      const eagerTools = selectedTools ?? EXPECTED_MCP_TOOLS;
+      serverCfg.tools = Object.fromEntries(
+        eagerTools.map((name) => [name, { eager: true }]),
+      );
+    }
+    return `${JSON.stringify(
+      {
+        mcpServers: {
+          fast: serverCfg,
+        },
+      },
+      null,
+      2,
+    )}\n`;
+  }
+  return `${JSON.stringify(
+    {
+      mcpServers: {
+        "agy-fast": {
+          command: "node",
+          args,
+        },
+      },
+    },
+    null,
+    2,
+  )}\n`;
+}
+
+function escapePosixDoubleQuoted(str) {
+  return str.replace(/(["\\$`])/g, "\\$1");
+}
+
+function renderGenericRulesTemplate(selectedTools, mcpEntryPosix) {
+  const enabled = new Set(selectedTools || EXPECTED_MCP_TOOLS);
+  const rows = [];
+  if (enabled.has("quick_outline")) {
+    rows.push(
+      "| Map symbol/section line ranges in large/unknown files (>300 lines; 10-20 files/batch, max 40) | `quick_outline` | Avoids blind full-file reads |",
+    );
+  }
+  if (enabled.has("read_slices")) {
+    rows.push(
+      "| Read multiple <=120-line symbol ranges across files in one call | `read_slices` | Inline cap <=8.8 KB UTF-8 |",
+    );
+  }
+  if (enabled.has("batch_search")) {
+    rows.push(
+      "| Run >=2 text/regex/glob/fuzzy/read-only git queries (even across repos) | `batch_search` | `pattern` always required; `contextLines` 0..10 |",
+    );
+  }
+  if (enabled.has("apply_edits")) {
+    rows.push(
+      "| Apply >=2 non-contiguous hunks, multi-file edits, or edit + inline `verify` | `apply_edits` | `create` XOR `hunks`; atomic or `bestEffort: true` |",
+    );
+  }
+  if (enabled.has("run_checks")) {
+    rows.push(
+      "| Run >=2 independent non-interactive shell commands concurrently | `run_checks` | Default `compact`; shared 150s budget |",
+    );
+  }
+
+  const bullets = [
+    "- **Pass explicit `cwd` when `roots/list` is unavailable**: Provide an absolute workspace `cwd` on tool calls when running in hosts without MCP `roots/list`.",
+  ];
+  if (enabled.has("quick_outline")) {
+    bullets.push(
+      "- **Outline before reading**: For unknown files >300 lines, run `quick_outline` first to map exact line ranges, then fetch targeted ranges.",
+    );
+  }
+  if (enabled.has("read_slices")) {
+    bullets.push(
+      "- **Use `read_slices` for targeted small ranges**: Prefer `lineRanges: ['path:start-end,s2-e2']` for <=150 total lines; for larger reads, use native ranged file reads instead of bulk-slicing >150 lines (8.8 KB inline cap).",
+    );
+  }
+  if (enabled.has("batch_search")) {
+    bullets.push(
+      "- **Batch searches & respect schema bounds**: Pack multiple queries into one `batch_search` using per-query `path`; `pattern` is always required (e.g., `\"*\"` for `glob`), glob uses `*`/`{a,b}` (no `|`), `contextLines` is `0..10`, and for large `git diff`/`git show` run `--stat` or path-scoped diffs first.",
+    );
+  }
+  if (enabled.has("apply_edits")) {
+    bullets.push(
+      "- **Safe multi-file edits**: Use `create` XOR `hunks` per entry; pass `bestEffort: true` when touching >=3 files so one mismatch does not roll back valid edits, and keep inline `verify` commands fast (<45s; `verifyTimeoutSec` max `150`s).",
+    );
+  }
+  if (enabled.has("run_checks")) {
+    bullets.push(
+      "- **Use `run_checks` for >=2 commands**: Keep single lightweight commands in the native shell; default to `outputMode: \"compact\"` (use `\"full\"` only when passing stdout is needed) and stay within the shared `150`s MCP budget.",
+    );
+  }
+
+  const cliMap = [
+    ["batch_search", "search"],
+    ["quick_outline", "outline"],
+    ["read_slices", "slice"],
+    ["apply_edits", "edit"],
+    ["run_checks", "check"],
+  ];
+  const cliSubcmds = cliMap
+    .filter(([tool]) => enabled.has(tool))
+    .map(([, sub]) => sub);
+  if (cliSubcmds.length > 0) {
+    bullets.push(
+      `- **CLI fallback for subagents/scripts**: Invoke \`node "${escapePosixDoubleQuoted(mcpEntryPosix)}" --cli <${cliSubcmds.join("|")}> ...\` (put per-query modifiers before each query).`,
+    );
+  }
+
+  return [
+    "# agy-fast Tool Routing Rules",
+    "",
+    "Batch independent operations into one `agy-fast` MCP call whenever possible (output hard-capped at <=8.8 KB UTF-8):",
+    "",
+    "| Task | Preferred Tool | Notes |",
+    "| :--- | :--- | :--- |",
+    ...rows,
+    "",
+    "## Guidelines",
+    "",
+    ...bullets,
+    "",
+  ].join("\n");
+}
+
+async function runMcpConfig(opts) {
+  const host = opts.mcpHost || "mcp-only";
+  const tools = parseMcpConfigTools(opts.mcpToolsRaw);
+  if (opts.printRules && opts.mcpHost && !opts.quiet) {
+    console.error(`Warning: --host '${opts.mcpHost}' is ignored when --rules is set.`);
+  }
+  const entry = await resolveMcpEntryPosix(opts);
+  if (!entry.exists && !opts.quiet) {
+    console.error(
+      `Warning: MCP server entrypoint not found at ${entry.posix} (run 'install' or 'npm run build' first).`,
+    );
+  }
+  if (opts.printRules) {
+    process.stdout.write(renderGenericRulesTemplate(tools, entry.posix));
+    return;
+  }
+  process.stdout.write(renderMcpConfigSnippet(host, entry.posix, opts, tools));
+}
+
 async function main() {
+  if (process.argv[2] === "mcp") {
+    const mcpServerPath = path.join(REPO_ROOT, "dist", "mcp-server.mjs");
+    if (!(await pathExists(mcpServerPath))) {
+      throw new Error(
+        `Built MCP server not found at ${mcpServerPath}. Run 'npm run build' first.`,
+      );
+    }
+    process.argv = [process.argv[0], mcpServerPath, ...process.argv.slice(3)];
+    await import(pathToFileURL(mcpServerPath).href);
+    return;
+  }
+
   const opts = parseArgs(process.argv);
   if (opts.showHelp) {
     printHelp();
     return;
+  }
+
+  if (
+    opts.command !== "mcp-config" &&
+    (opts.mcpHost || opts.mcpToolsRaw !== null || opts.schemaCompat || opts.printRules)
+  ) {
+    throw new Error(
+      "--host, --tools, --schema-compat, and --rules are only supported with the 'mcp-config' command.",
+    );
   }
 
   switch (opts.command) {
@@ -1490,6 +2112,9 @@ async function main() {
       break;
     case "config":
       await runConfig(opts);
+      break;
+    case "mcp-config":
+      await runMcpConfig(opts);
       break;
     case "uninstall":
       await runUninstall(opts);

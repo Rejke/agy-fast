@@ -162,7 +162,7 @@ Antigravity 在工具执行前会先运行本地规则检查（耗时 10~80 微�
 
 ### 4.3 技术栈选择依据
 
-基于冷启动基准测试（`node` 17.7ms、`rg` 2.1ms）与分发易用性对比，选择 **TypeScript（strict 模式）+ `esbuild` 打包为独立零依赖 ESM（`.mjs`）+ Node.js >= 20**：
+基于冷启动基准测试（macOS Apple Silicon 实测 `node` 17.7ms、`rg` 2.1ms；Windows 下 `CreateProcess` 加载 PE/DLL 约 80~250ms、`powershell.exe` CLR 冷启动可达 1.5~3s，常驻服务与批处理在 Windows 上收益更显著）与分发易用性对比，选择 **TypeScript（strict 模式）+ `esbuild` 打包为独立零依赖 ESM（`.mjs`）+ Node.js >= 20**：
 - **零 `node_modules` 安装体验**：构建产物直接随仓库分发，用户克隆或一键安装后无需编译、无需执行 `npm install`，跨 macOS / Linux / Windows 通用。
 - **常驻低延迟**：MCP Stdio 服务在会话期间常驻运行，进程间通信耗时低于 1 毫秒。
 - **易于审计**：不混淆打包产物，所有源码与打包文件均公开可读。

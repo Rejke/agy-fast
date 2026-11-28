@@ -2,7 +2,7 @@ import { promises as fs, type Dirent } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
-import { execBinaryAsync } from "./exec-utils.js";
+import { execBinaryAsync, withNonInteractiveGitEnv } from "./exec-utils.js";
 import { DEFAULT_IGNORE_DIRS } from "./fs-utils.js";
 import { sliceSafeChars, sliceUtf8Bytes, truncateWithByteNotice } from "./output-filter.js";
 
@@ -13,12 +13,15 @@ export interface SnapshotOptions {
   maxBytes?: number;
   gitTimeoutMs?: number;
   scanTimeoutMs?: number;
+  gitExec?: typeof execBinaryAsync;
 }
 
 const HARDENED_GIT_BASE_ARGS = [
   "--no-optional-locks",
   "-c",
   "core.fsmonitor=false",
+  "-c",
+  "core.quotePath=false",
   "-c",
   "diff.external=",
   "-c",
@@ -32,74 +35,258 @@ const HARDENED_GIT_BASE_ARGS = [
   "--no-pager",
 ] as const;
 
+async function findGitEntry(workspaceDir: string): Promise<string | null> {
+  let cur = path.resolve(workspaceDir);
+  while (true) {
+    const candidate = path.join(cur, ".git");
+    try {
+      await fs.lstat(candidate);
+      return candidate;
+    } catch {
+      // keep walking up
+    }
+    const parent = path.dirname(cur);
+    if (parent === cur) return null;
+    cur = parent;
+  }
+}
+
+async function readBranchFromGitEntry(gitEntry: string | null): Promise<string | null> {
+  if (!gitEntry) return null;
+  try {
+    const st = await fs.stat(gitEntry);
+    let gitDir = gitEntry;
+    if (st.isFile()) {
+      const ptr = await fs.readFile(gitEntry, "utf8");
+      const m = /^gitdir:\s*(.+)$/im.exec(ptr.trim());
+      if (!m?.[1]) return null;
+      gitDir = path.resolve(path.dirname(gitEntry), m[1].trim());
+    }
+    const headRaw = (await fs.readFile(path.join(gitDir, "HEAD"), "utf8")).trim();
+    const refMatch = /^ref:\s*refs\/heads\/(.+)$/.exec(headRaw);
+    return refMatch?.[1]?.trim() || "HEAD";
+  } catch {
+    return null;
+  }
+}
+
+export function parsePorcelainBranchHeader(headerLine: string): {
+  branch: string;
+  isUnborn: boolean;
+} {
+  const body = headerLine.slice(3).trim();
+  const unbornMatch = /^(?:No commits yet|Initial commit) on (.+)$/.exec(body);
+  if (unbornMatch?.[1]) {
+    const branchOnly = unbornMatch[1].split("...")[0]?.trim() || "HEAD";
+    return { branch: branchOnly, isUnborn: true };
+  }
+  if (/^HEAD\s*\(no branch\)$/i.test(body)) {
+    return { branch: "HEAD", isUnborn: false };
+  }
+  // Strip optional upstream tracking suffix `...origin/main [ahead 1]`
+  const branchOnly = body.split("...")[0]?.trim() || "HEAD";
+  return { branch: branchOnly, isUnborn: false };
+}
+
+/**
+ * Number of path segments between the enclosing repository root and the workspace:
+ * 0 when the workspace is the repository root, 2 for `<repo>/packages/app`.
+ * Counted on physical paths so 8.3 short names, letter case and symlinked segments
+ * cannot drift from the root-relative prefix git itself prints.
+ */
+async function resolveNestedRepoInfo(
+  workspaceDir: string,
+  gitEntry: string,
+): Promise<{ nestingDepth: number; effectiveGitEntry: string }> {
+  if (path.dirname(gitEntry) === path.resolve(workspaceDir)) {
+    return { nestingDepth: 0, effectiveGitEntry: gitEntry };
+  }
+  const realWorkspace = await fs.realpath(workspaceDir).catch(() => path.resolve(workspaceDir));
+  const realEntry = await findGitEntry(realWorkspace);
+  if (!realEntry) {
+    return { nestingDepth: 0, effectiveGitEntry: gitEntry };
+  }
+  const rel = path.relative(path.dirname(realEntry), realWorkspace);
+  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
+    return { nestingDepth: 0, effectiveGitEntry: realEntry };
+  }
+  return {
+    nestingDepth: rel.split(path.sep).filter(Boolean).length,
+    effectiveGitEntry: realEntry,
+  };
+}
+
+/**
+ * Rewrites one `git status --porcelain=v1` line of a nested workspace so its path(s) are
+ * relative to the workspace instead of the repository root (porcelain output is always
+ * root-relative). Returns null for an untracked/ignored directory entry that is the workspace
+ * itself or one of its ancestors, i.e. git reports the whole workspace as untracked.
+ */
+export function toWorkspaceRelativeStatusLine(
+  line: string,
+  nestingDepth: number,
+): string | null {
+  if (nestingDepth <= 0 || line.length < 4) return line;
+  let containsWorkspace = false;
+  const strip = (p: string): string => {
+    const quoted = p.startsWith('"');
+    const segs = (quoted ? p.slice(1) : p).split("/");
+    const last = segs[segs.length - 1] ?? "";
+    const isDirEntry = last === "" || last === '"';
+    const nameCount = isDirEntry ? segs.length - 1 : segs.length;
+    if (nameCount <= nestingDepth) {
+      containsWorkspace = isDirEntry;
+      return p;
+    }
+    return `${quoted ? '"' : ""}${segs.slice(nestingDepth).join("/")}`;
+  };
+  const code = line.slice(0, 2);
+  const rawBody = line.slice(3);
+  const isRenameOrCopy = code[0] === "R" || code[0] === "C";
+  const rest = isRenameOrCopy
+    ? rawBody.split(" -> ").map(strip).join(" -> ")
+    : strip(rawBody);
+  if (containsWorkspace && (code === "??" || code === "!!")) return null;
+  return `${line.slice(0, 3)}${rest}`;
+}
+
 async function getGitSummary(
   workspaceDir: string,
   timeoutMs: number,
+  gitExec: typeof execBinaryAsync = execBinaryAsync,
 ): Promise<string | null> {
-  const [branchRes, symRefRes, statusRes, logRes] = await Promise.all([
-    execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "rev-parse", "--abbrev-ref", "HEAD"], {
-      cwd: workspaceDir,
-      timeoutMs,
-      maxOutputBytes: 4096,
-    }),
-    execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "symbolic-ref", "--short", "HEAD"], {
-      cwd: workspaceDir,
-      timeoutMs,
-      maxOutputBytes: 4096,
-    }),
-    execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "status", "--porcelain=v1"], {
-      cwd: workspaceDir,
-      timeoutMs,
-      maxOutputBytes: 32_768,
-    }),
-    execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "log", "-n", "3", "--format=%h %s"], {
-      cwd: workspaceDir,
-      timeoutMs,
-      maxOutputBytes: 8192,
-    }),
-  ]);
-
-  const hasValidRepo =
-    (!branchRes.error && branchRes.exitCode === 0) ||
-    (!symRefRes.error && symRefRes.exitCode === 0) ||
-    (!statusRes.error && statusRes.exitCode === 0);
-
-  if (!hasValidRepo) {
+  const hasExplicitGitEnv = Boolean(process.env.GIT_DIR || process.env.GIT_WORK_TREE);
+  const gitEntry = hasExplicitGitEnv ? null : await findGitEntry(workspaceDir);
+  if (!hasExplicitGitEnv && !gitEntry) {
     return null;
   }
 
-  const branch =
-    (branchRes.exitCode === 0 && branchRes.stdout.trim()) ||
-    (symRefRes.exitCode === 0 && symRefRes.stdout.trim()) ||
-    "HEAD";
-  const isUnborn = branchRes.exitCode !== 0 && symRefRes.exitCode === 0;
-  const statusLines = statusRes.exitCode === 0
-    ? statusRes.stdout
-        .split(/\r?\n/)
-        .filter((l) => {
-          const trimmed = l.trim();
-          if (!trimmed) return false;
-          if (trimmed.startsWith("?? ")) {
-            const topSeg = trimmed.slice(3).split("/")[0]?.replace(/\/$/, "");
-            if (topSeg && DEFAULT_IGNORE_DIRS.has(topSeg)) return false;
-          }
-          return true;
-        })
-    : [];
-  const logLines = logRes.exitCode === 0
+  // A workspace nested inside an enclosing repository (a monorepo package, or a plain folder
+  // below a repo-initialised parent/home directory) only reports its own subtree.
+  const { nestingDepth, effectiveGitEntry } = gitEntry
+    ? await resolveNestedRepoInfo(workspaceDir, gitEntry)
+    : { nestingDepth: 0, effectiveGitEntry: null };
+  const isNested = nestingDepth > 0;
+
+  const gitEnv = withNonInteractiveGitEnv();
+  const [statusRes, logRes, headTreeRes] = await Promise.all([
+    gitExec(
+      "git",
+      [
+        ...HARDENED_GIT_BASE_ARGS,
+        "status",
+        "--porcelain=v1",
+        "--branch",
+        ...(isNested ? ["--", "."] : []),
+      ],
+      {
+        cwd: workspaceDir,
+        timeoutMs,
+        maxOutputBytes: 32_768,
+        env: gitEnv,
+      },
+    ),
+    gitExec("git", [...HARDENED_GIT_BASE_ARGS, "log", "-n", "3", "--format=%h %s"], {
+      cwd: workspaceDir,
+      timeoutMs,
+      maxOutputBytes: 8192,
+      env: gitEnv,
+    }),
+    // Nested only: does HEAD contain the workspace directory at all? (single tree lookup)
+    isNested
+      ? gitExec(
+          "git",
+          [...HARDENED_GIT_BASE_ARGS, "rev-parse", "--verify", "--quiet", "HEAD:./"],
+          { cwd: workspaceDir, timeoutMs, maxOutputBytes: 256, env: gitEnv },
+        )
+      : null,
+  ]);
+
+  const statusOk = !statusRes.error && !statusRes.timedOut && statusRes.exitCode === 0;
+  const logOk = !logRes.error && !logRes.timedOut && logRes.exitCode === 0;
+  const headConfirmedMissing = Boolean(
+    headTreeRes && !headTreeRes.error && !headTreeRes.timedOut && headTreeRes.exitCode !== 0,
+  );
+  const fallbackBranch =
+    !statusOk && effectiveGitEntry ? await readBranchFromGitEntry(effectiveGitEntry) : null;
+
+  if (!statusOk && !logOk && !(statusRes.timedOut && fallbackBranch)) {
+    return null;
+  }
+  if (isNested && !statusOk && headConfirmedMissing) {
+    return null;
+  }
+
+  let branch = "HEAD";
+  let isUnborn = false;
+  let statusLines: string[] = [];
+
+  if (statusOk) {
+    let rawLines = statusRes.stdout.split(/\r?\n/);
+    if (statusRes.truncated && rawLines.length > 1) {
+      // Drop potentially mid-path truncated trailing line
+      rawLines.pop();
+    }
+    const headerIdx = rawLines.findIndex((l) => l.startsWith("## "));
+    if (headerIdx !== -1) {
+      const parsed = parsePorcelainBranchHeader(rawLines[headerIdx]!);
+      branch = parsed.branch;
+      isUnborn = parsed.isUnborn;
+      rawLines.splice(headerIdx, 1);
+    } else {
+      branch = (await readBranchFromGitEntry(effectiveGitEntry)) ?? "HEAD";
+    }
+    if (isNested) {
+      const relLines = rawLines.map((l) => toWorkspaceRelativeStatusLine(l, nestingDepth));
+      const workspaceReportedUntracked = relLines.some((l) => l === null);
+      const hasTrackedChange = relLines.some(
+        (l) => l !== null && l.trim() !== "" && !/^(?:\?\?|!!) /.test(l),
+      );
+      // The enclosing repository does not track this workspace (confirmed missing from HEAD or
+      // reported as an untracked/ignored directory): skip the unrelated outer repo.
+      if ((headConfirmedMissing || workspaceReportedUntracked) && !hasTrackedChange) return null;
+      rawLines = relLines.filter((l): l is string => l !== null);
+    }
+    statusLines = rawLines.filter((l) => {
+      const trimmed = l.trim();
+      if (!trimmed) return false;
+      if (trimmed.startsWith("?? ")) {
+        const rawPath = trimmed.slice(3).replace(/^"/, "");
+        const topSeg = rawPath.split("/")[0]?.replace(/\/$/, "");
+        if (topSeg && DEFAULT_IGNORE_DIRS.has(topSeg)) return false;
+      }
+      return true;
+    });
+  } else {
+    branch = fallbackBranch ?? "HEAD";
+  }
+
+  const logLines = logOk
     ? logRes.stdout
         .split(/\r?\n/)
         .map((l) => l.trim())
         .filter(Boolean)
     : [];
 
+  const branchNotes: string[] = [];
+  if (isUnborn) branchNotes.push("unborn, no commits yet");
+  if (isNested) {
+    branchNotes.push(`repo root: ${Array.from({ length: nestingDepth }, () => "..").join("/")}`);
+  }
   const parts: string[] = [
-    isUnborn ? `Git: branch \`${branch}\` (unborn, no commits yet)` : `Git: branch \`${branch}\``,
+    `Git: branch \`${branch}\`${branchNotes.length > 0 ? ` (${branchNotes.join("; ")})` : ""}`,
   ];
-  if (statusLines.length === 0) {
+  if (!statusOk) {
+    parts.push(
+      statusRes.timedOut
+        ? "Working tree: unknown (git status timed out)"
+        : "Working tree: unknown (git status failed)",
+    );
+  } else if (statusLines.length === 0) {
     parts.push("Working tree: clean");
   } else {
-    const prefix = `Modified (${statusLines.length}): `;
+    const countLabel = statusRes.truncated ? `${statusLines.length}+` : `${statusLines.length}`;
+    const prefix = `Modified (${countLabel}): `;
     const maxModifiedChars = 260;
     const maxItems = 8;
     const shown: string[] = [];
@@ -109,7 +296,8 @@ async function getGitSummary(
       const item = raw.length > 100 ? `${sliceSafeChars(raw, 97)}...` : raw;
       const sepLen = shown.length > 0 ? 2 : 0;
       const remainingAfter = statusLines.length - (i + 1);
-      const moreReserve = remainingAfter > 0 ? ` (+${remainingAfter} more)`.length : 0;
+      const moreReserve =
+        remainingAfter > 0 || statusRes.truncated ? ` (+${remainingAfter} more)`.length : 0;
       if (shown.length > 0 && currentLen + sepLen + item.length + moreReserve > maxModifiedChars) {
         break;
       }
@@ -118,8 +306,10 @@ async function getGitSummary(
     }
     const more =
       shown.length < statusLines.length
-        ? ` (+${statusLines.length - shown.length} more)`
-        : "";
+        ? ` (+${statusLines.length - shown.length}${statusRes.truncated ? "+" : ""} more)`
+        : statusRes.truncated
+          ? " (+more)"
+          : "";
     parts.push(`${prefix}${shown.join(", ")}${more}`);
   }
   if (logLines.length > 0) {
@@ -358,7 +548,6 @@ async function raceWithDeadline<T>(
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeoutPromise = new Promise<typeof TIMEOUT_SENTINEL>((resolve) => {
     timer = setTimeout(() => resolve(TIMEOUT_SENTINEL), remaining);
-    timer.unref();
   });
   try {
     const res = await Promise.race([promise, timeoutPromise]);
@@ -445,6 +634,22 @@ async function getTwoLevelTree(
   const lines: string[] = [];
   const maxTop = 20;
   const shownTop = filteredTop.slice(0, maxTop);
+
+  // Never fan out depth-2 readdir calls on $HOME or filesystem roots (e.g. C:\Users\<user>);
+  // a 1-level listing avoids 20+ slow OS/NTFS directory scans and scan timeouts on startup.
+  if (isHomeRoot) {
+    for (const entry of shownTop) {
+      lines.push(
+        entry.isDirectory()
+          ? `  ${entry.name}/`
+          : `  ${shortEntryName(entry.name)}`,
+      );
+    }
+    if (filteredTop.length > maxTop) {
+      lines.push(`  ... (+${filteredTop.length - maxTop} more top-level entries)`);
+    }
+    return `Layout (1 level):\n${lines.join("\n")}`;
+  }
 
   const subResults = new Array<{
     name: string;
@@ -576,21 +781,28 @@ async function getTwoLevelTree(
 async function detectManifestsInDir(
   dirPath: string,
   prefix: string,
+  knownFiles?: Set<string>,
 ): Promise<string[]> {
   const hints: string[] = [];
+  const hasFile = (name: string): boolean => !knownFiles || knownFiles.has(name);
 
   await Promise.all([
     // package.json
     (async () => {
+      if (!hasFile("package.json")) return;
       try {
         const raw = await fs.readFile(path.join(dirPath, "package.json"), "utf8");
         const pkg = JSON.parse(raw) as {
-          name?: string;
-          scripts?: Record<string, string>;
+          name?: unknown;
+          scripts?: unknown;
         };
-        const scriptNames = pkg.scripts ? Object.keys(pkg.scripts).slice(0, 12) : [];
-        const label = pkg.name
-          ? `${prefix}package.json (${pkg.name})`
+        const pkgName = typeof pkg.name === "string" ? pkg.name.trim() : "";
+        const scriptNames =
+          pkg.scripts && typeof pkg.scripts === "object" && !Array.isArray(pkg.scripts)
+            ? Object.keys(pkg.scripts as Record<string, unknown>).slice(0, 12)
+            : [];
+        const label = pkgName
+          ? `${prefix}package.json (${pkgName})`
           : `${prefix}package.json`;
         hints.push(
           scriptNames.length > 0
@@ -606,6 +818,7 @@ async function detectManifestsInDir(
     (async () => {
       if (prefix) return;
       for (const name of ["Makefile", "makefile"]) {
+        if (!hasFile(name)) continue;
         try {
           const raw = await fs.readFile(path.join(dirPath, name), "utf8");
           const targets: string[] = [];
@@ -630,6 +843,7 @@ async function detectManifestsInDir(
 
     // pom.xml (Maven)
     (async () => {
+      if (!hasFile("pom.xml")) return;
       try {
         const raw = await fs.readFile(path.join(dirPath, "pom.xml"), "utf8");
         const stripped = raw.replace(/<parent>[\s\S]*?<\/parent>/i, "");
@@ -645,6 +859,7 @@ async function detectManifestsInDir(
     // build.gradle / build.gradle.kts
     (async () => {
       for (const name of ["build.gradle.kts", "build.gradle"]) {
+        if (!hasFile(name)) continue;
         try {
           await fs.access(path.join(dirPath, name));
           hints.push(`${prefix}${name} (gradle)`);
@@ -657,6 +872,7 @@ async function detectManifestsInDir(
 
     // pyproject.toml
     (async () => {
+      if (!hasFile("pyproject.toml")) return;
       try {
         const raw = await fs.readFile(path.join(dirPath, "pyproject.toml"), "utf8");
         const tools: string[] = [];
@@ -677,6 +893,7 @@ async function detectManifestsInDir(
 
     // Cargo.toml
     (async () => {
+      if (!hasFile("Cargo.toml")) return;
       try {
         const raw = await fs.readFile(path.join(dirPath, "Cargo.toml"), "utf8");
         const isWorkspace = /\[workspace\]/.test(raw);
@@ -690,6 +907,7 @@ async function detectManifestsInDir(
 
     // go.mod
     (async () => {
+      if (!hasFile("go.mod")) return;
       try {
         const raw = await fs.readFile(path.join(dirPath, "go.mod"), "utf8");
         const m = /^module\s+(\S+)/m.exec(raw);
@@ -709,14 +927,19 @@ async function getProjectManifestSummary(
   isHomeRoot: boolean,
   deadlineMs: number,
 ): Promise<string | null> {
+  const rootKnownFiles = topRes.ok
+    ? new Set(topRes.value.filter((e) => !e.isDirectory()).map((e) => e.name))
+    : undefined;
   const rootRes = await raceWithDeadline(
-    detectManifestsInDir(workspaceDir, ""),
+    detectManifestsInDir(workspaceDir, "", rootKnownFiles),
     deadlineMs,
   );
-  const allHints = rootRes.ok ? [...rootRes.value] : [];
+  const rootHints = rootRes.ok ? [...rootRes.value].sort() : [];
+  const subHints: string[] = [];
 
-  // Also inspect 1-level child subproject directories (e.g. server/, web/, desktop/, SourcingAgent/)
-  if (performance.now() < deadlineMs && topRes.ok) {
+  // Also inspect 1-level child subproject directories (e.g. server/, web/, desktop/, SourcingAgent/),
+  // but never treat $HOME or a filesystem root as a monorepo (avoids up to 64 wasted manifest probes).
+  if (!isHomeRoot && performance.now() < deadlineMs && topRes.ok) {
     const subdirs = topRes.value
       .filter(
         (e) =>
@@ -740,15 +963,16 @@ async function getProjectManifestSummary(
             deadlineMs,
           );
           if (res.ok) {
-            allHints.push(...res.value);
+            subHints.push(...res.value);
           }
         }
       }),
     );
   }
 
+  subHints.sort();
+  const allHints = [...rootHints, ...subHints];
   if (allHints.length === 0) return null;
-  allHints.sort();
   return `Project:\n${allHints.slice(0, 6).map((h) => `  - ${h}`).join("\n")}`;
 }
 
@@ -821,7 +1045,7 @@ export async function buildWorkspaceSnapshot(
   if (!statRes.ok || !statRes.value.isDirectory()) return null;
 
   // Start git summary in parallel with home-root detection and shared root readdir
-  const gitPromise = getGitSummary(workspaceDir, gitTimeoutMs);
+  const gitPromise = getGitSummary(workspaceDir, gitTimeoutMs, options.gitExec);
   const [isHomeRoot, topRes] = await Promise.all([
     isHomeOrSystemRoot(workspaceDir, scanDeadline),
     raceWithDeadline(

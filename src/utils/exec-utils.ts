@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
+import os from "node:os";
 import path from "node:path";
 
 export interface ExecResult {
@@ -110,8 +111,9 @@ function getWindowsFallbackEncoding(): string | null {
 
 /**
  * Decodes child-process stdout/stderr buffers as UTF-8 first, falling back to
- * the Windows active console codepage (e.g. `gb18030` for CP936) only when
- * non-UTF-8 bytes are present.
+ * the Windows active console codepage (e.g. `gb18030` for CP936) per line when
+ * non-UTF-8 bytes are present so valid UTF-8 lines in mixed-encoding output do
+ * not turn into mojibake.
  */
 export function decodeProcessOutput(
   buf: Buffer,
@@ -129,28 +131,49 @@ export function decodeProcessOutput(
     if (!label || label === "utf-8") {
       return buf.toString("utf8");
     }
+    let decoder: TextDecoder;
     try {
-      let decoder = fallbackDecoderCache.get(label);
-      if (!decoder) {
+      const cached = fallbackDecoderCache.get(label);
+      if (cached) {
+        decoder = cached;
+      } else {
         decoder = new TextDecoder(label);
         fallbackDecoderCache.set(label, decoder);
       }
-      return decoder.decode(buf);
     } catch {
       return buf.toString("utf8");
     }
+    if (buf.indexOf(0x0a) === -1) {
+      return decoder.decode(buf);
+    }
+    const parts: string[] = [];
+    let offset = 0;
+    while (offset < buf.length) {
+      const nl = buf.indexOf(0x0a, offset);
+      const end = nl === -1 ? buf.length : nl + 1;
+      const line = buf.subarray(offset, end);
+      const lineCandidate =
+        truncated && end === buf.length ? stripTrailingIncompleteUtf8(line) : line;
+      try {
+        parts.push(strictUtf8Decoder.decode(lineCandidate));
+      } catch {
+        parts.push(decoder.decode(line));
+      }
+      offset = end;
+    }
+    return parts.join("");
   }
 }
 
 /**
  * agy aborts an MCP tool call after 180 s ("timed out after 3m0s") and drops
  * its result. All commands of one tool call share this budget; the remaining
- * 10 s cover the kill grace period below and response formatting.
+ * 30 s cover Windows process-tree kill grace, host scheduling, and formatting.
  */
-export const MCP_CALL_BUDGET_SEC = 170;
+export const MCP_CALL_BUDGET_SEC = 150;
 
-function killChildTree(pid: number | undefined, detached: boolean): void {
-  if (!pid) return;
+function killChildTree(pid: number | undefined, detached: boolean): NodeJS.Timeout | null {
+  if (!pid) return null;
   if (process.platform === "win32") {
     const fallbackKill = (): void => {
       try {
@@ -171,7 +194,7 @@ function killChildTree(pid: number | undefined, detached: boolean): void {
     } catch {
       fallbackKill();
     }
-    return;
+    return null;
   }
 
   try {
@@ -183,7 +206,7 @@ function killChildTree(pid: number | undefined, detached: boolean): void {
   } catch {
     // Process may already have exited
   }
-  setTimeout(() => {
+  const sigkillTimer = setTimeout(() => {
     try {
       if (detached) {
         process.kill(-pid, "SIGKILL");
@@ -193,7 +216,9 @@ function killChildTree(pid: number | undefined, detached: boolean): void {
     } catch {
       // Already exited
     }
-  }, 400).unref();
+  }, 400);
+  sigkillTimer.unref();
+  return sigkillTimer;
 }
 
 export function execBinaryAsync(
@@ -213,6 +238,12 @@ const WINDOWS_PS_UNQUOTED_SYNTAX_RE =
   /(?<![\\`])\$(?:HOME|PWD|null|true|false|_)\b|\$\([^)]|@\(|(?:^|[;\r\n])\s*\$[A-Za-z_][A-Za-z0-9_]*\s*=/im;
 const WINDOWS_PS_CMDLET_RE =
   /(?:^|[;|&({\r\n]\s*)(?:Get|Set|New|Remove|Test|Select|Where|ForEach|Sort|Group|Measure|Compare|ConvertTo|ConvertFrom|Export|Import|Invoke|Start|Stop|Restart|Wait|Read|Write|Out|Format|Resolve|Join|Split|Copy|Move|Rename|Clear|Add|Push|Pop|Enable|Disable)-[A-Z][A-Za-z0-9]*\b(?!-)/;
+const WINDOWS_CMD_ENV_VAR_RE = /%[A-Za-z_][A-Za-z0-9_()]*%/;
+const WINDOWS_CMD_UNQUOTED_SYNTAX_RE =
+  /(?:^|[;&|(\r\n])\s*@?(?:set\s+(?:\/[ap]\s+|[A-Za-z_][A-Za-z0-9_]*=)|(?:setlocal|endlocal|rem|call|goto)\b(?!-)|::|(?:cd|chdir)\s+\/d\b|if\s+(?:\/i\s+(?:not\s+)?|(?:not\s+)?(?:errorlevel\s+\d|exist\s|defined\s|cmdextversion\s+\d|[^(\r\n;&|]*==))|for\s+(?:\/[dflr]\b|%%?[A-Za-z]\s+in\b))|(?<![\\`])(?:>>?|<)\s*nul(?=$|[\s;&|)])/i;
+const WINDOWS_CMD_QUOTED_SET_AT_POS_RE =
+  /^@?set[ \t]+(?:\/[ap][ \t]+)?"[A-Za-z_][A-Za-z0-9_]*=/i;
+const WINDOWS_PS51_CHAIN_OPERATOR_RE = /&&|\|\|/;
 const EXPLICIT_POWERSHELL_INVOCATION_RE =
   /^\s*(?:["']?)(?:pwsh|powershell)(?:\.exe)?(?:["']?)(?:\s|$)/i;
 const PS_NON_INVOCATION_TAIL_RE =
@@ -372,6 +403,126 @@ export function unwrapTrivialWindowsPowerShellCommand(command: string): string {
   return inner;
 }
 
+/**
+ * Detects unquoted PowerShell `; ` statement chaining while keeping legitimate
+ * `cmd.exe` commands (e.g. `%VAR%`, compact `key=a;b` / `-cp a.jar;b.jar`,
+ * `set FOO=...`, `if errorlevel ...`, `2>nul`) and commands mixing `;` with
+ * PowerShell 5.1-incompatible chain operators (`&&`, `||`, cmd `&`) on `cmd.exe`.
+ */
+function hasPowerShellSemicolonChaining(
+  command: string,
+  withoutSingle: string,
+  unquoted: string,
+): boolean {
+  if (
+    WINDOWS_CMD_ENV_VAR_RE.test(withoutSingle) ||
+    WINDOWS_CMD_UNQUOTED_SYNTAX_RE.test(unquoted) ||
+    WINDOWS_PS51_CHAIN_OPERATOR_RE.test(unquoted)
+  ) {
+    return false;
+  }
+
+  let quote: '"' | "'" | null = null;
+  let sawLeadingToken = false;
+  let atStatementStart = true;
+  let hasSemicolonChain = false;
+
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]!;
+    const next = command[i + 1];
+    if (quote === "'") {
+      if (ch === "'") {
+        if (next === "'") {
+          i++;
+        } else {
+          quote = null;
+        }
+      }
+      continue;
+    }
+    if (quote === '"') {
+      if ((ch === "\\" || ch === "`") && (next === ch || next === '"')) {
+        i++;
+        continue;
+      }
+      if (ch === '"') {
+        if (next === '"') {
+          i++;
+        } else {
+          quote = null;
+        }
+      }
+      continue;
+    }
+    if (ch === "'") {
+      quote = "'";
+      sawLeadingToken = true;
+      atStatementStart = false;
+      continue;
+    }
+    if (ch === '"') {
+      quote = '"';
+      sawLeadingToken = true;
+      atStatementStart = false;
+      continue;
+    }
+    if (ch === ";") {
+      const prev = i > 0 ? command[i - 1] : "";
+      const prevPrev = i > 1 ? command[i - 2] : "";
+      const isEscaped =
+        prev === "^" ||
+        prev === "`" ||
+        (prev === "\\" && (i === 1 || /\s/.test(prevPrev!)));
+      if (sawLeadingToken && !isEscaped && (next === " " || next === "\t")) {
+        let j = i + 1;
+        while (j < command.length && (command[j] === " " || command[j] === "\t")) {
+          j++;
+        }
+        if (
+          j < command.length &&
+          command[j] !== "\r" &&
+          command[j] !== "\n" &&
+          command[j] !== ";"
+        ) {
+          hasSemicolonChain = true;
+        }
+      }
+      atStatementStart = true;
+      continue;
+    }
+    if (ch === "&") {
+      const prev = i > 0 ? command[i - 1] : "";
+      if (prev !== ">" && !atStatementStart) {
+        return false;
+      }
+      if (atStatementStart) {
+        sawLeadingToken = true;
+        atStatementStart = false;
+      }
+      continue;
+    }
+    if (ch === "\r" || ch === "\n") {
+      sawLeadingToken = false;
+      atStatementStart = true;
+      continue;
+    }
+    if (ch === "|" || ch === "(" || ch === "{") {
+      atStatementStart = true;
+      continue;
+    }
+    if (ch === " " || ch === "\t") {
+      continue;
+    }
+    if (atStatementStart && WINDOWS_CMD_QUOTED_SET_AT_POS_RE.test(command.slice(i))) {
+      return false;
+    }
+    sawLeadingToken = true;
+    atStatementStart = false;
+  }
+
+  return hasSemicolonChain;
+}
+
 function stripQuotedSpans(command: string, stripDoubleQuotes: boolean): string {
   let out = "";
   let quote: '"' | "'" | null = null;
@@ -390,7 +541,7 @@ function stripQuotedSpans(command: string, stripDoubleQuotes: boolean): string {
       continue;
     }
     if (quote === '"') {
-      if ((ch === "\\" || ch === "`") && next === '"') {
+      if ((ch === "\\" || ch === "`") && (next === ch || next === '"')) {
         i++;
         if (!stripDoubleQuotes) out += ch + next;
         continue;
@@ -425,7 +576,8 @@ function stripQuotedSpans(command: string, stripDoubleQuotes: boolean): string {
 
 /**
  * Detects whether a Windows command uses PowerShell syntax (`$env:VAR`, automatic
- * variables, subexpressions, or PascalCase `Verb-Noun` cmdlets outside quotes)
+ * variables, subexpressions, PascalCase `Verb-Noun` cmdlets, or unquoted `; `
+ * statement chaining outside cmd.exe / PowerShell 5.1-incompatible constructs)
  * so cross-platform/cmd commands keep fast `cmd.exe` execution without altering
  * quoting behavior.
  */
@@ -440,7 +592,8 @@ export function needsPowerShellOnWindows(command: string): boolean {
   const unquoted = stripQuotedSpans(command, true);
   return (
     WINDOWS_PS_UNQUOTED_SYNTAX_RE.test(unquoted) ||
-    WINDOWS_PS_CMDLET_RE.test(unquoted)
+    WINDOWS_PS_CMDLET_RE.test(unquoted) ||
+    hasPowerShellSemicolonChaining(command, withoutSingle, unquoted)
   );
 }
 
@@ -469,11 +622,11 @@ export function formatPowerShellCommand(command: string): string {
         continue;
       }
       const afterQuote = trimmed.slice(idx + 1);
-      if (!/^\s+/.test(afterQuote)) {
+      const rest = afterQuote.replace(/^[ \t]+/, "");
+      if (rest.length === afterQuote.length || !rest || /^[\r\n]/.test(rest)) {
         return command;
       }
-      const rest = afterQuote.trimStart();
-      if (rest && !PS_NON_INVOCATION_TAIL_RE.test(rest)) {
+      if (!PS_NON_INVOCATION_TAIL_RE.test(rest)) {
         return `& ${trimmed}`;
       }
       return command;
@@ -568,10 +721,44 @@ export function resetWindowsShellCache(): void {
   pendingWindowsPowerShellProbe = null;
 }
 
+function hasDefinedEnvKey(
+  env: NodeJS.ProcessEnv,
+  key: string,
+  platform: NodeJS.Platform,
+): boolean {
+  if (env[key] !== undefined) return true;
+  if (platform !== "win32") return false;
+  const upper = key.toUpperCase();
+  for (const existing of Object.keys(env)) {
+    if (existing.toUpperCase() === upper && env[existing] !== undefined) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function withNonInteractiveGitEnv(
+  baseEnv: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): NodeJS.ProcessEnv {
+  const result: NodeJS.ProcessEnv = { ...baseEnv };
+  if (!hasDefinedEnvKey(baseEnv, "GIT_TERMINAL_PROMPT", platform)) {
+    result.GIT_TERMINAL_PROMPT = "0";
+  }
+  if (!hasDefinedEnvKey(baseEnv, "GCM_INTERACTIVE", platform)) {
+    result.GCM_INTERACTIVE = "never";
+  }
+  return result;
+}
+
 export async function runShellCommandAsync(
   command: string,
   options: ExecOptions,
 ): Promise<ExecResult> {
+  const effectiveOptions: ExecOptions = {
+    ...options,
+    env: withNonInteractiveGitEnv(options.env),
+  };
   if (process.platform === "win32") {
     const effectiveCommand = unwrapTrivialWindowsPowerShellCommand(command);
     if (needsPowerShellOnWindows(effectiveCommand)) {
@@ -582,13 +769,13 @@ export async function runShellCommandAsync(
           cachedWindowsPowerShellExecPath ?? psBin,
           ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", utf8Command],
           false,
-          options,
+          effectiveOptions,
         );
       }
     }
-    return spawnAndCollect(effectiveCommand, [], true, options);
+    return spawnAndCollect(effectiveCommand, [], true, effectiveOptions);
   }
-  return spawnAndCollect(command, [], true, options);
+  return spawnAndCollect(command, [], true, effectiveOptions);
 }
 
 function spawnAndCollect(
@@ -637,9 +824,10 @@ function spawnAndCollect(
     }
 
     let settleFallbackTimer: NodeJS.Timeout | null = null;
+    let sigkillTimer: NodeJS.Timeout | null = null;
     const timer = setTimeout(() => {
       timedOut = true;
-      killChildTree(child.pid, detached);
+      sigkillTimer = killChildTree(child.pid, detached);
       settleFallbackTimer = setTimeout(() => {
         child.stdout?.destroy();
         child.stderr?.destroy();
@@ -657,6 +845,7 @@ function spawnAndCollect(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (sigkillTimer) clearTimeout(sigkillTimer);
       if (settleFallbackTimer) clearTimeout(settleFallbackTimer);
       resolve({
         exitCode,
@@ -713,18 +902,37 @@ function spawnAndCollect(
 }
 
 let cachedRgAvailable: boolean | null = null;
+let pendingRgProbe: Promise<boolean> | null = null;
 
 export async function isRipgrepAvailable(): Promise<boolean> {
   if (cachedRgAvailable !== null) return cachedRgAvailable;
-  const res = await execBinaryAsync("rg", ["--version"], {
-    cwd: process.cwd(),
-    timeoutMs: 2000,
-    maxOutputBytes: 4096,
-  });
-  cachedRgAvailable = !res.error && res.exitCode === 0;
-  return cachedRgAvailable;
+  if (pendingRgProbe) return pendingRgProbe;
+
+  let probe: Promise<boolean> | null = null;
+  probe = (async () => {
+    try {
+      const res = await execBinaryAsync("rg", ["--version"], {
+        cwd: os.tmpdir(),
+        timeoutMs: 2000,
+        maxOutputBytes: 4096,
+      });
+      const available = !res.error && !res.timedOut && res.exitCode === 0;
+      if (!res.timedOut && pendingRgProbe === probe) {
+        cachedRgAvailable = available;
+      }
+      return available;
+    } finally {
+      if (pendingRgProbe === probe) {
+        pendingRgProbe = null;
+      }
+    }
+  })();
+
+  pendingRgProbe = probe;
+  return probe;
 }
 
 export function resetRipgrepCache(): void {
   cachedRgAvailable = null;
+  pendingRgProbe = null;
 }

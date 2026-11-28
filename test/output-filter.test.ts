@@ -6,6 +6,9 @@ import {
   fitSectionsToByteBudget,
   formatCompactCommandOutput,
   formatCompactCommandOutputWithMeta,
+  formatExitFailureLabel,
+  normalizeTerminalOutput,
+  prepareCompactCommandOutput,
 } from "../src/utils/output-filter.js";
 
 describe("output-filter", () => {
@@ -527,5 +530,208 @@ describe("output-filter", () => {
     assert.ok(elapsedMs < 500, `Expected linear-time < 500ms on adversarial input, took ${elapsedMs.toFixed(1)}ms`);
     assert.ok(res.text.length <= 1000);
     assert.match(res.text, /tail line 15/);
+  });
+
+  it("folds passing test lines containing error-domain words without hiding actual mid-suite failures, and drops ANSI-erased spinner lines", () => {
+    const spinnerRaw =
+      "⠋ Transforming (12/140)...\r\x1B[2K\n⠙ Bundling chunks...\r\x1B[K\n⠹ Resolving...\r\x1B[2K✓ Built client\n\nReal error: boom";
+    assert.equal(normalizeTerminalOutput(spinnerRaw), "✓ Built client\n\nReal error: boom");
+
+    const suiteLines = [
+      ...Array.from(
+        { length: 40 },
+        (_, i) =>
+          `✔ test #${i + 1}: handles invalid error, undefined input, not found, and timeout cleanly (1.2ms)`,
+      ),
+      "✖ ACTUAL_FAILING_TEST_AT_MIDPOINT (4.8ms)",
+      "  AssertionError [ERR_ASSERTION]: Expected status 200 but received 500",
+      ...Array.from(
+        { length: 30 },
+        (_, i) => `      at Layer.handle (/repo/src/router/frame_${i}.ts:${i + 10}:15)`,
+      ),
+      "ℹ tests 41",
+      "ℹ pass 40",
+      "ℹ fail 1",
+    ];
+    const meta = formatCompactCommandOutputWithMeta({
+      stdout: suiteLines.join("\n"),
+      stderr: "",
+      exitCode: 1,
+      timedOut: false,
+      maxChars: 950,
+    });
+    assert.equal(meta.collapsedLines, 40);
+    assert.match(meta.text, /collapsed 40 build\/pass lines/);
+    assert.match(meta.text, /ACTUAL_FAILING_TEST_AT_MIDPOINT/);
+    assert.match(meta.text, /AssertionError \[ERR_ASSERTION\]/);
+    assert.match(meta.text, /ℹ fail 1/);
+  });
+
+  it("formats fatal signal names and shell 128+N exit diagnostics cleanly", () => {
+    assert.equal(formatExitFailureLabel(null, "SIGKILL"), "SIGKILL - possible OOM");
+    assert.equal(formatExitFailureLabel(null, "SIGSEGV"), "SIGSEGV - segmentation fault");
+    assert.equal(formatExitFailureLabel(null, "SIGABRT"), "SIGABRT - process aborted");
+    assert.equal(formatExitFailureLabel(null, "SIGTERM"), "SIGTERM");
+    assert.equal(formatExitFailureLabel(null, "SIGBUS"), "SIGBUS");
+
+    assert.equal(formatExitFailureLabel(137, null), "exit 137 / SIGKILL - possible OOM");
+    assert.equal(formatExitFailureLabel(139, null), "exit 139 / SIGSEGV - segmentation fault");
+    assert.equal(formatExitFailureLabel(134, null), "exit 134 / SIGABRT - process aborted");
+    assert.equal(formatExitFailureLabel(0xc0000005, null), "exit 0xC0000005 / STATUS_ACCESS_VIOLATION");
+    assert.equal(formatExitFailureLabel(-1073741819, null), "exit 0xC0000005 / STATUS_ACCESS_VIOLATION");
+    assert.equal(formatExitFailureLabel(0xc00000fd, null), "exit 0xC00000FD / STATUS_STACK_OVERFLOW");
+    assert.equal(formatExitFailureLabel(0xc0000409, null), "exit 0xC0000409 / STATUS_STACK_BUFFER_OVERRUN");
+    assert.equal(formatExitFailureLabel(1, null), "exit 1");
+    assert.equal(formatExitFailureLabel(null, null), "exit err");
+
+    const sigkillEmpty = prepareCompactCommandOutput({
+      stdout: "",
+      stderr: "",
+      exitCode: null,
+      signal: "SIGKILL",
+      timedOut: false,
+    });
+    assert.equal(sigkillEmpty.kind, "fail-empty");
+    assert.equal(sigkillEmpty.bodyText, "Terminated by SIGKILL - possible OOM");
+
+    const sigsegvEmpty = prepareCompactCommandOutput({
+      stdout: "",
+      stderr: "",
+      exitCode: null,
+      signal: "SIGSEGV",
+      timedOut: false,
+    });
+    assert.equal(sigsegvEmpty.bodyText, "Terminated by SIGSEGV - segmentation fault");
+
+    const exit137Empty = prepareCompactCommandOutput({
+      stdout: "",
+      stderr: "",
+      exitCode: 137,
+      signal: null,
+      timedOut: false,
+    });
+    assert.equal(exit137Empty.bodyText, "Terminated (exit 137 / SIGKILL - possible OOM)");
+
+    const exit139Empty = prepareCompactCommandOutput({
+      stdout: "",
+      stderr: "",
+      exitCode: 139,
+      signal: null,
+      timedOut: false,
+    });
+    assert.equal(exit139Empty.bodyText, "Terminated (exit 139 / SIGSEGV - segmentation fault)");
+
+    const exit134Empty = prepareCompactCommandOutput({
+      stdout: "",
+      stderr: "",
+      exitCode: 134,
+      signal: null,
+      timedOut: false,
+    });
+    assert.equal(exit134Empty.bodyText, "Terminated (exit 134 / SIGABRT - process aborted)");
+
+    const ntstatusEmpty = prepareCompactCommandOutput({
+      stdout: "",
+      stderr: "",
+      exitCode: 0xc0000005,
+      signal: null,
+      timedOut: false,
+    });
+    assert.equal(ntstatusEmpty.bodyText, "Terminated (exit 0xC0000005 / STATUS_ACCESS_VIOLATION)");
+
+    const unknownEmpty = prepareCompactCommandOutput({
+      stdout: "",
+      stderr: "",
+      exitCode: null,
+      timedOut: false,
+    });
+    assert.equal(unknownEmpty.bodyText, "Exited with code unknown");
+  });
+
+  it("preserves TAP, node --test, and Jest failing test headers without error keywords while ignoring mid-line false positives", () => {
+    const filler = (n: number, prefix = "") =>
+      Array.from({ length: n }, (_, i) => `${prefix}neutral log line #${i + 1}: payload state`);
+    const compact = (lines: string[]) =>
+      formatCompactCommandOutputWithMeta({
+        stdout: lines.join("\n"),
+        stderr: "",
+        exitCode: 1,
+        timedOut: false,
+        maxChars: 750,
+      }).text;
+
+    const cases = [
+      {
+        lead: Array.from({ length: 12 }, (_, i) => `ok ${i + 1} - pass #${i + 1}`),
+        body: ["not ok 13 - computes cart discount", "  ---", "  location: '/repo/test/cart.test.ts:42:3'"],
+        tail: ["# fail 1"],
+        expect: [/not ok 13 - computes cart discount/, /cart\.test\.ts:42:3/],
+      },
+      {
+        lead: Array.from({ length: 10 }, (_, i) => `  ✔ pass #${i + 1} (0.4ms)`),
+        body: ["  ✖ calculates shipping total (3.2ms)", "    expected: 25", "    actual: 30"],
+        tail: ["ℹ fail 1"],
+        expect: [/✖ calculates shipping total/, /expected: 25/],
+      },
+      {
+        lead: Array.from({ length: 10 }, (_, i) => `  ✓ pass #${i + 1} (1 ms)`),
+        body: ["  ✕ applies promo code (5 ms)", "    Expected: 20", "    Received: 25"],
+        tail: ["Tests: 1 failed, 10 passed, 11 total"],
+        expect: [/✕ applies promo code/],
+      },
+      {
+        lead: Array.from({ length: 10 }, (_, i) => `@app/web:test: ✔ ok #${i + 1} (1ms)`),
+        body: ["@app/web:test: not ok 11 - validates checkout", "@app/web:test:   expected: true"],
+        tail: ["@app/web:test: # fail 1"],
+        expect: [/@app\/web:test: not ok 11 - validates checkout/],
+      },
+    ];
+    for (const c of cases) {
+      const out = compact([...c.lead, ...c.body, ...filler(40), ...c.tail]);
+      for (const re of c.expect) assert.match(out, re);
+    }
+
+    const hijackOut = formatCompactCommandOutputWithMeta({
+      stdout: [
+        "PASS src/a.test.ts",
+        "  ● Console",
+        "●  (SSG)      prerendered as static HTML",
+        "● (Static)   prerendered as static content",
+        "● (Dynamic)  server-rendered on demand",
+        "● (ISR)      incremental static regeneration",
+        "status check: not ok yet (retrying)",
+        "viewport dims: × 1080",
+        "viewport 1920 × 1080",
+        "status was not ok yet (not okay)",
+        "• Packages in scope: 4",
+        ...filler(20),
+        "  ● Cart › applies tax rate",
+        "    Expected: 10",
+        "    Received: 9",
+        ...filler(40),
+        "Test Suites: 1 failed, 1 total",
+      ].join("\n"),
+      stderr: "",
+      exitCode: 1,
+      timedOut: false,
+      maxChars: 650,
+    }).text;
+    assert.match(hijackOut, /● Cart › applies tax rate/);
+    for (const noise of [/● Console/, /\(SSG\)/, /status check: not ok/, /viewport dims: × 1080/, /1920 × 1080/]) {
+      assert.doesNotMatch(hijackOut, noise);
+    }
+
+    const crossFoldMeta = formatCompactCommandOutputWithMeta({
+      stdout: [
+        ...Array.from({ length: 5 }, (_, i) => `PASS src/a${i}.test.ts ✕ note`),
+        ...filler(16),
+      ].join("\n"),
+      stderr: "",
+      exitCode: 1,
+      timedOut: false,
+      maxChars: 2000,
+    });
+    assert.equal(crossFoldMeta.collapsedLines, 0);
+    assert.match(crossFoldMeta.text, /PASS src\/a0\.test\.ts ✕ note/);
   });
 });

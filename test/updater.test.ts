@@ -6,17 +6,45 @@ import path from "node:path";
 import { after, before, describe, it } from "node:test";
 import { pathToFileURL } from "node:url";
 import {
+  buildGithubReleaseUrl,
+  clearSkippedVersion,
   compareSemver,
   consumeSnapshotUpdateNotice,
+  detectInstallKind,
+  extractGithubSlug,
+  fetchLatestRemoteVersion,
+  getHomeDir,
   pickLatestSemverTag,
   readInstalledVersion,
+  readUpdateState,
   runPluginUpdate,
   shouldTriggerBackgroundCheck,
+  skipUpdateVersion,
+  UPDATER_OPTIONAL_FILES,
   UPDATER_RUNTIME_FILES,
+  validateRepoUrl,
+  verifyStagedPlugin,
+  writeUpdateState,
 } from "../src/utils/updater-core.js";
 
 const REPO_ROOT = process.cwd();
 const INSTALL_SCRIPT = path.join(REPO_ROOT, "scripts", "install.mjs");
+const UPDATER_DIST = path.join(REPO_ROOT, "dist", "updater.mjs");
+
+describe("updater optional files", () => {
+  it("includes README.zh-TW.md in the optional updater file set", () => {
+    assert.ok(UPDATER_OPTIONAL_FILES.includes("README.zh-TW.md"));
+  });
+});
+
+function makeNoGitEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  const cleaned: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (k.toLowerCase() === "path") continue;
+    cleaned[k] = v;
+  }
+  return { ...cleaned, PATH: "", ...extra };
+}
 
 function git(cwd: string, args: string[]): string {
   return execFileSync("git", args, {
@@ -541,5 +569,573 @@ describe("auto-updater", () => {
       await fs.readFile(path.join(lazyUpdateDir, "mcp_config.json"), "utf8"),
     );
     assert.equal(updatedMcpCfg.mcpServers.fast.tools, undefined);
+  });
+
+  it("blocks git option injection in repoUrl, avoids release->main error fallback, and handles verifyStagedPlugin EPIPE/stderr", async () => {
+    // 1. Option-like or control-char repoUrl values are rejected before spawning git
+    for (const bad of ["--upload-pack=evil", "-c", "https://example.com\n--upload-pack=x", ""]) {
+      assert.throws(() => validateRepoUrl(bad), /Invalid update repository URL/);
+      await assert.rejects(
+        () => fetchLatestRemoteVersion({ repoUrl: bad, channel: "release", timeoutMs: 2000 }),
+        /Invalid update repository URL/,
+      );
+    }
+
+    // 2. Transient/unreachable release remote throws immediately instead of falling through to main
+    await assert.rejects(
+      () =>
+        fetchLatestRemoteVersion({
+          repoUrl: pathToFileURL(path.join(rootTmp, "definitely-missing-repo.git")).href,
+          channel: "release",
+          timeoutMs: 3000,
+        }),
+    );
+
+    // 3. verifyStagedPlugin survives immediate crash (EPIPE) and >128 KiB stderr without crashing or deadlocking
+    const crashStage = path.join(rootTmp, "crash-stage");
+    await copyRuntimeFixture(crashStage, "0.9.0", "crash");
+    await fs.writeFile(path.join(crashStage, "dist", "mcp-server.mjs"), "process.exit(1);\n", "utf8");
+    const crashCheck = await verifyStagedPlugin(crashStage);
+    assert.equal(crashCheck.ok, false);
+
+    const loudStage = path.join(rootTmp, "loud-stderr-stage");
+    await copyRuntimeFixture(loudStage, "0.9.1", "loud");
+    await fs.writeFile(
+      path.join(loudStage, "dist", "mcp-server.mjs"),
+      `process.stderr.write("E".repeat(160 * 1024));
+import readline from "node:readline";
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {} }) + "\\n");
+  if (msg.method === "tools/list") process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { tools: [{ name: "a" }, { name: "b" }, { name: "c" }, { name: "d" }] } }) + "\\n");
+});\n`,
+      "utf8",
+    );
+    const loudCheck = await verifyStagedPlugin(loudStage);
+    assert.equal(loudCheck.ok, true);
+
+    // 4. verifyStagedPlugin succeeds even when ambient AGY_FAST_TOOLS is set in parent env
+    const ambientStage = path.join(rootTmp, "ambient-tools-stage");
+    await copyRuntimeFixture(ambientStage, "0.9.2", "ambient");
+    const prevTools = process.env.AGY_FAST_TOOLS;
+    process.env.AGY_FAST_TOOLS = "batch_search,quick_outline,run_checks";
+    try {
+      const ambientCheck = await verifyStagedPlugin(ambientStage);
+      assert.equal(ambientCheck.ok, true, ambientCheck.reason);
+    } finally {
+      if (prevTools === undefined) delete process.env.AGY_FAST_TOOLS;
+      else process.env.AGY_FAST_TOOLS = prevTools;
+    }
+  });
+
+  it("hardens GitHub API fallbacks (no release->main downgrade on error, sanitized html_url, cross-platform home dir)", async () => {
+    // 1. GitHub slug extraction & release URL builder
+    assert.equal(extractGithubSlug("https://github.com/INK-Q/agy-fast.git"), "INK-Q/agy-fast");
+    assert.equal(extractGithubSlug("git@github.com:INK-Q/agy-fast.git"), "INK-Q/agy-fast");
+    assert.equal(extractGithubSlug("https://evil.example/github.com/INK-Q/agy-fast.git"), null);
+    assert.equal(extractGithubSlug("file:///tmp/origin.git"), null);
+    assert.equal(
+      buildGithubReleaseUrl("https://github.com/INK-Q/agy-fast.git", "v0.3.1"),
+      "https://github.com/INK-Q/agy-fast/releases/tag/v0.3.1",
+    );
+    assert.equal(
+      buildGithubReleaseUrl("https://github.com/INK-Q/agy-fast.git", "main", "1234567abcdef"),
+      "https://github.com/INK-Q/agy-fast/commit/1234567abcdef",
+    );
+    assert.equal(buildGithubReleaseUrl("file:///tmp/origin.git", "v0.3.1"), undefined);
+
+    // 2. Cross-platform getHomeDir (Windows USERPROFILE, HOMEDRIVE+HOMEPATH, macOS/Linux HOME)
+    assert.equal(getHomeDir({ USERPROFILE: "C:\\Users\\Alice", HOME: "/home/ignored" }, "win32"), "C:\\Users\\Alice");
+    assert.equal(getHomeDir({ HOMEDRIVE: "D:", HOMEPATH: "\\Users\\Bob" }, "win32"), "D:\\Users\\Bob");
+    assert.equal(getHomeDir({ HOME: "/Users/carol", USERPROFILE: "C:\\ignored" }, "darwin"), "/Users/carol");
+    assert.equal(getHomeDir({ HOME: "/home/dave", USERPROFILE: "C:\\ignored" }, "linux"), "/home/dave");
+
+    const noGitEnv = makeNoGitEnv();
+    const ghRepo = "https://github.com/INK-Q/agy-fast.git";
+
+    // 3. No-git /releases/latest sanitizes untrusted html_url back to github.com
+    const calls1: string[] = [];
+    const relInfo = await fetchLatestRemoteVersion({
+      repoUrl: ghRepo,
+      channel: "release",
+      env: noGitEnv,
+      fetchFn: (async (url: string | URL) => {
+        calls1.push(String(url));
+        return new Response(
+          JSON.stringify({
+            tag_name: "v0.3.5",
+            html_url: "https://evil.example/phish",
+            published_at: "2026-06-01T00:00:00Z",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }) as typeof fetch,
+    });
+    assert.equal(calls1.length, 1);
+    assert.equal(relInfo.version, "0.3.5");
+    assert.equal(relInfo.releaseUrl, "https://github.com/INK-Q/agy-fast/releases/tag/v0.3.5");
+    assert.equal(relInfo.publishedAt, "2026-06-01T00:00:00Z");
+
+    // 4. No-git /releases/latest 404 falls back to /tags?per_page=30 and picks highest stable semver
+    const calls2: string[] = [];
+    const tagsInfo = await fetchLatestRemoteVersion({
+      repoUrl: ghRepo,
+      channel: "release",
+      env: noGitEnv,
+      fetchFn: (async (url: string | URL) => {
+        const u = String(url);
+        calls2.push(u);
+        if (u.endsWith("/releases/latest")) return new Response("Not Found", { status: 404 });
+        return new Response(
+          JSON.stringify([
+            { name: "v0.2.0", commit: { sha: "aaa" } },
+            { name: "v0.3.2-rc.1", commit: { sha: "bbb" } },
+            { name: "v0.3.1", commit: { sha: "ccc" } },
+          ]),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }) as typeof fetch,
+    });
+    assert.deepEqual(calls2, [
+      "https://api.github.com/repos/INK-Q/agy-fast/releases/latest",
+      "https://api.github.com/repos/INK-Q/agy-fast/tags?per_page=30",
+    ]);
+    assert.equal(tagsInfo.version, "0.3.1");
+    assert.equal(tagsInfo.commitSha, "ccc");
+
+    // 5. No-git confirmed untagged (/releases/latest 404 + /tags 200 []) falls back to /commits/main
+    const calls3: string[] = [];
+    const mainApiInfo = await fetchLatestRemoteVersion({
+      repoUrl: ghRepo,
+      channel: "release",
+      env: noGitEnv,
+      fetchFn: (async (url: string | URL) => {
+        const u = String(url);
+        calls3.push(u);
+        if (u.endsWith("/releases/latest")) return new Response("Not Found", { status: 404 });
+        if (u.includes("/tags?")) return new Response("[]", { status: 200 });
+        return new Response(
+          JSON.stringify({
+            sha: "deadbeef1234567890",
+            html_url: "https://github.com/INK-Q/agy-fast/commit/deadbeef1234567890",
+            commit: { committer: { date: "2026-06-02T00:00:00Z" } },
+          }),
+          { status: 200 },
+        );
+      }) as typeof fetch,
+    });
+    assert.equal(calls3.length, 3);
+    assert.equal(mainApiInfo.ref, "main");
+    assert.equal(mainApiInfo.version, null);
+    assert.equal(mainApiInfo.commitSha, "deadbeef1234567890");
+    assert.equal(mainApiInfo.releaseUrl, "https://github.com/INK-Q/agy-fast/commit/deadbeef1234567890");
+
+    // 6. P0-2: Rate limit (403), 5xx, or network error on /releases/latest throws IMMEDIATELY (never calls /tags or /commits/main)
+    for (const status of [403, 500]) {
+      const errCalls: string[] = [];
+      await assert.rejects(
+        () =>
+          fetchLatestRemoteVersion({
+            repoUrl: ghRepo,
+            channel: "release",
+            env: noGitEnv,
+            fetchFn: (async (url: string | URL) => {
+              errCalls.push(String(url));
+              return new Response("error", { status });
+            }) as typeof fetch,
+          }),
+        new RegExp(`HTTP ${status}`),
+      );
+      assert.equal(errCalls.length, 1);
+    }
+
+    const netErrCalls: string[] = [];
+    await assert.rejects(
+      () =>
+        fetchLatestRemoteVersion({
+          repoUrl: ghRepo,
+          channel: "release",
+          env: noGitEnv,
+          fetchFn: (async (url: string | URL) => {
+            netErrCalls.push(String(url));
+            throw new Error("socket hang up");
+          }) as typeof fetch,
+        }),
+      /socket hang up/,
+    );
+    assert.equal(netErrCalls.length, 1);
+
+    // 7. P0-2: /releases/latest 404 + /tags 403 throws IMMEDIATELY (never calls /commits/main)
+    const tagsErrCalls: string[] = [];
+    await assert.rejects(
+      () =>
+        fetchLatestRemoteVersion({
+          repoUrl: ghRepo,
+          channel: "release",
+          env: noGitEnv,
+          fetchFn: (async (url: string | URL) => {
+            const u = String(url);
+            tagsErrCalls.push(u);
+            if (u.endsWith("/releases/latest")) return new Response("Not Found", { status: 404 });
+            return new Response("rate limited", { status: 403 });
+          }) as typeof fetch,
+        }),
+      /HTTP 403/,
+    );
+    assert.equal(tagsErrCalls.length, 2);
+
+    // 8. P0-2: Clean exit-0 git ls-remote on an untagged repo skips GitHub API completely
+    const untaggedBare = path.join(rootTmp, "p0-untagged.git");
+    const untaggedWork = path.join(rootTmp, "p0-untagged-work");
+    await fs.mkdir(untaggedBare, { recursive: true });
+    git(untaggedBare, ["init", "--bare"]);
+    await fs.mkdir(untaggedWork, { recursive: true });
+    git(untaggedWork, ["init", "-b", "main"]);
+    git(untaggedWork, ["config", "user.email", "test@example.com"]);
+    git(untaggedWork, ["config", "user.name", "Test"]);
+    await copyRuntimeFixture(untaggedWork, "0.2.0", "untagged");
+    git(untaggedWork, ["add", "."]);
+    git(untaggedWork, ["commit", "-m", "init"]);
+    git(untaggedWork, ["remote", "add", "origin", pathToFileURL(untaggedBare).href]);
+    git(untaggedWork, ["push", "origin", "main"]);
+
+    let fetchCount = 0;
+    const gitUntaggedInfo = await fetchLatestRemoteVersion({
+      repoUrl: pathToFileURL(untaggedBare).href,
+      channel: "release",
+      fetchFn: (async () => {
+        fetchCount++;
+        throw new Error("should not call fetch");
+      }) as typeof fetch,
+    });
+    assert.equal(fetchCount, 0);
+    assert.equal(gitUntaggedInfo.source, "git-main");
+    assert.equal(gitUntaggedInfo.version, null);
+  });
+
+  it("supports skip/clear version, compact tailored notices, main-channel notify, and clears stale available* on post-clone up-to-date", async () => {
+    const fakeHome = path.join(rootTmp, "home-skip-notices");
+    const pluginDir = path.join(fakeHome, ".gemini", "config", "plugins", "agy-fast");
+    const cacheDir = path.join(fakeHome, ".gemini", "cache", "agy-fast");
+    await copyRuntimeFixture(pluginDir, "0.2.0", "release-0.2.0");
+
+    const envBase: NodeJS.ProcessEnv = {
+      ...process.env,
+      HOME: fakeHome,
+      USERPROFILE: fakeHome,
+      AGY_FAST_CACHE_DIR: cacheDir,
+      AGY_FAST_REPO: originRepoUrl,
+    };
+
+    // 1. Skip v0.3.0 -> suppresses notice AND prevents background auto-mode overwrite
+    const skipped = await skipUpdateVersion("v0.3.0", envBase);
+    assert.equal(skipped.version, "0.3.0");
+    await assert.rejects(() => skipUpdateVersion("bad-ver", envBase), /Invalid version/);
+
+    const bgSkipped = await runPluginUpdate({
+      pluginDir,
+      background: true,
+      env: { ...envBase, AGY_FAST_AUTO_UPDATE: "auto" },
+    });
+    assert.equal(bgSkipped.status, "available");
+    assert.equal(await readInstalledVersion(pluginDir), "0.2.0");
+    assert.equal(await consumeSnapshotUpdateNotice(pluginDir, "0.2.0", envBase), null);
+
+    // 2. Clear skip -> compact notice appears once (<= 280 bytes) with prompt & skip flags
+    await clearSkippedVersion(envBase);
+    await writeUpdateState(
+      {
+        availableVersion: "0.3.0",
+        availableReason: "notify mode",
+        availableInstallKind: "copied",
+        availableReleaseUrl: "https://github.com/INK-Q/agy-fast/releases/tag/v0.3.0",
+      },
+      envBase,
+    );
+    const copiedNotice = await consumeSnapshotUpdateNotice(pluginDir, "0.2.0", envBase);
+    assert.ok(copiedNotice);
+    assert.match(copiedNotice, /Update available: v0\.2\.0 -> v0\.3\.0/);
+    assert.match(copiedNotice, /update --prompt/);
+    assert.match(copiedNotice, /--skip-version 0\.3\.0/);
+    const expectedInstallerPath = path.join(pluginDir, "scripts", "install.mjs");
+    const fixedOverheadBytes =
+      Buffer.byteLength(copiedNotice, "utf8") -
+      Buffer.byteLength(expectedInstallerPath, "utf8");
+    assert.ok(
+      fixedOverheadBytes <= 185,
+      `Expected compact notice fixed overhead <= 185B, got ${fixedOverheadBytes}B: ${copiedNotice}`,
+    );
+
+    // 3. Symlink/dev-source notice gives tailored pull & build wording
+    await writeUpdateState(
+      {
+        availableVersion: "0.3.1",
+        availableReason: "linked dev install",
+        availableInstallKind: "symlink",
+        notifiedAvailableVersion: undefined,
+      },
+      envBase,
+    );
+    const linkNotice = await consumeSnapshotUpdateNotice(pluginDir, "0.2.0", envBase);
+    assert.match(linkNotice ?? "", /Pull & build in repo/);
+    assert.doesNotMatch(linkNotice ?? "", /update --prompt/);
+
+    // 4. Main-channel commit notice fires once per commit
+    await writeUpdateState(
+      {
+        availableVersion: undefined,
+        availableRef: "main",
+        availableCommit: "abcdef1234567890",
+        availableInstallKind: "copied",
+        availableReason: "notify mode",
+        notifiedAvailableCommit: undefined,
+      },
+      envBase,
+    );
+    const mainNotice = await consumeSnapshotUpdateNotice(pluginDir, "0.2.0", envBase);
+    assert.match(mainNotice ?? "", /Update available on main \(abcdef1\)/);
+    assert.equal(await consumeSnapshotUpdateNotice(pluginDir, "0.2.0", envBase), null);
+
+    // 5. P1-2: Post-clone main-channel up-to-date clears ALL stale available* fields
+    const untaggedBare = path.join(rootTmp, "p1-2-untagged.git");
+    const untaggedWork = path.join(rootTmp, "p1-2-untagged-work");
+    await fs.mkdir(untaggedBare, { recursive: true });
+    git(untaggedBare, ["init", "--bare"]);
+    await fs.mkdir(untaggedWork, { recursive: true });
+    git(untaggedWork, ["init", "-b", "main"]);
+    git(untaggedWork, ["config", "user.email", "test@example.com"]);
+    git(untaggedWork, ["config", "user.name", "Test"]);
+    await copyRuntimeFixture(untaggedWork, "0.2.0", "untagged-0.2.0");
+    git(untaggedWork, ["add", "."]);
+    git(untaggedWork, ["commit", "-m", "v0.2.0"]);
+    git(untaggedWork, ["remote", "add", "origin", pathToFileURL(untaggedBare).href]);
+    git(untaggedWork, ["push", "origin", "main"]);
+
+    const v3Plugin = path.join(rootTmp, "p1-2-v3-plugin");
+    const v3Cache = path.join(rootTmp, "p1-2-v3-cache");
+    await copyRuntimeFixture(v3Plugin, "0.3.0", "local-0.3.0");
+    const v3Env: NodeJS.ProcessEnv = { ...envBase, AGY_FAST_CACHE_DIR: v3Cache };
+    await writeUpdateState(
+      {
+        availableVersion: "0.4.0",
+        availableRef: "main",
+        availableCommit: "oldsha1234567",
+        availableReleaseUrl: "https://github.com/INK-Q/agy-fast/commit/oldsha1234567",
+        availableInstallKind: "copied",
+        availableReason: "notify mode",
+      },
+      v3Env,
+    );
+
+    const postCloneUpToDate = await runPluginUpdate({
+      pluginDir: v3Plugin,
+      channel: "main",
+      repoUrl: pathToFileURL(untaggedBare).href,
+      env: v3Env,
+    });
+    assert.equal(postCloneUpToDate.status, "up-to-date");
+    const clearedState = await readUpdateState(v3Env);
+    assert.equal(clearedState.availableVersion, undefined);
+    assert.equal(clearedState.availableRef, undefined);
+    assert.equal(clearedState.availableCommit, undefined);
+    assert.equal(clearedState.availableReleaseUrl, undefined);
+    assert.equal(clearedState.availableInstallKind, undefined);
+    assert.equal(clearedState.availableReason, undefined);
+  });
+
+  it("hardens updater CLI flags/JSON errors, prefers repoUpdater for --skip-version, syncs ACP/tool-loading on up-to-date --prompt, and renders doctor state accurately", async () => {
+    const cliHome = path.join(rootTmp, "home-prompt-cli");
+    const pluginDir = path.join(cliHome, ".gemini", "config", "plugins", "agy-fast");
+    const cacheDir = path.join(cliHome, ".gemini", "cache", "agy-fast");
+    await copyRuntimeFixture(pluginDir, "0.2.0", "release-0.2.0");
+
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      HOME: cliHome,
+      USERPROFILE: cliHome,
+      AGY_FAST_CACHE_DIR: cacheDir,
+      AGY_FAST_REPO: originRepoUrl,
+    };
+    delete env.GEMINI_HOME;
+    delete env.ANTIGRAVITY_APP_DATA_DIR;
+
+    // 1. P0-1 & P1-3: dist/updater.mjs rejects unknown flags, missing/flag-like values, and invalid semver with JSON error
+    for (const badArgs of [
+      ["--unknown-flag", "--json"],
+      ["--skip-version", "--json"],
+      ["--skip-version", "not-semver", "--json"],
+    ]) {
+      let exitCode = 0;
+      let stdout = "";
+      try {
+        stdout = execFileSync(process.execPath, [UPDATER_DIST, ...badArgs], {
+          env,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+      } catch (err: unknown) {
+        const e = err as { status?: number; stdout?: string };
+        exitCode = e.status ?? 1;
+        stdout = e.stdout ?? "";
+      }
+      assert.notEqual(exitCode, 0, `Expected non-zero exit for ${badArgs.join(" ")}`);
+      const parsed = JSON.parse(stdout.trim()) as { status?: string; error?: string };
+      assert.equal(parsed.status, "error");
+      assert.ok(parsed.error && parsed.error.length > 0);
+    }
+
+    // 2. P0-1: install.mjs update --skip-version prefers repoUpdater even when installed dist/updater.mjs is an old stub that would wrongly upgrade
+    const legacyDir = path.join(rootTmp, "legacy-v030-install");
+    const legacyCache = path.join(rootTmp, "legacy-v030-cache");
+    await copyRuntimeFixture(legacyDir, "0.2.0", "legacy-0.2.0");
+    await fs.writeFile(
+      path.join(legacyDir, "dist", "updater.mjs"),
+      `process.stdout.write(JSON.stringify({ status: "updated", currentVersion: "0.2.0", latestVersion: "9.9.9", message: "LEGACY UPGRADED!" }) + "\\n");\n`,
+      "utf8",
+    );
+    const legacySkipOut = execFileSync(
+      process.execPath,
+      [INSTALL_SCRIPT, "update", "--skip-version", "0.3.0", "--target", legacyDir],
+      { env: { ...env, AGY_FAST_CACHE_DIR: legacyCache }, encoding: "utf8" },
+    );
+    assert.match(legacySkipOut, /Skipped agy-fast v0\.3\.0/);
+    assert.equal(await readInstalledVersion(legacyDir), "0.2.0");
+    assert.equal((await readUpdateState({ ...env, AGY_FAST_CACHE_DIR: legacyCache })).skippedVersion, "0.3.0");
+
+    // 3. Interactive update --prompt: decline (n), skip (s), clear skip, then accept (y)
+    const declineOut = execFileSync(
+      process.execPath,
+      [INSTALL_SCRIPT, "update", "--prompt", "--target", pluginDir],
+      { env, input: "n\n", encoding: "utf8" },
+    );
+    assert.match(declineOut, /Update declined/);
+    assert.equal(await readInstalledVersion(pluginDir), "0.2.0");
+
+    const skipPromptOut = execFileSync(
+      process.execPath,
+      [INSTALL_SCRIPT, "update", "--prompt", "--target", pluginDir],
+      { env, input: "s\n", encoding: "utf8" },
+    );
+    assert.match(skipPromptOut, /Skipped agy-fast v0\.3\.0/);
+    assert.equal((await readUpdateState(env)).skippedVersion, "0.3.0");
+    assert.equal(await readInstalledVersion(pluginDir), "0.2.0");
+
+    const clearOut = execFileSync(
+      process.execPath,
+      [INSTALL_SCRIPT, "update", "--skip-version", "none", "--target", pluginDir],
+      { env, encoding: "utf8" },
+    );
+    assert.match(clearOut, /Cleared skipped/);
+    assert.equal((await readUpdateState(env)).skippedVersion, undefined);
+
+    const acceptOut = execFileSync(
+      process.execPath,
+      [INSTALL_SCRIPT, "update", "--prompt", "--target", pluginDir],
+      { env, input: "y\n", encoding: "utf8" },
+    );
+    assert.match(acceptOut, /Updated agy-fast v0\.2\.0 -> v0\.3\.0/);
+    assert.equal(await readInstalledVersion(pluginDir), "0.3.0");
+
+    // 4. P1-1: update --prompt when already up-to-date STILL applies --tool-loading AND syncs T3 Code ACP isolated profile
+    const t3ProfileRoot = path.join(cliHome, ".t3", "userdata", "providers", "antigravity", "sync1234");
+    await fs.mkdir(path.join(t3ProfileRoot, "config"), { recursive: true });
+    const t3PluginDir = path.join(t3ProfileRoot, "config", "plugins", "agy-fast");
+
+    const upToDatePromptOut = execFileSync(
+      process.execPath,
+      [INSTALL_SCRIPT, "update", "--prompt", "--tool-loading", "lazy"],
+      { env, encoding: "utf8" },
+    );
+    assert.match(upToDatePromptOut, /already up to date/);
+    assert.match(upToDatePromptOut, /Synced T3 Code ACP \(sync1234\)/);
+    const mcpCfgAfter = JSON.parse(
+      await fs.readFile(path.join(pluginDir, "mcp_config.json"), "utf8"),
+    );
+    assert.equal(mcpCfgAfter.mcpServers.fast.tools, undefined);
+    assert.equal(await readInstalledVersion(t3PluginDir), "0.3.0");
+
+    // 5. P2: doctor hides stale availableVersion/skippedVersion <= installedVersion, shows active skip + lastCheckAt + lastError, and surfaces main-channel commit
+    await writeUpdateState(
+      {
+        lastCheckAt: "2026-06-03T10:00:00Z",
+        availableVersion: "0.3.0",
+        skippedVersion: "0.3.0",
+        lastError: undefined,
+      },
+      env,
+    );
+    const staleDoc = execFileSync(
+      process.execPath,
+      [INSTALL_SCRIPT, "doctor", "--target", pluginDir],
+      { env, encoding: "utf8" },
+    );
+    assert.doesNotMatch(staleDoc, /update available: v0\.3\.0/);
+    assert.doesNotMatch(staleDoc, /skipped: v0\.3\.0/);
+    assert.match(staleDoc, /last check: 2026-06-03T10:00:00Z/);
+
+    await writeUpdateState(
+      {
+        lastCheckAt: "2026-06-03T11:00:00Z",
+        availableVersion: "0.4.0",
+        skippedVersion: "0.4.0",
+        lastError: "temporary timeout",
+      },
+      env,
+    );
+    const skippedDoc = execFileSync(
+      process.execPath,
+      [INSTALL_SCRIPT, "doctor", "--target", pluginDir],
+      { env, encoding: "utf8" },
+    );
+    assert.match(skippedDoc, /skipped: v0\.4\.0/);
+    assert.match(skippedDoc, /last check: 2026-06-03T11:00:00Z/);
+    assert.match(skippedDoc, /last error: temporary timeout/);
+    assert.doesNotMatch(skippedDoc, /update available: v0\.4\.0/);
+
+    await writeUpdateState(
+      {
+        lastCheckAt: "2026-06-03T12:00:00Z",
+        availableVersion: undefined,
+        skippedVersion: undefined,
+        availableRef: "main",
+        availableCommit: "abcdef1234567890",
+        availableReleaseUrl: "https://github.com/INK-Q/agy-fast/commit/abcdef1234567890",
+        lastError: undefined,
+      },
+      env,
+    );
+    const mainDoc = execFileSync(
+      process.execPath,
+      [INSTALL_SCRIPT, "doctor", "--target", pluginDir],
+      { env, encoding: "utf8" },
+    );
+    assert.match(mainDoc, /update available: main \(abcdef1\)/);
+    assert.match(mainDoc, /Release: https:\/\/github\.com\/INK-Q\/agy-fast\/commit\/abcdef1234567890/);
+  });
+
+  it("treats copied installs inside plugins/agy-fast with src/ as copied instead of dev-source", async () => {
+    const pluginWithSrc = path.join(rootTmp, "profile", "plugins", "agy-fast");
+    await copyRuntimeFixture(pluginWithSrc, "0.2.0", "plugin-with-src");
+    await fs.mkdir(path.join(pluginWithSrc, "src"), { recursive: true });
+    await fs.writeFile(path.join(pluginWithSrc, "src", "dummy.ts"), "export {};\n", "utf8");
+    assert.equal(await detectInstallKind(pluginWithSrc), "copied");
+
+    const mixedCaseWithSrc = path.join(rootTmp, "profile-case", "Plugins", "AGY-FAST");
+    await copyRuntimeFixture(mixedCaseWithSrc, "0.2.0", "mixed-case-with-src");
+    await fs.mkdir(path.join(mixedCaseWithSrc, "src"), { recursive: true });
+    await fs.writeFile(path.join(mixedCaseWithSrc, "src", "dummy.ts"), "export {};\n", "utf8");
+    assert.equal(await detectInstallKind(mixedCaseWithSrc), "copied");
+
+    const outsideWithSrc = path.join(rootTmp, "workspace", "agy-fast");
+    await copyRuntimeFixture(outsideWithSrc, "0.2.0", "outside-with-src");
+    await fs.mkdir(path.join(outsideWithSrc, "src"), { recursive: true });
+    await fs.writeFile(path.join(outsideWithSrc, "src", "dummy.ts"), "export {};\n", "utf8");
+    assert.equal(await detectInstallKind(outsideWithSrc), "dev-source");
+
+    const linkedPluginDir = path.join(rootTmp, "profile-link", "plugins", "agy-fast");
+    await fs.mkdir(path.dirname(linkedPluginDir), { recursive: true });
+    await fs.symlink(outsideWithSrc, linkedPluginDir, process.platform === "win32" ? "junction" : "dir");
+    assert.equal(await detectInstallKind(linkedPluginDir), "symlink");
   });
 });

@@ -7,21 +7,60 @@ export function stripAnsi(text: string): string {
   return text.replace(ANSI_REGEX, "");
 }
 
+// eslint-disable-next-line no-control-regex
+const LINE_ERASE_CSI_RE = /\x1B\[(?:2K|0?K)/;
+// eslint-disable-next-line no-control-regex
+const LEADING_CLEAR_TO_EOL_RE = /^(?:\x1B\[0?K)+/;
+
 /**
- * Clean terminal carriage-return progress overwrites so only the final frame of
- * each line remains.
+ * Clean terminal carriage-return progress overwrites and ANSI line-erase sequences
+ * (`\x1b[2K`, `\x1b[K`, `\x1b[0K`) so cleared spinner frames never leak into output.
  */
 export function normalizeTerminalOutput(raw: string): string {
-  const clean = stripAnsi(raw).replace(/\r\n/g, "\n");
-  return clean
-    .split("\n")
-    .map((line) => {
-      if (!line.includes("\r")) return line;
-      const parts = line.split("\r").filter((p) => p.length > 0);
-      return parts[parts.length - 1] ?? "";
-    })
-    .join("\n")
-    .trimEnd();
+  const rawLines = raw.replace(/\r\n/g, "\n").split("\n");
+  const normalizedLines: string[] = [];
+
+  for (const rawLine of rawLines) {
+    if (rawLine.length === 0) {
+      normalizedLines.push("");
+      continue;
+    }
+
+    const hadLineErase = LINE_ERASE_CSI_RE.test(rawLine);
+    let working = rawLine;
+    const lastFullErase = working.lastIndexOf("\x1B[2K");
+    if (lastFullErase !== -1) {
+      working = working.slice(lastFullErase + 4);
+    }
+
+    if (!working.includes("\r") && !hadLineErase) {
+      normalizedLines.push(stripAnsi(working));
+      continue;
+    }
+
+    let currentFrame = "";
+    const crFrames = working.split("\r");
+    for (let idx = 0; idx < crFrames.length; idx++) {
+      let seg = crFrames[idx]!;
+      if (idx > 0 && LEADING_CLEAR_TO_EOL_RE.test(seg)) {
+        seg = seg.replace(LEADING_CLEAR_TO_EOL_RE, "");
+        currentFrame = stripAnsi(seg);
+        continue;
+      }
+      const cleanSeg = stripAnsi(seg);
+      if (cleanSeg.length > 0) {
+        currentFrame = cleanSeg;
+      }
+    }
+
+    if (hadLineErase && currentFrame.length === 0) {
+      // Transient progress/spinner line explicitly cleared before newline/EOF
+      continue;
+    }
+    normalizedLines.push(currentFrame);
+  }
+
+  return normalizedLines.join("\n").trimEnd();
 }
 
 /**
@@ -423,21 +462,22 @@ function stripBenignZeroCounts(line: string): string {
 }
 
 const ERROR_LINE_PATTERN =
-  /(?:\berr!|\b(?:errors?|fail(?:ed|ing|ure|ures)?|exception|traceback|panic|fatal|assertion|syntaxerror|typeerror|referenceerror|zoderror|validationerror|ts\d{4}|e\d{4}|cannot find|not found|unexpected|undefined)\b|caused by:|application failed to start|compilation error|<<<\s*(?:failure|error)|找不到符号|符号:|位置:)/i;
+  /(?:\berr!|\b(?:errors?|fail(?:ed|ing|ure|ures)?|exception|traceback|panic|fatal|assertion|syntaxerror|typeerror|referenceerror|zoderror|validationerror|ts\d{4}|e\d{4}|cannot find|not found|unexpected|undefined)\b|^\s*(?:not ok\b|[✖✕✘✗×]\s+\S|●\s+(?!Console\s*$|\((?:SSG|Static|Dynamic|ISR)\)(?:\s|$))\S)|caused by:|application failed to start|compilation error|<<<\s*(?:failure|error)|找不到符号|符号:|位置:)/i;
 
 const ROOT_CAUSE_HEADER_PATTERN =
   /(?:^\s*(?:description|action):|caused by:|application failed to start|⎯\s*failed tests|compilation error)/i;
 
 // Strict superset of ERROR_LINE_PATTERN plus warnings, crashes, and localized failure terms
 const FOLD_DANGER_TOKEN_PATTERN =
-  /(?:\berr!|\b(?:errors?|fail(?:ed|ing|ure|ures)?|warns?|warnings?|exceptions?|tracebacks?|panics?|fatals?|assertions?|syntaxerror|typeerror|referenceerror|zoderror|validationerror|ts\d{4}|e\d{4}|cannot find|not found|unexpected|undefined|compilation error|killed|sigkill|sigsegv|sigabrt|oom|out of memory|timed out|timeout|refused|denied|permission|unhandled|mismatched|mismatch)\b|\bexit\s+(?:status|code)\s+[1-9]\d*\b|caused by:|application failed to start|<<<\s*(?:failure|error)|[✖✘✗×]\s+|找不到符号|符号:|位置:|错误|失败|异常|警告)/i;
+  /(?:\berr!|\b(?:errors?|fail(?:ed|ing|ure|ures)?|warns?|warnings?|exceptions?|tracebacks?|panics?|fatals?|assertions?|syntaxerror|typeerror|referenceerror|zoderror|validationerror|ts\d{4}|e\d{4}|cannot find|not found|unexpected|undefined|compilation error|killed|sigkill|sigsegv|sigabrt|oom|out of memory|timed out|timeout|refused|denied|permission|unhandled|mismatched|mismatch)\b|\bexit\s+(?:status|code)\s+[1-9]\d*\b|caused by:|application failed to start|<<<\s*(?:failure|error)|[✖✕✘✗×]\s+|找不到符号|符号:|位置:|错误|失败|异常|警告)/i;
 
 function isErrorLine(line: string): boolean {
   return ERROR_LINE_PATTERN.test(stripBenignZeroCounts(line));
 }
 
 function hasFoldDangerToken(line: string): boolean {
-  return FOLD_DANGER_TOKEN_PATTERN.test(stripBenignZeroCounts(line));
+  const cleaned = stripBenignZeroCounts(line);
+  return ERROR_LINE_PATTERN.test(cleaned) || FOLD_DANGER_TOKEN_PATTERN.test(cleaned);
 }
 
 const JSON_INFO_LOG_PATTERNS: RegExp[] = [
@@ -506,21 +546,41 @@ const GREEN_BUILD_OR_PASS_PATTERNS: RegExp[] = [
   /^\[INFO\]\s*(?:---\s+\S|Building\s+\S|Compiling\s+\S|Changes detected|Nothing to compile|Copying\s+\d+|Using\s+'[^']+'\s+encoding|Downloading\b|Downloaded\b|Installing\s+\S|Packaging\s+\S|Tests run:\s*\d+,\s*Failures:\s*0,\s*Errors:\s*0\b|Results:|Running\s+\S|Reactor Summary|BUILD SUCCESS|Total time:|Finished at:|-+\s*$|$)/i,
 ];
 
+// Explicit test-runner PASS verdicts whose trailing test description/path may
+// legitimately mention domain words like "error", "undefined", "timeout", or "invalid"
+const UNAMBIGUOUS_TEST_PASS_PATTERNS: RegExp[] = [
+  /^[✓✔]\s+(?!built\b|done\b|\d+\s+modules?\s+transformed\b)\S/,
+  /^---\s+PASS:\s+\S/,
+  /^ok\s+\d+\s+-\s+\S/,
+  /^ok\t\S/,
+  /^test\s+\S+\s+\.\.\.\s+ok\s*$/,
+  /^PASS\s+\S+\.(?:[cm]?[jt]sx?|py|go|rs|rb|java|kt|cs|php|vue|svelte)\b/,
+];
+
+function isUnambiguousTestPassLine(trimmed: string): boolean {
+  if (!trimmed || /[✖✕✘✗×]/.test(trimmed)) return false;
+  return UNAMBIGUOUS_TEST_PASS_PATTERNS.some((re) => re.test(trimmed));
+}
+
 const MIN_FOLD_RUN_LINES = 4;
 const PROTECTED_TAIL_LINES = 15;
 
 function isGreenBuildOrPassLine(line: string): boolean {
   const trimmed = line.trim();
   if (!trimmed) return false;
+  if (isUnambiguousTestPassLine(trimmed)) return true;
+
+  const prefixMatch = MONOREPO_PREFIX_PATTERN.exec(trimmed);
+  const inner = prefixMatch ? trimmed.slice(prefixMatch[0].length).trim() : "";
+  if (inner && isUnambiguousTestPassLine(inner)) return true;
+
   if (hasFoldDangerToken(trimmed)) return false;
 
   if (GREEN_BUILD_OR_PASS_PATTERNS.some((re) => re.test(trimmed))) {
     return true;
   }
 
-  const prefixMatch = MONOREPO_PREFIX_PATTERN.exec(trimmed);
   if (prefixMatch) {
-    const inner = trimmed.slice(prefixMatch[0].length).trim();
     if (!inner) return false;
     if (inner === "Done") return true;
     return GREEN_BUILD_OR_PASS_PATTERNS.some((re) => re.test(inner));
@@ -740,12 +800,24 @@ function compactLongFailureLines(lines: string[], maxChars: number): string {
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
+    const trimmed = line.trim();
+    const monoMatch = MONOREPO_PREFIX_PATTERN.exec(trimmed);
+    const monoInner = monoMatch ? trimmed.slice(monoMatch[0].length).trim() : "";
+    if (
+      isUnambiguousTestPassLine(trimmed) ||
+      (monoInner.length > 0 && isUnambiguousTestPassLine(monoInner))
+    ) {
+      continue;
+    }
     if (ROOT_CAUSE_HEADER_PATTERN.test(line)) {
       if (firstErrorLineIdx === -1) firstErrorLineIdx = i;
       const from = Math.max(0, i - 1);
       const to = Math.min(lines.length - 1, i + 8);
       for (let j = from; j <= to; j++) keepIndices.add(j);
-    } else if (isErrorLine(line)) {
+    } else if (
+      isErrorLine(line) ||
+      (monoInner.length > 0 && !/\s/.test(monoMatch![0].trimEnd()) && isErrorLine(monoInner))
+    ) {
       if (firstErrorLineIdx === -1) firstErrorLineIdx = i;
       const from = Math.max(0, i - 1);
       const to = Math.min(lines.length - 1, i + 3);
@@ -940,10 +1012,56 @@ function compactLongFailureLines(lines: string[], maxChars: number): string {
   return headText.length <= limit ? headText : sliceSafeChars(headText, limit);
 }
 
+function describeFatalExitCode(exitCode: number | null): string | null {
+  switch (exitCode) {
+    case 137:
+      return "exit 137 / SIGKILL - possible OOM";
+    case 139:
+      return "exit 139 / SIGSEGV - segmentation fault";
+    case 134:
+      return "exit 134 / SIGABRT - process aborted";
+    case 0xc0000005:
+    case -1073741819:
+      return "exit 0xC0000005 / STATUS_ACCESS_VIOLATION";
+    case 0xc00000fd:
+    case -1073741571:
+      return "exit 0xC00000FD / STATUS_STACK_OVERFLOW";
+    case 0xc0000409:
+    case -1073740791:
+      return "exit 0xC0000409 / STATUS_STACK_BUFFER_OVERRUN";
+    default:
+      return null;
+  }
+}
+
+export function formatExitFailureLabel(
+  exitCode: number | null,
+  signal?: NodeJS.Signals | null,
+): string {
+  if (signal) {
+    switch (signal) {
+      case "SIGKILL":
+        return "SIGKILL - possible OOM";
+      case "SIGSEGV":
+        return "SIGSEGV - segmentation fault";
+      case "SIGABRT":
+        return "SIGABRT - process aborted";
+      case "SIGTERM":
+        return "SIGTERM";
+      default:
+        return String(signal);
+    }
+  }
+  const fatalExit = describeFatalExitCode(exitCode);
+  if (fatalExit) return fatalExit;
+  return `exit ${exitCode ?? "err"}`;
+}
+
 export interface FormatCompactCommandOutputParams {
   stdout: string;
   stderr: string;
   exitCode: number | null;
+  signal?: NodeJS.Signals | null;
   timedOut: boolean;
   error?: string;
   maxChars: number;
@@ -1027,9 +1145,15 @@ export function prepareCompactCommandOutput(
   }
 
   if (!combined) {
+    const fatalExitLabel = params.signal ? null : describeFatalExitCode(params.exitCode);
+    const bodyText = params.signal
+      ? `Terminated by ${formatExitFailureLabel(params.exitCode, params.signal)}`
+      : fatalExitLabel
+        ? `Terminated (${fatalExitLabel})`
+        : `Exited with code ${params.exitCode ?? "unknown"}`;
     return {
       kind: "fail-empty",
-      bodyText: `Exited with code ${params.exitCode ?? "unknown"}`,
+      bodyText,
       collapsedLines: 0,
       rawLines: 0,
       rawChars: 0,

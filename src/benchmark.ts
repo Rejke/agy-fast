@@ -8,7 +8,23 @@ import {
   formatMetricsMarkdown,
   formatUsageSplitMarkdown,
   type AnalyzeOptions,
+  type SkippedTranscriptFile,
 } from "./benchmark-core.js";
+
+function warnSkippedFiles(skippedFiles: SkippedTranscriptFile[]): void {
+  if (skippedFiles.length === 0) return;
+  const maxShown = 10;
+  const lines = [
+    `Warning: skipped ${skippedFiles.length} unreadable/corrupted transcript file(s):`,
+  ];
+  for (const item of skippedFiles.slice(0, maxShown)) {
+    lines.push(`  - ${item.path}: ${item.reason}`);
+  }
+  if (skippedFiles.length > maxShown) {
+    lines.push(`  ... and ${skippedFiles.length - maxShown} more`);
+  }
+  process.stderr.write(`${lines.join("\n")}\n`);
+}
 
 async function assertPathsExist(paths: string[]): Promise<boolean> {
   for (const p of paths) {
@@ -220,13 +236,15 @@ async function main(argv: string[]): Promise<void> {
       process.exitCode = 1;
       return;
     }
-    const opts: AnalyzeOptions = {};
+    const skippedFiles: SkippedTranscriptFile[] = [];
+    const opts: AnalyzeOptions = { skippedFiles };
     if (recent !== undefined) opts.recent = recent;
     if (sinceMs !== undefined) opts.sinceMs = sinceMs;
     if (untilMs !== undefined) opts.untilMs = untilMs;
 
     if (splitUsage) {
       const split = await analyzePathsByUsage(targets, opts);
+      warnSkippedFiles(skippedFiles);
       process.stdout.write(
         asJson
           ? `${JSON.stringify(split, null, 2)}\n`
@@ -236,6 +254,7 @@ async function main(argv: string[]): Promise<void> {
     }
 
     const metrics = await analyzePaths(targets, opts);
+    warnSkippedFiles(skippedFiles);
     process.stdout.write(
       asJson
         ? `${JSON.stringify(metrics, null, 2)}\n`
@@ -283,10 +302,13 @@ async function main(argv: string[]): Promise<void> {
       process.exitCode = 1;
       return;
     }
+    const beforeSkipped: SkippedTranscriptFile[] = [];
+    const afterSkipped: SkippedTranscriptFile[] = [];
     const [before, after] = await Promise.all([
-      analyzePaths([beforePath]),
-      analyzePaths([afterPath]),
+      analyzePaths([beforePath], { skippedFiles: beforeSkipped }),
+      analyzePaths([afterPath], { skippedFiles: afterSkipped }),
     ]);
+    warnSkippedFiles([...beforeSkipped, ...afterSkipped]);
     process.stdout.write(
       asJson
         ? `${JSON.stringify({ before, after }, null, 2)}\n`

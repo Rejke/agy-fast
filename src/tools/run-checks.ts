@@ -4,6 +4,8 @@ import {
   formatCorruptedArrayError,
   isPlainObject,
   parseMaybeJsonArray,
+  TOOL_VALIDATION_EXAMPLES,
+  withValidationExample,
   type CorruptedItem,
 } from "../utils/arg-validation.js";
 import { MCP_CALL_BUDGET_SEC, runShellCommandAsync, type ExecResult } from "../utils/exec-utils.js";
@@ -13,6 +15,7 @@ import {
   computeWaterFillBudgets,
   fitSectionsToByteBudget,
   formatCompactCommandOutput,
+  formatExitFailureLabel,
   normalizeTerminalOutput,
   prepareCompactCommandOutput,
   renderPreparedCompactCommandOutput,
@@ -106,14 +109,20 @@ export async function runChecks(
       };
     }
     return {
-      text: "Error: 'commands' must be a non-empty array of check commands.",
+      text: withValidationExample(
+        "Error: 'commands' must be a non-empty array of check commands.",
+        TOOL_VALIDATION_EXAMPLES.run_checks,
+      ),
       isError: true,
     };
   }
   const rawCommands = parsedCommands.value;
   if (rawCommands.length === 0) {
     return {
-      text: "Error: 'commands' must be a non-empty array of check commands.",
+      text: withValidationExample(
+        "Error: 'commands' must be a non-empty array of check commands.",
+        TOOL_VALIDATION_EXAMPLES.run_checks,
+      ),
       isError: true,
     };
   }
@@ -170,7 +179,10 @@ export async function runChecks(
       typeof raw === "string" ? { command: raw } : (raw as unknown as CheckCommandSpec);
     if (!spec || typeof spec.command !== "string" || !spec.command.trim()) {
       return {
-        text: `Error: commands[${i}] must contain a non-empty 'command' string.`,
+        text: withValidationExample(
+          `Error: commands[${i}] must contain a non-empty 'command' string.`,
+          TOOL_VALIDATION_EXAMPLES.run_checks,
+        ),
         isError: true,
       };
     }
@@ -346,7 +358,7 @@ export async function runChecks(
           ? "TIMEOUT"
           : passed
             ? "PASS"
-            : `FAIL (exit ${result.exitCode ?? "err"})`;
+            : `FAIL (${formatExitFailureLabel(result.exitCode, result.signal)})`;
       const headerLine = `## [${badge}] ${spec.name} (${result.durationMs}ms)`;
       const fullPrefix = `${headerLine}\n$ ${spec.command}\n`;
       const combined = [
@@ -466,7 +478,7 @@ export async function runChecks(
         ? "ERROR"
         : result.timedOut
           ? "TIMEOUT"
-          : `FAIL (exit ${result.exitCode ?? "err"})`;
+          : `FAIL (${formatExitFailureLabel(result.exitCode, result.signal)})`;
       const badgeLine = `## [${badge} ${result.durationMs}ms] ${spec.name}`;
       const header = `${badgeLine}\n$ ${spec.command}\n`;
 
@@ -475,6 +487,7 @@ export async function runChecks(
         stdout: result.stdout,
         stderr: result.stderr,
         exitCode: result.exitCode,
+        signal: result.signal,
         timedOut: result.timedOut,
         error: result.error,
       });

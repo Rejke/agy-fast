@@ -11,6 +11,7 @@
 **面向 Google Antigravity 的合规延迟、Token 额度与工具调用加速插件**
 
 [![版本](https://img.shields.io/github/v/tag/INK-Q/agy-fast?label=version&sort=semver&style=flat-square&color=38BDF8&labelColor=0F172A)](CHANGELOG.md)
+[![npm](https://img.shields.io/npm/v/agy-fast?style=flat-square&logo=npm&logoColor=white&color=CB3837&labelColor=0F172A)](https://www.npmjs.com/package/agy-fast)
 [![GitHub Stars](https://img.shields.io/github/stars/INK-Q/agy-fast?style=flat-square&color=FACC15&labelColor=0F172A)](https://github.com/INK-Q/agy-fast/stargazers)
 [![Node.js >= 20](https://img.shields.io/badge/node-%3E%3D20-22C55E?style=flat-square&logo=node.js&logoColor=white&labelColor=0F172A)](#快速开始)
 [![零运行期依赖](https://img.shields.io/badge/runtime%20deps-0-38BDF8?style=flat-square&labelColor=0F172A)](#工作原理)
@@ -19,7 +20,7 @@
 [![Glama MCP Server](https://glama.ai/mcp/servers/INK-Q/agy-fast/badges/score.svg)](https://glama.ai/mcp/servers/INK-Q/agy-fast)
 [![HOL Guard Verified](https://img.shields.io/endpoint?url=https%3A%2F%2Fhol.org%2Fapi%2Fregistry%2Fbadges%2Fplugin%3Fslug%3Dink-q%252Fagy-fast%26metric%3Dscore&style=flat-square&labelColor=0F172A)](https://hol.org/registry/plugins/ink-q%2Fagy-fast?utm_source=hol_marketplace&utm_medium=plugins_badge&utm_campaign=plugins&utm_content=ink-q%2Fagy-fast&ref=plugin-author-5dc88d78)
 
-[English](README.md) · 简体中文 · [快速开始](#快速开始) · [实测数据](#实测数据) · [MCP 工具](#5-个核心-mcp-工具) · [性能分析报告](docs/ANALYSIS_REPORT.zh-CN.md) · [更新日志](CHANGELOG.md)
+[English](README.md) · 简体中文 · [繁體中文](README.zh-TW.md) · [快速开始](#快速开始) · [实测数据](#实测数据) · [MCP 工具](#5-个核心-mcp-工具) · [性能分析报告](docs/ANALYSIS_REPORT.zh-CN.md) · [更新日志](CHANGELOG.md)
 
 </div>
 
@@ -53,11 +54,40 @@ curl -fsSL https://raw.githubusercontent.com/INK-Q/agy-fast/main/install.sh | sh
 irm https://raw.githubusercontent.com/INK-Q/agy-fast/main/install.ps1 | iex
 ```
 
+**全平台通用（通过 npm / `npx`）：**
+```bash
+npx -y agy-fast install
+```
+
 > [!TIP]
 > **Desktop 2.0 / IDE 启用提示：** 打开 Antigravity 侧边栏的 **Customizations → Installed**，确认 `agy-fast` 已处于开启状态，然后开启一个**新会话**即可激活启动快照钩子与 MCP 工具。
+>
+> **以无需审批模式启动 `agy` CLI（可选）：** 如果希望在 CLI 中连续调用 `agy-fast` 等工具而不必每次手动确认审批，可使用官方参数启动：
+>
+> ```bash
+> agy --dangerously-skip-permissions
+> ```
+>
+> *（该参数会自动批准所有工具权限请求且不再弹窗询问，建议仅在受信任的代码仓库中使用，或配合 `--sandbox` 一起启用。）*
 
 <details>
-<summary>更多安装方式（本地克隆、直接克隆至插件目录、<code>agy</code> 官方 CLI、按项目团队共享、让 Antigravity 自动安装）</summary>
+<summary>更多安装方式（<code>npx</code> 独立 MCP 服务、本地克隆、直接克隆至插件目录、<code>agy</code> 官方 CLI、按项目团队共享、让 Antigravity 自动安装）</summary>
+
+#### 独立纯 MCP 服务（任意标准 MCP 客户端）
+`agy-fast` 以 Antigravity 为一等公民（完整插件含 `SessionStart` 钩子、`rules/AGENTS.md` 与自动更新）；其他标准 MCP 客户端也可通过 `npx` 直接挂载纯 MCP Stdio 服务：
+
+```json
+{
+  "mcpServers": {
+    "agy-fast": {
+      "command": "npx",
+      "args": ["-y", "agy-fast", "mcp"]
+    }
+  }
+}
+```
+
+可选参数：传入 `"--tools", "batch_search,quick_outline,run_checks"` 按需暴露工具子集，传入 `"--schema-compat=minimal"` 适配严格 JSON Schema 子集宿主，或运行 `npx -y agy-fast mcp-config --rules` 输出宿主无关的精简路由规则。
 
 #### 本地克隆安装（全平台通用）
 ```bash
@@ -205,7 +235,7 @@ node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./aft
 - **大纲与小切片合一**：支持同等 15 种格式符号大纲（支持单文件广度优先水填充分配），并可在同一次请求中顺带读取少量小行段（总输出死守 `≤8.8 KB` UTF-8 上限）；大段正文读取自动引导至并行内置 `read_file`。
 
 ### 5. `run_checks` — 并发构建、规范检查、测试与诊断执行器
-- **单次最多 12 条命令**：在受控并发池（`concurrency: 1..8`）中并行执行独立非交互命令，支持单条超时强杀（`1..170 s`，单次调用共享 `170 s` 预算以适配 Antigravity `180 s` MCP 上限）、ANSI 转义符清理，并在 Windows 下自动透明解包针对白名单 CLI（`git`/`npm`/`node`/`rg`/`pytest`/`cargo` 等）的冗余 `powershell -Command "..."` 包装，免去 PowerShell 冷启动开销（PowerShell cmdlet、别名与管道完全原样保留）。
+- **单次最多 12 条命令**：在受控并发池（`concurrency: 1..8`）中并行执行独立非交互命令，支持单条超时强杀（`1..150 s`，单次调用共享 `150 s` 预算以适配 Antigravity `180 s` MCP 上限）、ANSI 转义符清理，并在 Windows 下自动透明解包针对白名单 CLI（`git`/`npm`/`node`/`rg`/`pytest`/`cargo` 等）的冗余 `powershell -Command "..."` 包装，免去 PowerShell 冷启动开销（PowerShell cmdlet、别名与管道完全原样保留）。
 - **头尾折叠（Head-Tail）双输出模式**：默认 `compact` 模式将通过项折叠为 1 行摘要、超长失败日志采用**头尾折叠**（同时保留首条根因报错与末尾测试汇总/堆栈尾部）；`full` 模式在 `≤8.8 KB` 预算内保留标准输出，超限时同样采用头尾折叠。
 
 <details>
@@ -247,6 +277,9 @@ node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./aft
 | **立即更新并自检** *（先暂存冒烟校验再替换）* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs update` |
 | **配置自动更新策略** *（`auto` \| `notify` \| `off`）* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs config --auto-update notify --interval 24` |
 | **切换 MCP 工具加载模式** *（`eager` \| `lazy`，自动更新保留）* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs config --tool-loading lazy` |
+| **CLI 直调模式** *（供 Swarm Worker 及无 MCP 环境通过 `run_command` 调用）* | `node ~/.gemini/config/plugins/agy-fast/dist/mcp-server.mjs --cli <search\|outline\|slice\|edit\|check>` |
+| **独立 MCP Stdio 服务** *（供标准 MCP 客户端挂载；透传 `--tools`、`--schema-compat=minimal`、`--cli`）* | `npx -y agy-fast mcp` *（或 `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs mcp`）* |
+| **生成 MCP 配置 / 通用规则** *（`--host mcp-only\|json\|generic\|antigravity`、`--tools`、`--rules`）* | `npx -y agy-fast mcp-config --rules` *（或 `node .../scripts/install.mjs mcp-config`）* |
 | **一键干净卸载** | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs uninstall` |
 
 > 在本地克隆目录中，也可直接使用 `./install.sh <子命令>`（macOS/Linux）或 `.\install.ps1 <子命令>`（Windows）执行上述全部子命令。
@@ -268,6 +301,8 @@ node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./aft
 | `AGY_FAST_REPO` | Git 仓库地址 | 自定义镜像或 Fork 仓库地址 |
 | `AGY_FAST_EDITS_FORMAT` | `auto` *（默认）* \| `array` \| `string` | 控制 `apply_edits.edits` 参数格式策略（`auto` 在支持 `"eager": true` 的 CLI ≥1.5.8、桌面端 2.0、IDE 与第三方客户端统一走省 token 的强类型原生数组，在旧版懒加载 CLI 1.5.0–1.5.7 自动切换为 JSON 数组字符串以防 `[]` 丢参；服务端始终同时兼容两种格式） |
 | `AGY_FAST_HOST` | 如 `cli@1.5.14`、`ide@2.7.0`、`desktop@2.34.0` | 手动覆盖自动探测到的 Antigravity 宿主端类型与版本 |
+| `AGY_FAST_TOOLS` | 逗号分隔工具名 *（默认全部 5 个）* | 仅暴露指定的 MCP 工具子集（亦支持 `--tools <列表>`） |
+| `AGY_FAST_SCHEMA_COMPAT` | `standard` *（默认）* \| `minimal` | 从 `tools/list` 剥离数值/数组范围约束关键字（`minimum`/`maximum`/`minItems`/`maxItems`），适配严格 JSON Schema 子集宿主（亦支持 `--schema-compat=minimal`，运行时校验不受影响） |
 
 **更新生效提示：** 新版 `rules/AGENTS.md` 与 `dist/session-start.mjs` 在下一次开启新会话时自动生效；Antigravity Desktop 2.0 / IDE 若需立即刷新常驻 MCP 服务，重载窗口或重启一次即可。
 

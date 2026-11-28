@@ -11,7 +11,8 @@ const entrypoints = [
   {
     in: path.join(rootDir, "src", "mcp-server.ts"),
     out: path.join(distDir, "mcp-server.mjs"),
-    banner: "// agy-fast MCP Stdio Server (bundled zero-dependency ESM)\n",
+    banner: "#!/usr/bin/env node\n// agy-fast MCP Stdio Server (bundled zero-dependency ESM)\n",
+    executable: true,
   },
   {
     in: path.join(rootDir, "src", "session-start.ts"),
@@ -45,6 +46,9 @@ for (const entry of entrypoints) {
     legalComments: "none",
     banner: { js: entry.banner },
   });
+  if (entry.executable && process.platform !== "win32") {
+    await fs.chmod(entry.out, 0o755);
+  }
   const stat = await fs.stat(entry.out);
   const rel = path.relative(rootDir, entry.out);
   console.log(`Built ${rel} (${(stat.size / 1024).toFixed(1)} KB)`);

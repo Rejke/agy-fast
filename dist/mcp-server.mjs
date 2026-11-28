@@ -1,571 +1,119 @@
+#!/usr/bin/env node
 // agy-fast MCP Stdio Server (bundled zero-dependency ESM)
 
 
-// src/mcp-server.ts
-import fs6 from "node:fs";
-import path7 from "node:path";
-import { fileURLToPath as fileURLToPath2 } from "node:url";
+// src/tools/apply-edits.ts
+import { isUtf8 } from "node:buffer";
+import { promises as fs2 } from "node:fs";
+import path3 from "node:path";
 
-// src/protocol/mcp.ts
-import { fileURLToPath } from "node:url";
-var SUPPORTED_PROTOCOL_VERSIONS = /* @__PURE__ */ new Set([
-  "2025-11-25",
-  "2025-06-18",
-  "2025-03-26",
-  "2024-11-05"
-]);
-var DEFAULT_PROTOCOL_VERSION = "2025-03-26";
-var ROOTS_REQUEST_TIMEOUT_MS = 1e3;
-var MAX_KNOWN_ROOTS_IDS = 64;
-var McpStdioServer = class {
-  tools = /* @__PURE__ */ new Map();
-  serverName;
-  serverVersion;
-  inFlight = 0;
-  stdinEnded = false;
-  onDrainExit;
-  onWorkspaceRoots;
-  shouldRequestRoots;
-  onInitialize;
-  sendToClient;
-  clientSupportsRoots = false;
-  rootsDirty = false;
-  rootsRequestCount = 0;
-  lastAppliedRootsSeq = 0;
-  pendingRoots = /* @__PURE__ */ new Map();
-  knownRootsIds = /* @__PURE__ */ new Map();
-  rootsWaiters = /* @__PURE__ */ new Set();
-  activeOutgoingQueue = null;
-  pendingInitFlush = Promise.resolve();
-  rootsTimeoutMs;
-  constructor(options) {
-    this.serverName = options.name;
-    this.serverVersion = options.version;
-    this.onWorkspaceRoots = options.onWorkspaceRoots;
-    this.shouldRequestRoots = options.shouldRequestRoots;
-    this.onInitialize = options.onInitialize;
-    this.rootsTimeoutMs = typeof options.rootsTimeoutMs === "number" && Number.isFinite(options.rootsTimeoutMs) && options.rootsTimeoutMs > 0 ? Math.trunc(options.rootsTimeoutMs) : ROOTS_REQUEST_TIMEOUT_MS;
+// src/utils/arg-validation.ts
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function describeValueType(value) {
+  if (value === null) return "null";
+  if (value === void 0) return "undefined";
+  if (Array.isArray(value)) return `array (len=${value.length})`;
+  if (typeof value === "boolean") return `boolean (${String(value)})`;
+  if (typeof value === "number") return `number (${String(value)})`;
+  if (typeof value === "string") return `string (len=${value.length})`;
+  return typeof value;
+}
+function parseMaybeJsonArray(value) {
+  if (value === void 0) {
+    return { ok: false, kind: "missing", detail: "undefined" };
   }
-  flushRootsWaiters() {
-    for (const waiter of this.rootsWaiters) {
-      let stillWaiting = false;
-      for (const pending of this.pendingRoots.values()) {
-        if (pending.seq <= waiter.minSeq) {
-          stillWaiting = true;
-          break;
-        }
-      }
-      if (!stillWaiting) {
-        this.rootsWaiters.delete(waiter);
-        waiter.resolve();
-      }
-    }
+  if (Array.isArray(value)) {
+    return { ok: true, value };
   }
-  settleAllPendingRoots() {
-    for (const pending of this.pendingRoots.values()) {
-      clearTimeout(pending.timer);
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return { ok: false, kind: "wrong_type", detail: "empty string" };
     }
-    this.pendingRoots.clear();
-    for (const waiter of this.rootsWaiters) {
-      waiter.resolve();
-    }
-    this.rootsWaiters.clear();
-  }
-  waitForRoots() {
-    if (this.pendingRoots.size === 0 || this.stdinEnded) {
-      return Promise.resolve();
-    }
-    if (this.activeOutgoingQueue && this.activeOutgoingQueue.length > 0) {
-      const tasks = this.activeOutgoingQueue.splice(0, this.activeOutgoingQueue.length);
-      void this.pendingInitFlush.then(() => {
-        for (const task of tasks) {
-          try {
-            task();
-          } catch {
-          }
-        }
-      }).catch(() => {
-      });
-    }
-    const minSeq = this.rootsRequestCount;
-    return new Promise((resolve) => {
-      this.rootsWaiters.add({ minSeq, resolve });
-    });
-  }
-  pruneKnownRootsIds() {
-    if (this.knownRootsIds.size <= MAX_KNOWN_ROOTS_IDS) return;
-    for (const key of this.knownRootsIds.keys()) {
-      if (this.knownRootsIds.size <= MAX_KNOWN_ROOTS_IDS) break;
-      if (!this.pendingRoots.has(key)) {
-        this.knownRootsIds.delete(key);
-      }
-    }
-  }
-  // Tool calls wait for the pending answer (bounded by rootsTimeoutMs and stdin EOF),
-  // so the first call already sees the workspace roots without ever deadlocking.
-  requestRoots(useContentLength) {
-    if (this.stdinEnded || !this.clientSupportsRoots || !this.onWorkspaceRoots || !this.sendToClient) {
-      return;
-    }
-    this.rootsRequestCount += 1;
-    const seq = this.rootsRequestCount;
-    const id = `agy-fast-roots-${seq}`;
-    const timer = setTimeout(() => {
-      if (this.pendingRoots.delete(id)) {
-        this.pruneKnownRootsIds();
-        this.flushRootsWaiters();
-      }
-    }, this.rootsTimeoutMs);
-    timer.unref();
-    this.pendingRoots.set(id, { seq, timer });
-    this.knownRootsIds.set(id, seq);
-    this.pruneKnownRootsIds();
-    const send = this.sendToClient;
-    const sendTask = () => {
-      if (this.stdinEnded) return;
-      send({ jsonrpc: "2.0", id, method: "roots/list" }, useContentLength);
-    };
-    if (this.activeOutgoingQueue) {
-      this.activeOutgoingQueue.push(sendTask);
-    } else {
-      sendTask();
-    }
-  }
-  receiveRoots(result) {
-    if (!result || typeof result !== "object") return;
-    const rawRoots = result.roots;
-    if (!Array.isArray(rawRoots)) return;
-    const paths = [];
-    for (const root of rawRoots) {
-      if (!root || typeof root !== "object") continue;
-      const uri = root.uri;
-      if (typeof uri !== "string" || !/^file:/i.test(uri)) continue;
-      try {
-        paths.push(fileURLToPath(uri));
-      } catch {
-      }
-    }
-    if (paths.length > 0) {
-      try {
-        this.onWorkspaceRoots?.(paths);
-      } catch {
-      }
-    }
-  }
-  registerTool(definition, handler) {
-    const name = typeof definition === "function" ? definition().name : definition.name;
-    this.tools.set(name, { definition, handler });
-  }
-  async handleMessage(raw, useContentLength = false) {
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-      return {
-        jsonrpc: "2.0",
-        id: null,
-        error: { code: -32600, message: "Invalid Request" }
-      };
-    }
-    const msg = raw;
-    const hasId = Object.prototype.hasOwnProperty.call(msg, "id") && msg.id !== void 0;
-    const id = hasId ? msg.id ?? null : null;
-    const method = typeof msg.method === "string" ? msg.method : "";
-    if (!method && typeof id === "string" && this.knownRootsIds.has(id)) {
-      const seq = this.knownRootsIds.get(id);
-      this.knownRootsIds.delete(id);
-      const pending = this.pendingRoots.get(id);
-      if (pending) {
-        clearTimeout(pending.timer);
-        this.pendingRoots.delete(id);
-      }
-      const errField = msg.error;
-      const hasError = errField !== void 0 && errField !== null;
-      try {
-        if (!hasError && seq >= this.lastAppliedRootsSeq) {
-          this.lastAppliedRootsSeq = seq;
-          for (const [oldId, oldPending] of this.pendingRoots.entries()) {
-            if (oldPending.seq < seq) {
-              clearTimeout(oldPending.timer);
-              this.pendingRoots.delete(oldId);
-            }
-          }
-          this.receiveRoots(msg.result);
-        }
-      } finally {
-        this.pruneKnownRootsIds();
-        this.flushRootsWaiters();
-      }
-      return null;
-    }
-    if (!method) {
-      return {
-        jsonrpc: "2.0",
-        id,
-        error: { code: -32600, message: "Invalid Request: missing method" }
-      };
-    }
-    if (!hasId) {
-      if (method === "notifications/initialized" || method === "notifications/roots/list_changed") {
-        if (this.clientSupportsRoots) {
-          this.rootsDirty = true;
-        }
-      }
-      return null;
-    }
-    if (method === "initialize") {
-      const requested = typeof msg.params?.protocolVersion === "string" ? msg.params.protocolVersion.trim() : "";
-      const protocolVersion = SUPPORTED_PROTOCOL_VERSIONS.has(requested) ? requested : DEFAULT_PROTOCOL_VERSION;
-      const capabilities = msg.params?.capabilities;
-      this.clientSupportsRoots = capabilities?.roots !== null && typeof capabilities?.roots === "object" && !Array.isArray(capabilities?.roots);
-      this.rootsDirty = this.clientSupportsRoots;
-      const rawClientInfo = msg.params?.clientInfo;
-      let clientInfo;
-      if (rawClientInfo !== null && typeof rawClientInfo === "object" && !Array.isArray(rawClientInfo)) {
-        const ci = rawClientInfo;
-        clientInfo = {
-          name: typeof ci.name === "string" ? ci.name : void 0,
-          version: typeof ci.version === "string" ? ci.version : void 0
-        };
-      }
-      try {
-        this.onInitialize?.({ clientInfo, protocolVersion });
-      } catch {
-      }
-      return {
-        jsonrpc: "2.0",
-        id,
-        result: {
-          protocolVersion,
-          capabilities: {
-            tools: {}
-          },
-          serverInfo: {
-            name: this.serverName,
-            version: this.serverVersion
-          }
-        }
-      };
-    }
-    if (method === "ping") {
-      return { jsonrpc: "2.0", id, result: {} };
-    }
-    if (method === "tools/list") {
-      const definitions = [...this.tools.values()].map(
-        (t) => typeof t.definition === "function" ? t.definition() : t.definition
-      );
-      return { jsonrpc: "2.0", id, result: { tools: definitions } };
-    }
-    if (method === "resources/list") {
-      return { jsonrpc: "2.0", id, result: { resources: [] } };
-    }
-    if (method === "resources/templates/list") {
-      return { jsonrpc: "2.0", id, result: { resourceTemplates: [] } };
-    }
-    if (method === "prompts/list") {
-      return { jsonrpc: "2.0", id, result: { prompts: [] } };
-    }
-    if (method === "tools/call") {
-      const name = typeof msg.params?.name === "string" ? msg.params.name : "";
-      const tool = this.tools.get(name);
-      if (!tool) {
-        return {
-          jsonrpc: "2.0",
-          id,
-          error: { code: -32602, message: `Unknown tool: ${name}` }
-        };
-      }
-      const rawArgs = msg.params?.arguments;
-      let args;
-      if (rawArgs === void 0 || rawArgs === null) {
-        args = {};
-      } else if (typeof rawArgs === "object" && !Array.isArray(rawArgs)) {
-        args = rawArgs;
-      } else if (typeof rawArgs === "string" && rawArgs.trim().startsWith("{")) {
-        try {
-          const parsedArgs = JSON.parse(rawArgs);
-          if (parsedArgs && typeof parsedArgs === "object" && !Array.isArray(parsedArgs)) {
-            args = parsedArgs;
-          } else {
-            return {
-              jsonrpc: "2.0",
-              id,
-              error: {
-                code: -32602,
-                message: `Invalid params: 'arguments' for '${name}' must be a JSON object`
-              }
-            };
-          }
-        } catch {
-          return {
-            jsonrpc: "2.0",
-            id,
-            error: {
-              code: -32602,
-              message: `Invalid params: malformed JSON string in 'arguments' for '${name}'`
-            }
-          };
-        }
-      } else {
-        return {
-          jsonrpc: "2.0",
-          id,
-          error: {
-            code: -32602,
-            message: `Invalid params: 'arguments' for '${name}' must be an object (received ${Array.isArray(rawArgs) ? "array" : typeof rawArgs})`
-          }
-        };
-      }
-      try {
-        const needRoots = this.clientSupportsRoots && Boolean(this.onWorkspaceRoots) && (this.shouldRequestRoots ? this.shouldRequestRoots(name, args) : true);
-        if (needRoots) {
-          if (this.rootsDirty && !this.stdinEnded) {
-            this.rootsDirty = false;
-            this.requestRoots(useContentLength);
-          }
-          await this.waitForRoots();
-        }
-        const res = await tool.handler(args);
-        return {
-          jsonrpc: "2.0",
-          id,
-          result: {
-            content: [{ type: "text", text: res.text }],
-            isError: Boolean(res.isError)
-          }
-        };
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        return {
-          jsonrpc: "2.0",
-          id,
-          result: {
-            content: [{ type: "text", text: `Tool error: ${message}` }],
-            isError: true
-          }
-        };
-      }
-    }
-    return {
-      jsonrpc: "2.0",
-      id,
-      error: { code: -32601, message: `Method not found: ${method}` }
-    };
-  }
-  listen(input = process.stdin, output = process.stdout, onExit) {
-    this.onDrainExit = onExit;
-    let buffer = Buffer.alloc(0);
-    const writeResponse = (payload, useContentLength) => {
-      const serialized = JSON.stringify(payload);
-      if (useContentLength) {
-        const len = Buffer.byteLength(serialized, "utf8");
-        output.write(`Content-Length: ${len}\r
-\r
-${serialized}`);
-      } else {
-        output.write(`${serialized}
-`);
-      }
-    };
-    this.sendToClient = (request, useContentLength) => writeResponse(request, useContentLength);
-    let drainExitCalled = false;
-    const triggerDrainExit = () => {
-      if (drainExitCalled) return;
-      drainExitCalled = true;
-      this.onDrainExit?.();
-    };
-    const dispatchRawJson = (jsonText, useContentLength) => {
-      let parsed;
-      try {
-        parsed = JSON.parse(jsonText);
-      } catch {
-        writeResponse(
-          {
-            jsonrpc: "2.0",
-            id: null,
-            error: { code: -32700, message: "Parse error" }
-          },
-          useContentLength
-        );
-        return;
-      }
-      this.inFlight += 1;
-      const finish = () => {
-        this.inFlight -= 1;
-        if (this.stdinEnded && this.inFlight === 0) {
-          triggerDrainExit();
-        }
-      };
-      const outgoingForCall = [];
-      const flushOutgoingForCall = () => {
-        for (const task of outgoingForCall) {
-          task();
-        }
-      };
+    try {
+      const parsed = JSON.parse(trimmed);
       if (Array.isArray(parsed)) {
-        if (parsed.length === 0) {
-          writeResponse(
-            {
-              jsonrpc: "2.0",
-              id: null,
-              error: { code: -32600, message: "Invalid Request: empty batch" }
-            },
-            useContentLength
-          );
-          finish();
-          return;
-        }
-        const prevQueue2 = this.activeOutgoingQueue;
-        this.activeOutgoingQueue = outgoingForCall;
-        let promises;
-        try {
-          promises = parsed.map((item) => this.handleMessage(item, useContentLength));
-        } finally {
-          this.activeOutgoingQueue = prevQueue2;
-        }
-        const isInitOnlyBatch = parsed.some(
-          (item) => item !== null && typeof item === "object" && item.method === "initialize"
-        ) && !parsed.some(
-          (item) => item !== null && typeof item === "object" && item.method === "tools/call"
-        );
-        const batchDone = Promise.all(promises).then((responses) => {
-          const nonNull = responses.filter(
-            (r) => r !== null
-          );
-          if (nonNull.length > 0) {
-            writeResponse(nonNull, useContentLength);
-          }
-          flushOutgoingForCall();
-        }).catch(() => {
-        }).finally(finish);
-        if (isInitOnlyBatch) {
-          this.pendingInitFlush = batchDone;
-        }
-        return;
+        return { ok: true, value: parsed };
       }
-      const isSingleInit = parsed !== null && typeof parsed === "object" && parsed.method === "initialize";
-      const prevQueue = this.activeOutgoingQueue;
-      this.activeOutgoingQueue = outgoingForCall;
-      let promise;
-      try {
-        promise = this.handleMessage(parsed, useContentLength);
-      } finally {
-        this.activeOutgoingQueue = prevQueue;
+      if (parsed === null || typeof parsed === "boolean") {
+        return {
+          ok: false,
+          kind: "corrupted_literal",
+          detail: describeValueType(parsed),
+          value: parsed
+        };
       }
-      const singleDone = promise.then((response) => {
-        if (response !== null) {
-          writeResponse(response, useContentLength);
-        }
-        flushOutgoingForCall();
-      }).catch(() => {
-      }).finally(finish);
-      if (isSingleInit) {
-        this.pendingInitFlush = singleDone;
-      }
-    };
-    const drainBuffer = () => {
-      while (buffer.length > 0) {
-        let offset = 0;
-        while (offset < buffer.length && (buffer[offset] === 10 || buffer[offset] === 13)) {
-          offset++;
-        }
-        if (offset > 0) {
-          buffer = buffer.subarray(offset);
-          if (buffer.length === 0) break;
-        }
-        const headerProbe = buffer.subarray(0, 16).toString("latin1").toLowerCase();
-        if (headerProbe.startsWith("content-length:") || headerProbe.startsWith("content-type:")) {
-          const headerScan = buffer.subarray(0, Math.min(buffer.length, 16384)).toString("latin1");
-          const sepMatch = /\r?\n\r?\n/.exec(headerScan);
-          if (!sepMatch) {
-            if (buffer.length >= 16384) {
-              writeResponse(
-                {
-                  jsonrpc: "2.0",
-                  id: null,
-                  error: { code: -32600, message: "Invalid Request: header too large" }
-                },
-                true
-              );
-              buffer = Buffer.alloc(0);
-            }
-            break;
-          }
-          const sepIdx = sepMatch.index;
-          const sepLen = sepMatch[0].length;
-          const headerText = headerScan.slice(0, sepIdx);
-          const clMatches = [...headerText.matchAll(/^content-length:[ \t]*(\d+)[ \t]*\r?$/gim)];
-          const maxFrameBytes = 64 * 1024 * 1024;
-          if (clMatches.length !== 1) {
-            writeResponse(
-              {
-                jsonrpc: "2.0",
-                id: null,
-                error: { code: -32600, message: "Invalid Request: invalid Content-Length header" }
-              },
-              true
-            );
-            buffer = buffer.subarray(sepIdx + sepLen);
-            continue;
-          }
-          const contentLength = Number(clMatches[0][1]);
-          if (!Number.isSafeInteger(contentLength) || contentLength < 0 || contentLength > maxFrameBytes) {
-            writeResponse(
-              {
-                jsonrpc: "2.0",
-                id: null,
-                error: { code: -32600, message: "Invalid Request: Content-Length out of bounds" }
-              },
-              true
-            );
-            buffer = Buffer.alloc(0);
-            break;
-          }
-          const bodyStart = sepIdx + sepLen;
-          if (buffer.length < bodyStart + contentLength) {
-            break;
-          }
-          const bodyText = buffer.subarray(bodyStart, bodyStart + contentLength).toString("utf8");
-          buffer = buffer.subarray(bodyStart + contentLength);
-          dispatchRawJson(bodyText, true);
-          continue;
-        }
-        const newlineIdx = buffer.indexOf(10);
-        if (newlineIdx === -1) break;
-        const lineBuf = buffer.subarray(0, newlineIdx);
-        buffer = buffer.subarray(newlineIdx + 1);
-        const line = lineBuf.toString("utf8").trim();
-        if (line.length > 0) {
-          dispatchRawJson(line, false);
-        }
-      }
-    };
-    input.on("data", (chunk) => {
-      const buf = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
-      buffer = buffer.length === 0 ? buf : Buffer.concat([buffer, buf]);
-      drainBuffer();
-    });
-    const handleInputClosed = (flushTrailing) => {
-      if (this.stdinEnded) return;
-      const remaining = flushTrailing ? buffer.toString("utf8").trim() : "";
-      buffer = Buffer.alloc(0);
-      this.stdinEnded = true;
-      if (flushTrailing && remaining.length > 0) {
-        const lowerRem = remaining.toLowerCase();
-        if (!lowerRem.startsWith("content-length:") && !lowerRem.startsWith("content-type:")) {
-          dispatchRawJson(remaining, false);
-        }
-      }
-      this.settleAllPendingRoots();
-      if (this.inFlight === 0) {
-        triggerDrainExit();
-      }
-    };
-    input.on("end", () => handleInputClosed(true));
-    input.on("close", () => handleInputClosed(false));
-    input.on("error", () => handleInputClosed(false));
+      return {
+        ok: false,
+        kind: "invalid_json",
+        detail: `decoded to ${describeValueType(parsed)} instead of a JSON array`
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        kind: "invalid_json",
+        detail: err instanceof Error ? err.message : String(err)
+      };
+    }
   }
+  return {
+    ok: false,
+    kind: "wrong_type",
+    detail: describeValueType(value)
+  };
+}
+function parseMaybeStringOrJsonArray(value) {
+  const parsed = parseMaybeJsonArray(value);
+  if (parsed.ok || parsed.kind === "corrupted_literal" || parsed.kind === "missing") {
+    return parsed;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return parsed;
+    }
+    if (trimmed.startsWith("[") || trimmed.startsWith("{") || trimmed.startsWith("```") || /[\r\n]/.test(trimmed)) {
+      return parsed;
+    }
+    if (parsed.kind === "invalid_json" && parsed.detail.startsWith("decoded to ")) {
+      return parsed;
+    }
+    return { ok: true, value: [trimmed] };
+  }
+  return parsed;
+}
+var TOOL_VALIDATION_EXAMPLES = {
+  batch_search: '{"queries":[{"type":"text","pattern":"foo","path":"src"}]}',
+  apply_edits: '{"edits":[{"path":"src/app.ts","hunks":[{"target":"old","replacement":"new"}]}]}',
+  read_slices: '{"outlines":["src/app.ts"],"lineRanges":["src/app.ts:1-60"]}',
+  read_slices_line_range: '{"lineRanges":["src/app.ts:1-60"]}',
+  quick_outline: '{"paths":["src/app.ts"]}',
+  run_checks: '{"commands":[{"name":"test","command":"npm test"}]}'
 };
+function withValidationExample(message, exampleJson) {
+  return `${message}
+Example: ${exampleJson}`;
+}
+function formatCorruptedArrayError(options) {
+  const details = options.items.slice(0, 8).map(
+    (item) => `- ${item.label}: received ${describeValueType(item.value)} instead of ${item.expected ?? "an object"}`
+  );
+  if (options.items.length > 8) {
+    details.push(`- ... (+${options.items.length - 8} more corrupted entries)`);
+  }
+  return [
+    `${options.header}: nested argument serialization corruption detected in call_mcp_tool.`,
+    ...details,
+    "",
+    `Hint: untyped call_mcp_tool Arguments can occasionally collapse nested objects/arrays into booleans, null, or an empty array. Do NOT retry the same ${options.toolName} payload \u2014 ${options.fallbackAdvice}`
+  ].join("\n");
+}
 
 // src/utils/exec-utils.ts
 import { spawn, spawnSync } from "node:child_process";
+import os from "node:os";
 import path from "node:path";
 var DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
 var WINDOWS_CODEPAGE_LABELS = {
@@ -658,21 +206,41 @@ function decodeProcessOutput(buf, truncated = false, fallbackEncoding) {
     if (!label || label === "utf-8") {
       return buf.toString("utf8");
     }
+    let decoder;
     try {
-      let decoder = fallbackDecoderCache.get(label);
-      if (!decoder) {
+      const cached = fallbackDecoderCache.get(label);
+      if (cached) {
+        decoder = cached;
+      } else {
         decoder = new TextDecoder(label);
         fallbackDecoderCache.set(label, decoder);
       }
-      return decoder.decode(buf);
     } catch {
       return buf.toString("utf8");
     }
+    if (buf.indexOf(10) === -1) {
+      return decoder.decode(buf);
+    }
+    const parts = [];
+    let offset = 0;
+    while (offset < buf.length) {
+      const nl = buf.indexOf(10, offset);
+      const end = nl === -1 ? buf.length : nl + 1;
+      const line = buf.subarray(offset, end);
+      const lineCandidate = truncated && end === buf.length ? stripTrailingIncompleteUtf8(line) : line;
+      try {
+        parts.push(strictUtf8Decoder.decode(lineCandidate));
+      } catch {
+        parts.push(decoder.decode(line));
+      }
+      offset = end;
+    }
+    return parts.join("");
   }
 }
-var MCP_CALL_BUDGET_SEC = 170;
+var MCP_CALL_BUDGET_SEC = 150;
 function killChildTree(pid, detached) {
-  if (!pid) return;
+  if (!pid) return null;
   if (process.platform === "win32") {
     const fallbackKill = () => {
       try {
@@ -692,7 +260,7 @@ function killChildTree(pid, detached) {
     } catch {
       fallbackKill();
     }
-    return;
+    return null;
   }
   try {
     if (detached) {
@@ -702,7 +270,7 @@ function killChildTree(pid, detached) {
     }
   } catch {
   }
-  setTimeout(() => {
+  const sigkillTimer = setTimeout(() => {
     try {
       if (detached) {
         process.kill(-pid, "SIGKILL");
@@ -711,7 +279,9 @@ function killChildTree(pid, detached) {
       }
     } catch {
     }
-  }, 400).unref();
+  }, 400);
+  sigkillTimer.unref();
+  return sigkillTimer;
 }
 function execBinaryAsync(bin, args, options) {
   return spawnAndCollect(bin, args, false, options);
@@ -719,6 +289,10 @@ function execBinaryAsync(bin, args, options) {
 var WINDOWS_PS_DOUBLE_QUOTABLE_VAR_RE = /(?<![\\`])(?:\$env:[A-Za-z_][A-Za-z0-9_]*|\$(?:LASTEXITCODE|PSVersionTable|PSScriptRoot|PROFILE)\b)/i;
 var WINDOWS_PS_UNQUOTED_SYNTAX_RE = /(?<![\\`])\$(?:HOME|PWD|null|true|false|_)\b|\$\([^)]|@\(|(?:^|[;\r\n])\s*\$[A-Za-z_][A-Za-z0-9_]*\s*=/im;
 var WINDOWS_PS_CMDLET_RE = /(?:^|[;|&({\r\n]\s*)(?:Get|Set|New|Remove|Test|Select|Where|ForEach|Sort|Group|Measure|Compare|ConvertTo|ConvertFrom|Export|Import|Invoke|Start|Stop|Restart|Wait|Read|Write|Out|Format|Resolve|Join|Split|Copy|Move|Rename|Clear|Add|Push|Pop|Enable|Disable)-[A-Z][A-Za-z0-9]*\b(?!-)/;
+var WINDOWS_CMD_ENV_VAR_RE = /%[A-Za-z_][A-Za-z0-9_()]*%/;
+var WINDOWS_CMD_UNQUOTED_SYNTAX_RE = /(?:^|[;&|(\r\n])\s*@?(?:set\s+(?:\/[ap]\s+|[A-Za-z_][A-Za-z0-9_]*=)|(?:setlocal|endlocal|rem|call|goto)\b(?!-)|::|(?:cd|chdir)\s+\/d\b|if\s+(?:\/i\s+(?:not\s+)?|(?:not\s+)?(?:errorlevel\s+\d|exist\s|defined\s|cmdextversion\s+\d|[^(\r\n;&|]*==))|for\s+(?:\/[dflr]\b|%%?[A-Za-z]\s+in\b))|(?<![\\`])(?:>>?|<)\s*nul(?=$|[\s;&|)])/i;
+var WINDOWS_CMD_QUOTED_SET_AT_POS_RE = /^@?set[ \t]+(?:\/[ap][ \t]+)?"[A-Za-z_][A-Za-z0-9_]*=/i;
+var WINDOWS_PS51_CHAIN_OPERATOR_RE = /&&|\|\|/;
 var EXPLICIT_POWERSHELL_INVOCATION_RE = /^\s*(?:["']?)(?:pwsh|powershell)(?:\.exe)?(?:["']?)(?:\s|$)/i;
 var PS_NON_INVOCATION_TAIL_RE = /^(?:[|;&+}=),*?]|(?:[1-6*])?>|-(?:c|i)?(?:eq|ne|gt|ge|lt|le|like|notlike|match|notmatch|replace|split|join|in|notin|contains|notcontains|is|isnot|as|and|or|xor|shl|shr|band|bor|bxor)\b|-f\b|$)/i;
 var PS_UTF8_PREFIX = "try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}; $OutputEncoding = [System.Text.UTF8Encoding]::new($false);";
@@ -852,6 +426,100 @@ function unwrapTrivialWindowsPowerShellCommand(command) {
   }
   return inner;
 }
+function hasPowerShellSemicolonChaining(command, withoutSingle, unquoted) {
+  if (WINDOWS_CMD_ENV_VAR_RE.test(withoutSingle) || WINDOWS_CMD_UNQUOTED_SYNTAX_RE.test(unquoted) || WINDOWS_PS51_CHAIN_OPERATOR_RE.test(unquoted)) {
+    return false;
+  }
+  let quote = null;
+  let sawLeadingToken = false;
+  let atStatementStart = true;
+  let hasSemicolonChain = false;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    const next = command[i + 1];
+    if (quote === "'") {
+      if (ch === "'") {
+        if (next === "'") {
+          i++;
+        } else {
+          quote = null;
+        }
+      }
+      continue;
+    }
+    if (quote === '"') {
+      if ((ch === "\\" || ch === "`") && (next === ch || next === '"')) {
+        i++;
+        continue;
+      }
+      if (ch === '"') {
+        if (next === '"') {
+          i++;
+        } else {
+          quote = null;
+        }
+      }
+      continue;
+    }
+    if (ch === "'") {
+      quote = "'";
+      sawLeadingToken = true;
+      atStatementStart = false;
+      continue;
+    }
+    if (ch === '"') {
+      quote = '"';
+      sawLeadingToken = true;
+      atStatementStart = false;
+      continue;
+    }
+    if (ch === ";") {
+      const prev = i > 0 ? command[i - 1] : "";
+      const prevPrev = i > 1 ? command[i - 2] : "";
+      const isEscaped = prev === "^" || prev === "`" || prev === "\\" && (i === 1 || /\s/.test(prevPrev));
+      if (sawLeadingToken && !isEscaped && (next === " " || next === "	")) {
+        let j = i + 1;
+        while (j < command.length && (command[j] === " " || command[j] === "	")) {
+          j++;
+        }
+        if (j < command.length && command[j] !== "\r" && command[j] !== "\n" && command[j] !== ";") {
+          hasSemicolonChain = true;
+        }
+      }
+      atStatementStart = true;
+      continue;
+    }
+    if (ch === "&") {
+      const prev = i > 0 ? command[i - 1] : "";
+      if (prev !== ">" && !atStatementStart) {
+        return false;
+      }
+      if (atStatementStart) {
+        sawLeadingToken = true;
+        atStatementStart = false;
+      }
+      continue;
+    }
+    if (ch === "\r" || ch === "\n") {
+      sawLeadingToken = false;
+      atStatementStart = true;
+      continue;
+    }
+    if (ch === "|" || ch === "(" || ch === "{") {
+      atStatementStart = true;
+      continue;
+    }
+    if (ch === " " || ch === "	") {
+      continue;
+    }
+    if (atStatementStart && WINDOWS_CMD_QUOTED_SET_AT_POS_RE.test(command.slice(i))) {
+      return false;
+    }
+    sawLeadingToken = true;
+    atStatementStart = false;
+  }
+  return hasSemicolonChain;
+}
 function stripQuotedSpans(command, stripDoubleQuotes) {
   let out = "";
   let quote = null;
@@ -870,7 +538,7 @@ function stripQuotedSpans(command, stripDoubleQuotes) {
       continue;
     }
     if (quote === '"') {
-      if ((ch === "\\" || ch === "`") && next === '"') {
+      if ((ch === "\\" || ch === "`") && (next === ch || next === '"')) {
         i++;
         if (!stripDoubleQuotes) out += ch + next;
         continue;
@@ -911,7 +579,7 @@ function needsPowerShellOnWindows(command) {
     return true;
   }
   const unquoted = stripQuotedSpans(command, true);
-  return WINDOWS_PS_UNQUOTED_SYNTAX_RE.test(unquoted) || WINDOWS_PS_CMDLET_RE.test(unquoted);
+  return WINDOWS_PS_UNQUOTED_SYNTAX_RE.test(unquoted) || WINDOWS_PS_CMDLET_RE.test(unquoted) || hasPowerShellSemicolonChaining(command, withoutSingle, unquoted);
 }
 function formatPowerShellCommand(command) {
   const trimmed = command.trim();
@@ -931,11 +599,11 @@ function formatPowerShellCommand(command) {
         continue;
       }
       const afterQuote = trimmed.slice(idx + 1);
-      if (!/^\s+/.test(afterQuote)) {
+      const rest = afterQuote.replace(/^[ \t]+/, "");
+      if (rest.length === afterQuote.length || !rest || /^[\r\n]/.test(rest)) {
         return command;
       }
-      const rest = afterQuote.trimStart();
-      if (rest && !PS_NON_INVOCATION_TAIL_RE.test(rest)) {
+      if (!PS_NON_INVOCATION_TAIL_RE.test(rest)) {
         return `& ${trimmed}`;
       }
       return command;
@@ -1008,7 +676,32 @@ async function resolveWindowsPowerShell(probe = defaultProbeWindowsShell) {
   })();
   return pendingWindowsPowerShellProbe;
 }
+function hasDefinedEnvKey(env, key, platform) {
+  if (env[key] !== void 0) return true;
+  if (platform !== "win32") return false;
+  const upper = key.toUpperCase();
+  for (const existing of Object.keys(env)) {
+    if (existing.toUpperCase() === upper && env[existing] !== void 0) {
+      return true;
+    }
+  }
+  return false;
+}
+function withNonInteractiveGitEnv(baseEnv = process.env, platform = process.platform) {
+  const result = { ...baseEnv };
+  if (!hasDefinedEnvKey(baseEnv, "GIT_TERMINAL_PROMPT", platform)) {
+    result.GIT_TERMINAL_PROMPT = "0";
+  }
+  if (!hasDefinedEnvKey(baseEnv, "GCM_INTERACTIVE", platform)) {
+    result.GCM_INTERACTIVE = "never";
+  }
+  return result;
+}
 async function runShellCommandAsync(command, options) {
+  const effectiveOptions = {
+    ...options,
+    env: withNonInteractiveGitEnv(options.env)
+  };
   if (process.platform === "win32") {
     const effectiveCommand = unwrapTrivialWindowsPowerShellCommand(command);
     if (needsPowerShellOnWindows(effectiveCommand)) {
@@ -1019,13 +712,13 @@ async function runShellCommandAsync(command, options) {
           cachedWindowsPowerShellExecPath ?? psBin,
           ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", utf8Command],
           false,
-          options
+          effectiveOptions
         );
       }
     }
-    return spawnAndCollect(effectiveCommand, [], true, options);
+    return spawnAndCollect(effectiveCommand, [], true, effectiveOptions);
   }
-  return spawnAndCollect(command, [], true, options);
+  return spawnAndCollect(command, [], true, effectiveOptions);
 }
 function spawnAndCollect(commandOrBin, args, shell, options) {
   const startMs = Date.now();
@@ -1064,9 +757,10 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
       return;
     }
     let settleFallbackTimer = null;
+    let sigkillTimer = null;
     const timer = setTimeout(() => {
       timedOut = true;
-      killChildTree(child.pid, detached);
+      sigkillTimer = killChildTree(child.pid, detached);
       settleFallbackTimer = setTimeout(() => {
         child.stdout?.destroy();
         child.stderr?.destroy();
@@ -1079,6 +773,7 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (sigkillTimer) clearTimeout(sigkillTimer);
       if (settleFallbackTimer) clearTimeout(settleFallbackTimer);
       resolve({
         exitCode,
@@ -1130,21 +825,396 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
   });
 }
 var cachedRgAvailable = null;
+var pendingRgProbe = null;
 async function isRipgrepAvailable() {
   if (cachedRgAvailable !== null) return cachedRgAvailable;
-  const res = await execBinaryAsync("rg", ["--version"], {
-    cwd: process.cwd(),
-    timeoutMs: 2e3,
-    maxOutputBytes: 4096
-  });
-  cachedRgAvailable = !res.error && res.exitCode === 0;
-  return cachedRgAvailable;
+  if (pendingRgProbe) return pendingRgProbe;
+  let probe = null;
+  probe = (async () => {
+    try {
+      const res = await execBinaryAsync("rg", ["--version"], {
+        cwd: os.tmpdir(),
+        timeoutMs: 2e3,
+        maxOutputBytes: 4096
+      });
+      const available = !res.error && !res.timedOut && res.exitCode === 0;
+      if (!res.timedOut && pendingRgProbe === probe) {
+        cachedRgAvailable = available;
+      }
+      return available;
+    } finally {
+      if (pendingRgProbe === probe) {
+        pendingRgProbe = null;
+      }
+    }
+  })();
+  pendingRgProbe = probe;
+  return probe;
 }
 
-// src/utils/host-compat.ts
-import fs from "node:fs";
-import os from "node:os";
+// src/utils/fs-utils.ts
+import { promises as fs } from "node:fs";
+import os2 from "node:os";
 import path2 from "node:path";
+var DEFAULT_IGNORE_DIRS = /* @__PURE__ */ new Set([
+  ".git",
+  ".hg",
+  ".svn",
+  "node_modules",
+  "dist",
+  "build",
+  "out",
+  "target",
+  ".next",
+  ".nuxt",
+  ".svelte-kit",
+  ".cache",
+  ".turbo",
+  "coverage",
+  "__pycache__",
+  ".venv",
+  "venv",
+  ".tox",
+  ".pytest_cache",
+  ".mypy_cache",
+  ".ruff_cache",
+  ".gradle",
+  ".idea",
+  "vendor"
+]);
+function expandHome(inputPath) {
+  if (inputPath === "~") return os2.homedir();
+  if (inputPath.startsWith("~/") || inputPath.startsWith("~\\")) {
+    return path2.join(os2.homedir(), inputPath.slice(2));
+  }
+  return inputPath;
+}
+function resolvePath(inputPath, baseDir) {
+  const expanded = expandHome(inputPath.trim());
+  const root = baseDir ? path2.resolve(expandHome(baseDir)) : process.cwd();
+  return path2.resolve(root, expanded);
+}
+function toPosixPath(p) {
+  return p.split(path2.sep).join("/");
+}
+function isLikelyBinary(buf) {
+  const limit = Math.min(buf.length, 8192);
+  for (let i = 0; i < limit; i++) {
+    if (buf[i] === 0) return true;
+  }
+  return false;
+}
+function hasUtf8Bom(buf) {
+  return buf.length >= 3 && buf[0] === 239 && buf[1] === 187 && buf[2] === 191;
+}
+function detectUtf16Bom(buf) {
+  if (buf.length < 2) return null;
+  if (buf[0] === 255 && buf[1] === 254) {
+    if (buf.length >= 4 && buf[2] === 0 && buf[3] === 0) {
+      return null;
+    }
+    return "UTF-16 LE";
+  }
+  if (buf[0] === 254 && buf[1] === 255) {
+    return "UTF-16 BE";
+  }
+  return null;
+}
+async function readTextFile(filePath, maxBytes = 10 * 1024 * 1024) {
+  const stat = await fs.stat(filePath);
+  if (!stat.isFile()) {
+    throw new Error(`Not a regular file: ${filePath}`);
+  }
+  if (stat.size > maxBytes) {
+    throw new Error(
+      `File exceeds maximum size (${stat.size} bytes > ${maxBytes} bytes): ${filePath}`
+    );
+  }
+  const buf = await fs.readFile(filePath);
+  const utf16Bom = detectUtf16Bom(buf);
+  if (utf16Bom) {
+    throw new Error(
+      `UTF-16 encoded file is not supported (convert to UTF-8 first): ${filePath} [${utf16Bom}]`
+    );
+  }
+  if (isLikelyBinary(buf)) {
+    throw new Error(`Binary file cannot be read as text: ${filePath}`);
+  }
+  const hasBom = hasUtf8Bom(buf);
+  const rawContent = (hasBom ? buf.subarray(3) : buf).toString("utf8");
+  let crlfCount = 0;
+  let lfOnlyCount = 0;
+  for (let i = 0; i < rawContent.length; i++) {
+    if (rawContent[i] === "\n") {
+      if (i > 0 && rawContent[i - 1] === "\r") crlfCount++;
+      else lfOnlyCount++;
+    }
+  }
+  const eol = crlfCount > lfOnlyCount ? "\r\n" : "\n";
+  const mixedEol = crlfCount > 0 && lfOnlyCount > 0;
+  return {
+    content: rawContent,
+    rawContent,
+    eol,
+    mixedEol,
+    hasBom,
+    size: stat.size,
+    mode: stat.mode & 4095,
+    rawBuffer: buf
+  };
+}
+function globToRegExp(pattern) {
+  const normalized = pattern.trim().replace(/\\/g, "/").replace(/^\.\//, "").replace(/\*{3,}/g, "**").replace(/(?:\*\*\/)+/g, "**/");
+  const re = `^${compileGlobBody(normalized)}$`;
+  try {
+    return new RegExp(re);
+  } catch (err) {
+    throw new Error(
+      `Invalid glob pattern '${pattern}': ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+}
+function compileGlobBody(normalized) {
+  let re = "";
+  let i = 0;
+  while (i < normalized.length) {
+    const ch = normalized[i];
+    if (ch === "*") {
+      if (normalized[i + 1] === "*") {
+        if (normalized[i + 2] === "/") {
+          re += "(?:.*/)?";
+          i += 3;
+        } else {
+          re += ".*";
+          i += 2;
+        }
+      } else {
+        re += "[^/]*";
+        i += 1;
+      }
+    } else if (ch === "?") {
+      re += "[^/]";
+      i += 1;
+    } else if (ch === "[") {
+      const close = findClosingBracket(normalized, i);
+      if (close === -1) {
+        re += "\\[";
+        i += 1;
+      } else {
+        let inner = normalized.slice(i + 1, close);
+        const negated = inner.startsWith("!") || inner.startsWith("^");
+        if (negated) inner = inner.slice(1);
+        inner = inner.replace(/\\/g, "\\\\").replace(/\]/g, "\\]");
+        re += negated ? `(?!/)[${"^"}${inner}]` : `[${inner}]`;
+        i = close + 1;
+      }
+    } else if (ch === "{") {
+      const close = findMatchingBrace(normalized, i);
+      if (close === -1) {
+        re += "\\{";
+        i += 1;
+      } else {
+        const parts = splitBraceAlternatives(normalized.slice(i + 1, close));
+        const sub = parts.map((part) => compileGlobBody(part.replace(/\*{3,}/g, "**").replace(/(?:\*\*\/)+/g, "**/"))).join("|");
+        re += `(?:${sub})`;
+        i = close + 1;
+      }
+    } else if (".+^$()|\\".includes(ch)) {
+      re += "\\" + ch;
+      i += 1;
+    } else {
+      re += ch;
+      i += 1;
+    }
+  }
+  return re;
+}
+function findClosingBracket(str, openIdx) {
+  let i = openIdx + 1;
+  if (i < str.length && (str[i] === "!" || str[i] === "^")) i++;
+  if (i < str.length && str[i] === "]") i++;
+  for (; i < str.length; i++) {
+    if (str[i] === "]") return i;
+  }
+  return -1;
+}
+function findMatchingBrace(str, openIdx) {
+  let depth = 0;
+  for (let i = openIdx; i < str.length; i++) {
+    if (str[i] === "[") {
+      const close = findClosingBracket(str, i);
+      if (close !== -1) {
+        i = close;
+        continue;
+      }
+    }
+    if (str[i] === "{") depth++;
+    else if (str[i] === "}") {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+function splitBraceAlternatives(inner) {
+  const parts = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i];
+    if (ch === "[") {
+      const close = findClosingBracket(inner, i);
+      if (close !== -1) {
+        i = close;
+        continue;
+      }
+    }
+    if (ch === "{") depth++;
+    else if (ch === "}") depth--;
+    else if (ch === "," && depth === 0) {
+      parts.push(inner.slice(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(inner.slice(start));
+  return parts;
+}
+async function walkFiles(rootDir, options = {}) {
+  const maxFiles = Math.max(0, Math.trunc(options.maxFiles ?? 5e3));
+  const maxDepth = options.maxDepth ?? 32;
+  const includeHidden = options.includeHidden ?? false;
+  const ignoreDirs = options.ignoreDirs ?? DEFAULT_IGNORE_DIRS;
+  const fileFilter = options.fileFilter;
+  const timeoutMs = options.timeoutMs !== void 0 && Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? Math.max(1, Math.trunc(options.timeoutMs)) : null;
+  const deadline = timeoutMs !== null ? Date.now() + timeoutMs : null;
+  const maxDirs = options.maxDirs !== void 0 && Number.isFinite(options.maxDirs) && options.maxDirs > 0 ? Math.max(1, Math.trunc(options.maxDirs)) : null;
+  const files = [];
+  let truncated = false;
+  let timedOut = false;
+  let dirsTruncated = false;
+  let visitedDirs = 0;
+  const MAX_CONCURRENT_READDIRS = 16;
+  let activeReaddirs = 0;
+  const waitQueue = [];
+  const drainWaiters = () => {
+    while (waitQueue.length > 0) {
+      waitQueue.shift()();
+    }
+  };
+  const markTruncated = () => {
+    if (truncated) return;
+    truncated = true;
+    drainWaiters();
+  };
+  const withinBudget = () => {
+    if (truncated) return false;
+    if (deadline !== null && Date.now() >= deadline) {
+      timedOut = true;
+      markTruncated();
+      return false;
+    }
+    return true;
+  };
+  const timeoutTimer = timeoutMs !== null ? setTimeout(() => {
+    timedOut = true;
+    markTruncated();
+  }, timeoutMs) : null;
+  timeoutTimer?.unref();
+  const readDirBounded = async (dir) => {
+    if (!withinBudget()) return null;
+    while (activeReaddirs >= MAX_CONCURRENT_READDIRS) {
+      await new Promise((resolve) => waitQueue.push(resolve));
+      if (!withinBudget()) return null;
+    }
+    if (!withinBudget()) return null;
+    if (maxDirs !== null && visitedDirs >= maxDirs) {
+      dirsTruncated = true;
+      markTruncated();
+      return null;
+    }
+    visitedDirs++;
+    activeReaddirs++;
+    try {
+      return await fs.readdir(dir, { withFileTypes: true });
+    } finally {
+      activeReaddirs--;
+      if (truncated) {
+        drainWaiters();
+      } else {
+        const next = waitQueue.shift();
+        if (next) next();
+      }
+    }
+  };
+  const scanDir = async (dir, relDir) => {
+    if (!withinBudget()) return { localFiles: [], subdirs: [] };
+    let entries;
+    try {
+      entries = await readDirBounded(dir);
+    } catch {
+      return { localFiles: [], subdirs: [] };
+    }
+    if (!entries || !withinBudget()) return { localFiles: [], subdirs: [] };
+    entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+    const localFiles = [];
+    const subdirs = [];
+    for (const entry of entries) {
+      const name = entry.name;
+      if (!includeHidden && name.startsWith(".")) {
+        if (!(entry.isDirectory() && name === ".agents")) {
+          continue;
+        }
+      }
+      const relPosix = relDir ? `${relDir}/${name}` : name;
+      if (entry.isDirectory()) {
+        if (ignoreDirs.has(name)) continue;
+        subdirs.push({ abs: path2.join(dir, name), rel: relPosix });
+      } else if (entry.isFile()) {
+        if (fileFilter && !fileFilter(relPosix)) continue;
+        localFiles.push(relPosix);
+      }
+    }
+    return { localFiles, subdirs };
+  };
+  async function visit(dir, relDir, depth, prefetched) {
+    if (!withinBudget() || depth > maxDepth) return;
+    const { localFiles, subdirs } = await (prefetched ?? scanDir(dir, relDir));
+    if (!withinBudget()) return;
+    for (const relPosix of localFiles) {
+      if (files.length >= maxFiles) {
+        markTruncated();
+        return;
+      }
+      files.push(relPosix);
+    }
+    if (depth >= maxDepth || subdirs.length === 0) return;
+    const batchSize = 8;
+    for (let i = 0; i < subdirs.length && withinBudget(); i += batchSize) {
+      const slice = subdirs.slice(i, i + batchSize);
+      const prefetches = slice.map((sub) => scanDir(sub.abs, sub.rel));
+      try {
+        for (let j = 0; j < slice.length && withinBudget(); j++) {
+          await visit(slice[j].abs, slice[j].rel, depth + 1, prefetches[j]);
+        }
+      } finally {
+        if (truncated) {
+          await Promise.allSettled(prefetches);
+        }
+      }
+    }
+  }
+  try {
+    await visit(rootDir, "", 0);
+  } finally {
+    if (timeoutTimer) clearTimeout(timeoutTimer);
+  }
+  return {
+    files,
+    truncated,
+    ...timedOut ? { timedOut: true } : {},
+    ...dirsTruncated ? { dirsTruncated: true } : {}
+  };
+}
 
 // src/utils/output-filter.ts
 var ANSI_REGEX = (
@@ -1154,13 +1224,46 @@ var ANSI_REGEX = (
 function stripAnsi(text) {
   return text.replace(ANSI_REGEX, "");
 }
+var LINE_ERASE_CSI_RE = /\x1B\[(?:2K|0?K)/;
+var LEADING_CLEAR_TO_EOL_RE = /^(?:\x1B\[0?K)+/;
 function normalizeTerminalOutput(raw) {
-  const clean = stripAnsi(raw).replace(/\r\n/g, "\n");
-  return clean.split("\n").map((line) => {
-    if (!line.includes("\r")) return line;
-    const parts = line.split("\r").filter((p) => p.length > 0);
-    return parts[parts.length - 1] ?? "";
-  }).join("\n").trimEnd();
+  const rawLines = raw.replace(/\r\n/g, "\n").split("\n");
+  const normalizedLines = [];
+  for (const rawLine of rawLines) {
+    if (rawLine.length === 0) {
+      normalizedLines.push("");
+      continue;
+    }
+    const hadLineErase = LINE_ERASE_CSI_RE.test(rawLine);
+    let working = rawLine;
+    const lastFullErase = working.lastIndexOf("\x1B[2K");
+    if (lastFullErase !== -1) {
+      working = working.slice(lastFullErase + 4);
+    }
+    if (!working.includes("\r") && !hadLineErase) {
+      normalizedLines.push(stripAnsi(working));
+      continue;
+    }
+    let currentFrame = "";
+    const crFrames = working.split("\r");
+    for (let idx = 0; idx < crFrames.length; idx++) {
+      let seg = crFrames[idx];
+      if (idx > 0 && LEADING_CLEAR_TO_EOL_RE.test(seg)) {
+        seg = seg.replace(LEADING_CLEAR_TO_EOL_RE, "");
+        currentFrame = stripAnsi(seg);
+        continue;
+      }
+      const cleanSeg = stripAnsi(seg);
+      if (cleanSeg.length > 0) {
+        currentFrame = cleanSeg;
+      }
+    }
+    if (hadLineErase && currentFrame.length === 0) {
+      continue;
+    }
+    normalizedLines.push(currentFrame);
+  }
+  return normalizedLines.join("\n").trimEnd();
 }
 var DEFAULT_INLINE_MAX_BYTES = 8800;
 function sliceUtf8Bytes(text, maxBytes) {
@@ -1449,14 +1552,15 @@ function stripBenignZeroCounts(line) {
   );
   return afterLeading.replace(BENIGN_ZERO_COUNT_TRAILING_RE, " ");
 }
-var ERROR_LINE_PATTERN = /(?:\berr!|\b(?:errors?|fail(?:ed|ing|ure|ures)?|exception|traceback|panic|fatal|assertion|syntaxerror|typeerror|referenceerror|zoderror|validationerror|ts\d{4}|e\d{4}|cannot find|not found|unexpected|undefined)\b|caused by:|application failed to start|compilation error|<<<\s*(?:failure|error)|找不到符号|符号:|位置:)/i;
+var ERROR_LINE_PATTERN = /(?:\berr!|\b(?:errors?|fail(?:ed|ing|ure|ures)?|exception|traceback|panic|fatal|assertion|syntaxerror|typeerror|referenceerror|zoderror|validationerror|ts\d{4}|e\d{4}|cannot find|not found|unexpected|undefined)\b|^\s*(?:not ok\b|[✖✕✘✗×]\s+\S|●\s+(?!Console\s*$|\((?:SSG|Static|Dynamic|ISR)\)(?:\s|$))\S)|caused by:|application failed to start|compilation error|<<<\s*(?:failure|error)|找不到符号|符号:|位置:)/i;
 var ROOT_CAUSE_HEADER_PATTERN = /(?:^\s*(?:description|action):|caused by:|application failed to start|⎯\s*failed tests|compilation error)/i;
-var FOLD_DANGER_TOKEN_PATTERN = /(?:\berr!|\b(?:errors?|fail(?:ed|ing|ure|ures)?|warns?|warnings?|exceptions?|tracebacks?|panics?|fatals?|assertions?|syntaxerror|typeerror|referenceerror|zoderror|validationerror|ts\d{4}|e\d{4}|cannot find|not found|unexpected|undefined|compilation error|killed|sigkill|sigsegv|sigabrt|oom|out of memory|timed out|timeout|refused|denied|permission|unhandled|mismatched|mismatch)\b|\bexit\s+(?:status|code)\s+[1-9]\d*\b|caused by:|application failed to start|<<<\s*(?:failure|error)|[✖✘✗×]\s+|找不到符号|符号:|位置:|错误|失败|异常|警告)/i;
+var FOLD_DANGER_TOKEN_PATTERN = /(?:\berr!|\b(?:errors?|fail(?:ed|ing|ure|ures)?|warns?|warnings?|exceptions?|tracebacks?|panics?|fatals?|assertions?|syntaxerror|typeerror|referenceerror|zoderror|validationerror|ts\d{4}|e\d{4}|cannot find|not found|unexpected|undefined|compilation error|killed|sigkill|sigsegv|sigabrt|oom|out of memory|timed out|timeout|refused|denied|permission|unhandled|mismatched|mismatch)\b|\bexit\s+(?:status|code)\s+[1-9]\d*\b|caused by:|application failed to start|<<<\s*(?:failure|error)|[✖✕✘✗×]\s+|找不到符号|符号:|位置:|错误|失败|异常|警告)/i;
 function isErrorLine(line) {
   return ERROR_LINE_PATTERN.test(stripBenignZeroCounts(line));
 }
 function hasFoldDangerToken(line) {
-  return FOLD_DANGER_TOKEN_PATTERN.test(stripBenignZeroCounts(line));
+  const cleaned = stripBenignZeroCounts(line);
+  return ERROR_LINE_PATTERN.test(cleaned) || FOLD_DANGER_TOKEN_PATTERN.test(cleaned);
 }
 var JSON_INFO_LOG_PATTERNS = [
   /^\s*\{"level":(?:10|20|30)\b/,
@@ -1515,18 +1619,32 @@ var GREEN_BUILD_OR_PASS_PATTERNS = [
   /^>\s+Task\s+:[\w:.-]+\s+(?:UP-TO-DATE|FROM-CACHE|NO-SOURCE|SKIPPED)\s*$/,
   /^\[INFO\]\s*(?:---\s+\S|Building\s+\S|Compiling\s+\S|Changes detected|Nothing to compile|Copying\s+\d+|Using\s+'[^']+'\s+encoding|Downloading\b|Downloaded\b|Installing\s+\S|Packaging\s+\S|Tests run:\s*\d+,\s*Failures:\s*0,\s*Errors:\s*0\b|Results:|Running\s+\S|Reactor Summary|BUILD SUCCESS|Total time:|Finished at:|-+\s*$|$)/i
 ];
+var UNAMBIGUOUS_TEST_PASS_PATTERNS = [
+  /^[✓✔]\s+(?!built\b|done\b|\d+\s+modules?\s+transformed\b)\S/,
+  /^---\s+PASS:\s+\S/,
+  /^ok\s+\d+\s+-\s+\S/,
+  /^ok\t\S/,
+  /^test\s+\S+\s+\.\.\.\s+ok\s*$/,
+  /^PASS\s+\S+\.(?:[cm]?[jt]sx?|py|go|rs|rb|java|kt|cs|php|vue|svelte)\b/
+];
+function isUnambiguousTestPassLine(trimmed) {
+  if (!trimmed || /[✖✕✘✗×]/.test(trimmed)) return false;
+  return UNAMBIGUOUS_TEST_PASS_PATTERNS.some((re) => re.test(trimmed));
+}
 var MIN_FOLD_RUN_LINES = 4;
 var PROTECTED_TAIL_LINES = 15;
 function isGreenBuildOrPassLine(line) {
   const trimmed = line.trim();
   if (!trimmed) return false;
+  if (isUnambiguousTestPassLine(trimmed)) return true;
+  const prefixMatch = MONOREPO_PREFIX_PATTERN.exec(trimmed);
+  const inner = prefixMatch ? trimmed.slice(prefixMatch[0].length).trim() : "";
+  if (inner && isUnambiguousTestPassLine(inner)) return true;
   if (hasFoldDangerToken(trimmed)) return false;
   if (GREEN_BUILD_OR_PASS_PATTERNS.some((re) => re.test(trimmed))) {
     return true;
   }
-  const prefixMatch = MONOREPO_PREFIX_PATTERN.exec(trimmed);
   if (prefixMatch) {
-    const inner = trimmed.slice(prefixMatch[0].length).trim();
     if (!inner) return false;
     if (inner === "Done") return true;
     return GREEN_BUILD_OR_PASS_PATTERNS.some((re) => re.test(inner));
@@ -1693,12 +1811,18 @@ function compactLongFailureLines(lines, maxChars) {
   const keepIndices = /* @__PURE__ */ new Set();
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+    const trimmed = line.trim();
+    const monoMatch = MONOREPO_PREFIX_PATTERN.exec(trimmed);
+    const monoInner = monoMatch ? trimmed.slice(monoMatch[0].length).trim() : "";
+    if (isUnambiguousTestPassLine(trimmed) || monoInner.length > 0 && isUnambiguousTestPassLine(monoInner)) {
+      continue;
+    }
     if (ROOT_CAUSE_HEADER_PATTERN.test(line)) {
       if (firstErrorLineIdx === -1) firstErrorLineIdx = i;
       const from = Math.max(0, i - 1);
       const to = Math.min(lines.length - 1, i + 8);
       for (let j = from; j <= to; j++) keepIndices.add(j);
-    } else if (isErrorLine(line)) {
+    } else if (isErrorLine(line) || monoInner.length > 0 && !/\s/.test(monoMatch[0].trimEnd()) && isErrorLine(monoInner)) {
       if (firstErrorLineIdx === -1) firstErrorLineIdx = i;
       const from = Math.max(0, i - 1);
       const to = Math.min(lines.length - 1, i + 3);
@@ -1853,6 +1977,46 @@ ${formatOmittedLinesMarker(omitted, true)}
   }
   return headText.length <= limit ? headText : sliceSafeChars(headText, limit);
 }
+function describeFatalExitCode(exitCode) {
+  switch (exitCode) {
+    case 137:
+      return "exit 137 / SIGKILL - possible OOM";
+    case 139:
+      return "exit 139 / SIGSEGV - segmentation fault";
+    case 134:
+      return "exit 134 / SIGABRT - process aborted";
+    case 3221225477:
+    case -1073741819:
+      return "exit 0xC0000005 / STATUS_ACCESS_VIOLATION";
+    case 3221225725:
+    case -1073741571:
+      return "exit 0xC00000FD / STATUS_STACK_OVERFLOW";
+    case 3221226505:
+    case -1073740791:
+      return "exit 0xC0000409 / STATUS_STACK_BUFFER_OVERRUN";
+    default:
+      return null;
+  }
+}
+function formatExitFailureLabel(exitCode, signal) {
+  if (signal) {
+    switch (signal) {
+      case "SIGKILL":
+        return "SIGKILL - possible OOM";
+      case "SIGSEGV":
+        return "SIGSEGV - segmentation fault";
+      case "SIGABRT":
+        return "SIGABRT - process aborted";
+      case "SIGTERM":
+        return "SIGTERM";
+      default:
+        return String(signal);
+    }
+  }
+  const fatalExit = describeFatalExitCode(exitCode);
+  if (fatalExit) return fatalExit;
+  return `exit ${exitCode ?? "err"}`;
+}
 function prepareCompactCommandOutput(params) {
   const out = normalizeTerminalOutput(params.stdout);
   const err = normalizeTerminalOutput(params.stderr);
@@ -1901,9 +2065,11 @@ ${tail}` : "TIMED OUT (no output)",
     };
   }
   if (!combined) {
+    const fatalExitLabel = params.signal ? null : describeFatalExitCode(params.exitCode);
+    const bodyText = params.signal ? `Terminated by ${formatExitFailureLabel(params.exitCode, params.signal)}` : fatalExitLabel ? `Terminated (${fatalExitLabel})` : `Exited with code ${params.exitCode ?? "unknown"}`;
     return {
       kind: "fail-empty",
-      bodyText: `Exited with code ${params.exitCode ?? "unknown"}`,
+      bodyText,
       collapsedLines: 0,
       rawLines: 0,
       rawChars: 0
@@ -1997,581 +2163,6 @@ function getTailLines(text, count) {
   return lines.slice(-count).join("\n");
 }
 
-// src/utils/host-compat.ts
-var HOST_COMPAT_RULES = [
-  {
-    id: "agy-cli-1.5-call-mcp-tool-empty-edits",
-    surface: "cli",
-    minVersion: "1.5.0",
-    // Antigravity CLI >= 1.5.8 supports `"eager": true` in mcp_config.json,
-    // which registers typed native mcp_agy-fast_fast_* tools and bypasses
-    // lazy call_mcp_tool altogether (keeping token-saving native array edits).
-    // Pre-eager CLI 1.5.0-1.5.7 keeps the JSON-string workaround automatically;
-    // any lazy/custom setup can still opt in via AGY_FAST_EDITS_FORMAT=string.
-    maxVersionExclusive: "1.5.8",
-    editsFormat: "string",
-    reason: "Pre-eager Antigravity CLI 1.5.0-1.5.7 loads tools lazily via call_mcp_tool where long native edits arrays can drop to []; JSON array string avoids payload loss"
-  }
-];
-function parseHostSemverParts(raw) {
-  const m = /(?:^|[^0-9.])v?(\d+)\.(\d+)\.(\d+)(?:\.\d+)?(?:-([0-9A-Za-z.-]+))?(?:$|[^0-9.])/.exec(
-    raw.trim()
-  );
-  if (!m) return null;
-  const major = Number.parseInt(m[1], 10);
-  const minor = Number.parseInt(m[2], 10);
-  const patch = Number.parseInt(m[3], 10);
-  if (!Number.isSafeInteger(major) || !Number.isSafeInteger(minor) || !Number.isSafeInteger(patch) || major > 999999 || minor > 999999 || patch > 999999) {
-    return null;
-  }
-  return { major, minor, patch, prerelease: m[4] ?? null };
-}
-function formatHostSemverParts(parts) {
-  const base = `${parts.major}.${parts.minor}.${parts.patch}`;
-  return parts.prerelease ? `${base}-${parts.prerelease}` : base;
-}
-function comparePrerelease(a, b) {
-  const aParts = a.split(".");
-  const bParts = b.split(".");
-  const len = Math.max(aParts.length, bParts.length);
-  for (let i = 0; i < len; i++) {
-    const ai = aParts[i];
-    const bi = bParts[i];
-    if (ai === void 0) return -1;
-    if (bi === void 0) return 1;
-    if (ai === bi) continue;
-    const aNum = /^\d+$/.test(ai);
-    const bNum = /^\d+$/.test(bi);
-    if (aNum && bNum) {
-      const diff = Number.parseInt(ai, 10) - Number.parseInt(bi, 10);
-      if (diff !== 0) return diff > 0 ? 1 : -1;
-    } else if (aNum !== bNum) {
-      return aNum ? -1 : 1;
-    } else {
-      return ai < bi ? -1 : 1;
-    }
-  }
-  return 0;
-}
-function compareHostSemver(a, b) {
-  const pa = parseHostSemverParts(a);
-  const pb = parseHostSemverParts(b);
-  if (!pa || !pb) return a.localeCompare(b);
-  if (pa.major !== pb.major) return pa.major > pb.major ? 1 : -1;
-  if (pa.minor !== pb.minor) return pa.minor > pb.minor ? 1 : -1;
-  if (pa.patch !== pb.patch) return pa.patch > pb.patch ? 1 : -1;
-  if (pa.prerelease === pb.prerelease) return 0;
-  if (pa.prerelease === null) return 1;
-  if (pb.prerelease === null) return -1;
-  return comparePrerelease(pa.prerelease, pb.prerelease);
-}
-function parseEditsFormatMode(raw) {
-  if (typeof raw !== "string") return null;
-  const v = raw.trim().toLowerCase();
-  if (v === "auto" || v === "array" || v === "string") return v;
-  return null;
-}
-function parseHostOverride(raw) {
-  if (typeof raw !== "string") return null;
-  const trimmed = raw.trim().toLowerCase();
-  if (!trimmed) return null;
-  const m = /^(cli|desktop|app|antigravity|ide|unknown)(?:[@\-/\s](.+))?$/.exec(trimmed);
-  if (!m) return null;
-  const surface = m[1] === "app" || m[1] === "antigravity" ? "desktop" : m[1];
-  if (m[2] !== void 0) {
-    const parts = parseHostSemverParts(m[2]);
-    if (!parts) return null;
-    return { surface, version: formatHostSemverParts(parts) };
-  }
-  return { surface, version: null };
-}
-var EXPLICIT_THIRD_PARTY_CLIENT_RE = /^(?:claude(?:[-_\s]|$)|cursor(?:[-_\s]|$)|windsurf(?:[-_\s]|$)|vscode(?:[-_\s]|$)|visual[\s_-]+studio[\s_-]+code|codex(?:[-_\s]|$)|zed(?:[-_\s]|$)|cline(?:[-_\s]|$)|roo[-_\s]?code|continue(?:[-_\s]|$)|opencode(?:[-_\s]|$)|aider(?:[-_\s]|$)|goose(?:[-_\s]|$)|jetbrains(?:[-_\s]|$)|neovim(?:[-_\s]|$)|nvim(?:[-_\s]|$)|emacs(?:[-_\s]|$)|mcp[-_\s]?inspector(?:[-_\s]|$))/i;
-function isExplicitThirdPartyClient(rawName) {
-  if (typeof rawName !== "string") return false;
-  return EXPLICIT_THIRD_PARTY_CLIENT_RE.test(rawName.trim());
-}
-function parseSurfaceFromClientName(rawName) {
-  if (typeof rawName !== "string") return null;
-  const s = rawName.trim().toLowerCase();
-  if (!s || s.startsWith("agy-fast")) return null;
-  if (/^(?:google[-_\s]?)?antigravity[-_\s]?cli$/.test(s) || /^agy(?:[-_\s]?cli)?$/.test(s)) {
-    return "cli";
-  }
-  if (/^(?:google[-_\s]?)?antigravity[-_\s]?ide$/.test(s)) {
-    return "ide";
-  }
-  if (/^(?:google[-_\s]?)?antigravity(?:[-_\s]?(?:2\.0|app|desktop))?$/.test(s)) {
-    return "desktop";
-  }
-  return null;
-}
-function parseLsVersion(raw) {
-  if (typeof raw !== "string") return null;
-  const trimmed = raw.trim();
-  if (!trimmed) return null;
-  const parts = parseHostSemverParts(trimmed);
-  const version = parts ? formatHostSemverParts(parts) : null;
-  if (/^(?:antigravity[-_\s]?)?cli(?:[-_/@\s]|$)/i.test(trimmed)) {
-    return { surface: "cli", version };
-  }
-  if (/^(?:antigravity[-_\s]?)?ide(?:[-_/@\s]|$)/i.test(trimmed)) {
-    return { surface: "ide", version };
-  }
-  if (/^(?:antigravity[-_\s]?)?(?:desktop|app)(?:[-_/@\s]|$)/i.test(trimmed)) {
-    return { surface: "desktop", version };
-  }
-  if (/^antigravity(?:[-_/@\s]|$)/i.test(trimmed)) {
-    return { surface: "desktop", version };
-  }
-  if (version) {
-    return { surface: null, version };
-  }
-  return null;
-}
-function parseSurfaceFromPath(rawPath, allowTrailingAppDir = false) {
-  if (typeof rawPath !== "string" || !rawPath.trim()) return null;
-  const segs = rawPath.trim().replace(/\\/g, "/").split("/").filter(Boolean).map((s) => s.toLowerCase());
-  for (let i = 0; i < segs.length - 1; i++) {
-    if (segs[i] !== ".gemini") continue;
-    const next = segs[i + 1];
-    if (next === "antigravity-cli") return "cli";
-    if (next === "antigravity-ide") return "ide";
-    if (next === "antigravity") return "desktop";
-  }
-  if (allowTrailingAppDir && segs.length > 0) {
-    const tail = segs[segs.length - 1];
-    if (tail === "antigravity-cli") return "cli";
-    if (tail === "antigravity-ide") return "ide";
-    if (tail === "antigravity") return "desktop";
-  }
-  return null;
-}
-function detectHostIdentity(signals = {}) {
-  const env = signals.env ?? process.env;
-  const rawClientName = typeof signals.clientInfo?.name === "string" && signals.clientInfo.name.trim() ? signals.clientInfo.name.trim() : void 0;
-  const rawClientVersion = typeof signals.clientInfo?.version === "string" && signals.clientInfo.version.trim() ? signals.clientInfo.version.trim() : void 0;
-  const modelName = typeof signals.modelName === "string" && signals.modelName.trim() ? signals.modelName.trim() : void 0;
-  const override = parseHostOverride(env.AGY_FAST_HOST);
-  if (override) {
-    return {
-      surface: override.surface,
-      version: override.version,
-      source: "override",
-      rawClientName,
-      rawClientVersion,
-      modelName
-    };
-  }
-  if (isExplicitThirdPartyClient(rawClientName)) {
-    return {
-      surface: "unknown",
-      version: null,
-      source: "mcp:client-info",
-      rawClientName,
-      rawClientVersion,
-      modelName
-    };
-  }
-  const clientSurface = parseSurfaceFromClientName(rawClientName);
-  const clientVerParts = clientSurface && rawClientVersion ? parseHostSemverParts(rawClientVersion) : null;
-  const clientVersion = clientVerParts ? formatHostSemverParts(clientVerParts) : null;
-  const hookSurface = parseSurfaceFromPath(signals.transcriptPath) ?? parseSurfaceFromPath(signals.artifactDirectoryPath);
-  const lsInfo = parseLsVersion(env.ANTIGRAVITY_LS_VERSION);
-  const appDataSurface = parseSurfaceFromPath(env.ANTIGRAVITY_APP_DATA_DIR, true);
-  let surface = "unknown";
-  let source = "unknown";
-  if (clientSurface) {
-    surface = clientSurface;
-    source = "mcp:client-info";
-  } else if (hookSurface) {
-    surface = hookSurface;
-    source = "hook:path";
-  } else if (lsInfo?.surface) {
-    surface = lsInfo.surface;
-    source = "env:ls-version";
-  } else if (appDataSurface) {
-    surface = appDataSurface;
-    source = "env:app-data-dir";
-  }
-  let version = null;
-  if (clientSurface === surface && clientVersion) {
-    version = clientVersion;
-  } else if (surface !== "unknown" && lsInfo?.version && (lsInfo.surface === null || lsInfo.surface === surface)) {
-    version = lsInfo.version;
-  }
-  return {
-    surface,
-    version,
-    source,
-    rawClientName,
-    rawClientVersion,
-    modelName
-  };
-}
-function ruleMatchesIdentity(rule, identity) {
-  if (rule.surface !== identity.surface) return false;
-  if (rule.minVersion !== void 0 || rule.maxVersionExclusive !== void 0) {
-    if (!identity.version) return false;
-    if (rule.minVersion !== void 0 && compareHostSemver(identity.version, rule.minVersion) < 0) {
-      return false;
-    }
-    if (rule.maxVersionExclusive !== void 0 && compareHostSemver(identity.version, rule.maxVersionExclusive) >= 0) {
-      return false;
-    }
-  }
-  return true;
-}
-function resolveHostCompat(signals = {}, rules = HOST_COMPAT_RULES) {
-  const env = signals.env ?? process.env;
-  const identity = detectHostIdentity(signals);
-  let ruleEditsFormat;
-  let callBudgetSec = MCP_CALL_BUDGET_SEC;
-  let inlineMaxBytes = DEFAULT_INLINE_MAX_BYTES;
-  const matchedRuleIds = [];
-  const reasons = [];
-  for (const rule of rules) {
-    if (!ruleMatchesIdentity(rule, identity)) continue;
-    matchedRuleIds.push(rule.id);
-    if (rule.editsFormat !== void 0) ruleEditsFormat = rule.editsFormat;
-    if (rule.callBudgetSec !== void 0) callBudgetSec = rule.callBudgetSec;
-    if (rule.inlineMaxBytes !== void 0) inlineMaxBytes = rule.inlineMaxBytes;
-    if (rule.reason) reasons.push(rule.reason);
-  }
-  const envMode = parseEditsFormatMode(env.AGY_FAST_EDITS_FORMAT);
-  const cfgMode = parseEditsFormatMode(signals.configEditsFormat);
-  let editsFormat = "array";
-  let editsFormatSource = "token-saving-default";
-  let reason = reasons[0] ?? "Defaulting to native array edits for lower output token usage (~2.6-3.3x cheaper than double-escaped JSON strings)";
-  if (envMode === "array" || envMode === "string") {
-    editsFormat = envMode;
-    editsFormatSource = "env-override";
-    reason = `Forced by AGY_FAST_EDITS_FORMAT=${envMode}`;
-  } else if (envMode !== "auto" && (cfgMode === "array" || cfgMode === "string")) {
-    editsFormat = cfgMode;
-    editsFormatSource = "config-override";
-    reason = `Configured in agy-fast config.json (editsFormat=${cfgMode})`;
-  } else if (ruleEditsFormat !== void 0) {
-    editsFormat = ruleEditsFormat;
-    editsFormatSource = "compat-rule";
-  }
-  return {
-    identity,
-    editsFormat,
-    editsFormatSource,
-    callBudgetSec,
-    inlineMaxBytes,
-    matchedRuleIds,
-    reason
-  };
-}
-function getConfigPath(env = process.env) {
-  const custom = env.AGY_FAST_CACHE_DIR?.trim();
-  const home = process.platform === "win32" ? env.USERPROFILE || env.HOME || os.homedir() : env.HOME || env.USERPROFILE || os.homedir();
-  const cacheDir = custom ? path2.resolve(custom) : path2.join(home, ".gemini", "cache", "agy-fast");
-  return path2.join(cacheDir, "config.json");
-}
-function readSavedEditsFormatSync(env = process.env) {
-  try {
-    const raw = fs.readFileSync(getConfigPath(env), "utf8");
-    const parsed = JSON.parse(raw);
-    return parseEditsFormatMode(parsed?.editsFormat) ?? void 0;
-  } catch {
-    return void 0;
-  }
-}
-
-// src/tools/apply-edits.ts
-import { promises as fs3 } from "node:fs";
-import path4 from "node:path";
-
-// src/utils/arg-validation.ts
-function isPlainObject(value) {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-function describeValueType(value) {
-  if (value === null) return "null";
-  if (value === void 0) return "undefined";
-  if (Array.isArray(value)) return `array (len=${value.length})`;
-  if (typeof value === "boolean") return `boolean (${String(value)})`;
-  if (typeof value === "number") return `number (${String(value)})`;
-  if (typeof value === "string") return `string (len=${value.length})`;
-  return typeof value;
-}
-function parseMaybeJsonArray(value) {
-  if (value === void 0) {
-    return { ok: false, kind: "missing", detail: "undefined" };
-  }
-  if (Array.isArray(value)) {
-    return { ok: true, value };
-  }
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (!trimmed) {
-      return { ok: false, kind: "wrong_type", detail: "empty string" };
-    }
-    try {
-      const parsed = JSON.parse(trimmed);
-      if (Array.isArray(parsed)) {
-        return { ok: true, value: parsed };
-      }
-      if (parsed === null || typeof parsed === "boolean") {
-        return {
-          ok: false,
-          kind: "corrupted_literal",
-          detail: describeValueType(parsed),
-          value: parsed
-        };
-      }
-      return {
-        ok: false,
-        kind: "invalid_json",
-        detail: `decoded to ${describeValueType(parsed)} instead of a JSON array`
-      };
-    } catch (err) {
-      return {
-        ok: false,
-        kind: "invalid_json",
-        detail: err instanceof Error ? err.message : String(err)
-      };
-    }
-  }
-  return {
-    ok: false,
-    kind: "wrong_type",
-    detail: describeValueType(value)
-  };
-}
-function formatCorruptedArrayError(options) {
-  const details = options.items.slice(0, 8).map(
-    (item) => `- ${item.label}: received ${describeValueType(item.value)} instead of ${item.expected ?? "an object"}`
-  );
-  if (options.items.length > 8) {
-    details.push(`- ... (+${options.items.length - 8} more corrupted entries)`);
-  }
-  return [
-    `${options.header}: nested argument serialization corruption detected in call_mcp_tool.`,
-    ...details,
-    "",
-    `Hint: untyped call_mcp_tool Arguments can occasionally collapse nested objects/arrays into booleans, null, or an empty array. Do NOT retry the same ${options.toolName} payload \u2014 ${options.fallbackAdvice}`
-  ].join("\n");
-}
-
-// src/utils/fs-utils.ts
-import { promises as fs2 } from "node:fs";
-import os2 from "node:os";
-import path3 from "node:path";
-var DEFAULT_IGNORE_DIRS = /* @__PURE__ */ new Set([
-  ".git",
-  ".hg",
-  ".svn",
-  "node_modules",
-  "dist",
-  "build",
-  "out",
-  "target",
-  ".next",
-  ".nuxt",
-  ".svelte-kit",
-  ".cache",
-  ".turbo",
-  "coverage",
-  "__pycache__",
-  ".venv",
-  "venv",
-  ".tox",
-  ".pytest_cache",
-  ".mypy_cache",
-  ".ruff_cache",
-  ".gradle",
-  ".idea",
-  "vendor"
-]);
-function expandHome(inputPath) {
-  if (inputPath === "~") return os2.homedir();
-  if (inputPath.startsWith("~/") || inputPath.startsWith("~\\")) {
-    return path3.join(os2.homedir(), inputPath.slice(2));
-  }
-  return inputPath;
-}
-function resolvePath(inputPath, baseDir) {
-  const expanded = expandHome(inputPath.trim());
-  const root = baseDir ? path3.resolve(expandHome(baseDir)) : process.cwd();
-  return path3.isAbsolute(expanded) ? path3.normalize(expanded) : path3.resolve(root, expanded);
-}
-function toPosixPath(p) {
-  return p.split(path3.sep).join("/");
-}
-function isLikelyBinary(buf) {
-  const limit = Math.min(buf.length, 8192);
-  for (let i = 0; i < limit; i++) {
-    if (buf[i] === 0) return true;
-  }
-  return false;
-}
-async function readTextFile(filePath, maxBytes = 10 * 1024 * 1024) {
-  const stat = await fs2.stat(filePath);
-  if (!stat.isFile()) {
-    throw new Error(`Not a regular file: ${filePath}`);
-  }
-  if (stat.size > maxBytes) {
-    throw new Error(
-      `File exceeds maximum size (${stat.size} bytes > ${maxBytes} bytes): ${filePath}`
-    );
-  }
-  const buf = await fs2.readFile(filePath);
-  if (isLikelyBinary(buf)) {
-    throw new Error(`Binary file cannot be read as text: ${filePath}`);
-  }
-  const content = buf.toString("utf8");
-  let crlfCount = 0;
-  let lfOnlyCount = 0;
-  for (let i = 0; i < content.length; i++) {
-    if (content[i] === "\n") {
-      if (i > 0 && content[i - 1] === "\r") crlfCount++;
-      else lfOnlyCount++;
-    }
-  }
-  const eol = crlfCount > lfOnlyCount ? "\r\n" : "\n";
-  return { content, eol, size: stat.size, mode: stat.mode & 4095, rawBuffer: buf };
-}
-function globToRegExp(pattern) {
-  const normalized = pattern.trim().replace(/\\/g, "/").replace(/^\.\//, "");
-  let re = "^";
-  let i = 0;
-  while (i < normalized.length) {
-    const ch = normalized[i];
-    if (ch === "*") {
-      if (normalized[i + 1] === "*") {
-        if (normalized[i + 2] === "/") {
-          re += "(?:.*/)?";
-          i += 3;
-        } else {
-          re += ".*";
-          i += 2;
-        }
-      } else {
-        re += "[^/]*";
-        i += 1;
-      }
-    } else if (ch === "?") {
-      re += "[^/]";
-      i += 1;
-    } else if (ch === "[") {
-      const close = normalized.indexOf("]", i + 1);
-      if (close === -1) {
-        re += "\\[";
-        i += 1;
-      } else {
-        let inner = normalized.slice(i + 1, close).replace(/\\/g, "\\\\");
-        if (inner.startsWith("!")) inner = "^" + inner.slice(1);
-        re += `[${inner}]`;
-        i = close + 1;
-      }
-    } else if (ch === "{") {
-      const close = findMatchingBrace(normalized, i);
-      if (close === -1) {
-        re += "\\{";
-        i += 1;
-      } else {
-        const parts = splitBraceAlternatives(normalized.slice(i + 1, close));
-        const sub = parts.map((part) => globToRegExp(part).source.slice(1, -1)).join("|");
-        re += `(?:${sub})`;
-        i = close + 1;
-      }
-    } else if (".+^$()|\\".includes(ch)) {
-      re += "\\" + ch;
-      i += 1;
-    } else {
-      re += ch;
-      i += 1;
-    }
-  }
-  re += "$";
-  try {
-    return new RegExp(re);
-  } catch (err) {
-    throw new Error(
-      `Invalid glob pattern '${pattern}': ${err instanceof Error ? err.message : String(err)}`
-    );
-  }
-}
-function findMatchingBrace(str, openIdx) {
-  let depth = 0;
-  for (let i = openIdx; i < str.length; i++) {
-    if (str[i] === "{") depth++;
-    else if (str[i] === "}") {
-      depth--;
-      if (depth === 0) return i;
-    }
-  }
-  return -1;
-}
-function splitBraceAlternatives(inner) {
-  const parts = [];
-  let depth = 0;
-  let start = 0;
-  for (let i = 0; i < inner.length; i++) {
-    const ch = inner[i];
-    if (ch === "{") depth++;
-    else if (ch === "}") depth--;
-    else if (ch === "," && depth === 0) {
-      parts.push(inner.slice(start, i));
-      start = i + 1;
-    }
-  }
-  parts.push(inner.slice(start));
-  return parts;
-}
-async function walkFiles(rootDir, options = {}) {
-  const maxFiles = options.maxFiles ?? 5e3;
-  const maxDepth = options.maxDepth ?? 32;
-  const includeHidden = options.includeHidden ?? false;
-  const ignoreDirs = options.ignoreDirs ?? DEFAULT_IGNORE_DIRS;
-  const fileFilter = options.fileFilter;
-  const files = [];
-  let truncated = false;
-  async function visit(dir, relDir, depth) {
-    if (truncated || depth > maxDepth) return;
-    let entries;
-    try {
-      entries = await fs2.readdir(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
-    const subdirs = [];
-    for (const entry of entries) {
-      if (truncated) return;
-      const name = entry.name;
-      if (!includeHidden && name.startsWith(".")) {
-        if (!(entry.isDirectory() && name === ".agents")) {
-          continue;
-        }
-      }
-      const absPath = path3.join(dir, name);
-      const relPosix = relDir ? `${relDir}/${name}` : name;
-      if (entry.isDirectory()) {
-        if (ignoreDirs.has(name)) continue;
-        subdirs.push({ abs: absPath, rel: relPosix });
-      } else if (entry.isFile()) {
-        if (fileFilter && !fileFilter(relPosix)) continue;
-        files.push(relPosix);
-        if (files.length >= maxFiles) {
-          truncated = true;
-          return;
-        }
-      }
-    }
-    const batchSize = 8;
-    for (let i = 0; i < subdirs.length && !truncated; i += batchSize) {
-      const slice = subdirs.slice(i, i + batchSize);
-      await Promise.all(slice.map((sub) => visit(sub.abs, sub.rel, depth + 1)));
-    }
-  }
-  await visit(rootDir, "", 0);
-  return { files, truncated };
-}
-
 // src/tools/apply-edits.ts
 function computeLineStarts(text) {
   const starts = [0];
@@ -2594,6 +2185,12 @@ function offsetToLine(lineStarts, offset) {
     }
   }
   return Math.max(1, hi + 1);
+}
+function formatMatchLineRange(lineStarts, offset, length, prefix = "L") {
+  const startLine = offsetToLine(lineStarts, offset);
+  const endOffset = length > 0 ? offset + length - 1 : offset;
+  const endLine = offsetToLine(lineStarts, endOffset);
+  return startLine === endLine ? `${prefix}${startLine}` : `${prefix}${startLine}-${prefix}${endLine}`;
 }
 function getLineWindowOffsets(text, lineStarts, startLine, endLine) {
   if (startLine !== void 0 && (typeof startLine !== "number" || !Number.isFinite(startLine) || startLine < 1)) {
@@ -2646,80 +2243,109 @@ function findClosestRegionSnippet(normalizedContent, normTarget, rangeStartLine,
   if (fileLines.length === 0) return "";
   const targetLines = normTarget.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
   if (targetLines.length === 0) return "";
-  const firstAnchor = targetLines.find((l) => l.length >= 6) ?? targetLines[0];
-  let longestAnchor = targetLines[0];
-  for (const tl of targetLines) {
-    if (tl.length > longestAnchor.length) longestAnchor = tl;
+  let firstAnchorIdx = 0;
+  for (let idx = 0; idx < targetLines.length; idx++) {
+    if (targetLines[idx].length >= 6) {
+      firstAnchorIdx = idx;
+      break;
+    }
   }
-  const anchors = [firstAnchor];
-  if (longestAnchor !== firstAnchor) anchors.push(longestAnchor);
-  const lastAnchor = targetLines[targetLines.length - 1];
-  if (lastAnchor.length >= 6 && !anchors.includes(lastAnchor)) {
-    anchors.push(lastAnchor);
+  let longestAnchorIdx = 0;
+  for (let idx = 1; idx < targetLines.length; idx++) {
+    if (targetLines[idx].length > targetLines[longestAnchorIdx].length) {
+      longestAnchorIdx = idx;
+    }
   }
-  const primaryTokens = new Set(extractLineTokens(firstAnchor));
-  const longestTokens = new Set(extractLineTokens(longestAnchor));
+  const lastAnchorIdx = targetLines.length - 1;
+  const anchorIndices = /* @__PURE__ */ new Set([firstAnchorIdx, longestAnchorIdx]);
+  if (targetLines[lastAnchorIdx].length >= 8) {
+    anchorIndices.add(lastAnchorIdx);
+  }
+  const anchors = [...anchorIndices].map((idx) => ({
+    text: targetLines[idx],
+    idx,
+    tokens: new Set(extractLineTokens(targetLines[idx]))
+  }));
+  const targetTokenSets = targetLines.map((tl) => new Set(extractLineTokens(tl)));
   const trimmedFileLines = fileLines.map((l) => l.trim());
-  let bestIdx = -1;
-  let bestScore = 0;
   const scanStart = Math.max(0, (rangeStartLine ?? 1) - 1);
   const scanEnd = Math.min(
     trimmedFileLines.length - 1,
     (rangeEndLine ?? trimmedFileLines.length) - 1
   );
+  if (scanStart > scanEnd) return "";
+  const evaluatedStarts = /* @__PURE__ */ new Set();
+  let bestStart = -1;
+  let bestScore = 0;
+  const scoreIndices = [];
+  const windowLen = Math.min(targetLines.length, 10);
+  for (let k = 0; k < windowLen; k++) {
+    scoreIndices.push(k);
+  }
+  for (const idx of anchorIndices) {
+    if (idx >= windowLen) {
+      scoreIndices.push(idx);
+    }
+  }
+  const scoreCandidateStart = (candStart) => {
+    let total = 0;
+    for (const k of scoreIndices) {
+      const fIdx = candStart + k;
+      if (fIdx > scanEnd || fIdx >= trimmedFileLines.length) continue;
+      const fLine = trimmedFileLines[fIdx];
+      const tLine = targetLines[k];
+      if (!fLine || !tLine) continue;
+      const tTokens = targetTokenSets[k];
+      const isHighEntropy = tLine.length >= 12 && tTokens.size >= 2;
+      if (fLine === tLine) {
+        total += isHighEntropy ? 8 + Math.min(6, tLine.length / 14) : 4;
+      } else if (tLine.length >= 8 && (fLine.includes(tLine) || tLine.includes(fLine))) {
+        total += isHighEntropy ? 6 : 3.5;
+      } else if (tTokens.size > 0) {
+        const lineTokens = extractLineTokens(fLine);
+        let hits = 0;
+        for (const tok of lineTokens) {
+          if (tTokens.has(tok)) hits += 1;
+        }
+        if (hits >= 2 || hits >= 1 && tTokens.size <= 2 && hits === tTokens.size) {
+          total += (isHighEntropy ? 4.5 : 3) * (hits / tTokens.size);
+        }
+      }
+    }
+    return total;
+  };
   for (let i = scanStart; i <= scanEnd; i++) {
     const line = trimmedFileLines[i];
     if (!line) continue;
-    let score = 0;
-    if (line === firstAnchor) {
-      score += 10;
-    } else if (firstAnchor.length >= 8 && (line.includes(firstAnchor) || firstAnchor.includes(line))) {
-      score += 6;
-    } else if (primaryTokens.size > 0) {
-      const lineTokens = extractLineTokens(line);
-      let hits = 0;
-      for (const tok of lineTokens) {
-        if (primaryTokens.has(tok)) hits += 1;
-      }
-      if (hits >= 2 || hits >= 1 && primaryTokens.size <= 2 && hits === primaryTokens.size) {
-        score += 4 * (hits / primaryTokens.size);
-      }
-    }
-    if (longestAnchor !== firstAnchor) {
-      if (line === longestAnchor) {
-        score += 8;
-      } else if (longestAnchor.length >= 10 && line.includes(longestAnchor)) {
-        score += 5;
-      } else if (longestTokens.size >= 2) {
+    for (const anchor of anchors) {
+      let matchedAnchor = false;
+      if (line === anchor.text || anchor.text.length >= 8 && (line.includes(anchor.text) || anchor.text.includes(line))) {
+        matchedAnchor = true;
+      } else if (anchor.tokens.size > 0) {
         const lineTokens = extractLineTokens(line);
         let hits = 0;
         for (const tok of lineTokens) {
-          if (longestTokens.has(tok)) hits += 1;
+          if (anchor.tokens.has(tok)) hits += 1;
         }
-        if (hits >= 2) {
-          score += 3 * (hits / longestTokens.size);
-        }
-      }
-    }
-    if (score >= 2 && targetLines.length > 1) {
-      const lookahead = Math.min(targetLines.length, 6);
-      for (let k = 1; k < lookahead && i + k < trimmedFileLines.length; k++) {
-        const nextLine = trimmedFileLines[i + k];
-        const tgtLine = targetLines[k];
-        if (nextLine && tgtLine && (nextLine === tgtLine || tgtLine.length >= 8 && nextLine.includes(tgtLine))) {
-          score += 3;
+        if (hits >= 2 || hits >= 1 && anchor.tokens.size <= 2 && hits === anchor.tokens.size) {
+          matchedAnchor = true;
         }
       }
-    }
-    if (score > bestScore) {
-      bestScore = score;
-      bestIdx = i;
+      if (!matchedAnchor) continue;
+      const candStart = Math.max(scanStart, Math.min(scanEnd, i - anchor.idx));
+      if (evaluatedStarts.has(candStart)) continue;
+      evaluatedStarts.add(candStart);
+      const score = scoreCandidateStart(candStart);
+      if (score > bestScore) {
+        bestScore = score;
+        bestStart = candStart;
+      }
     }
   }
-  if (bestIdx < 0 || bestScore < 2.5) return "";
+  if (bestStart < 0 || bestScore < 2.5) return "";
   const span = Math.min(Math.max(targetLines.length, 4), 8);
-  const from = Math.max(1, bestIdx + 1 - 2);
-  const to = Math.min(fileLines.length, Math.min(from + 13, bestIdx + 1 + span + 2));
+  const from = Math.max(1, bestStart + 1 - 2);
+  const to = Math.min(fileLines.length, Math.min(from + 13, bestStart + 1 + span + 2));
   const snippet = [];
   for (let ln = from; ln <= to; ln++) {
     const lineText = fileLines[ln - 1] ?? "";
@@ -2728,7 +2354,7 @@ function findClosestRegionSnippet(normalizedContent, normTarget, rangeStartLine,
     );
   }
   return `
-  Closest match near line ${bestIdx + 1} (lines ${from}-${to}):
+  Closest match near line ${bestStart + 1} (lines ${from}-${to}):
 ${snippet.join("\n")}`;
 }
 function planHunksForContent(normalizedContent, hunks, displayPath) {
@@ -2790,7 +2416,7 @@ function planHunksForContent(normalizedContent, hunks, displayPath) {
           gPos = found + Math.max(1, normTarget.length);
         }
         if (globalOffsets.length > 0) {
-          const hitLines = globalOffsets.map((o) => `L${offsetToLine(lineStarts, o)}`).join(", ");
+          const hitLines = globalOffsets.map((o) => formatMatchLineRange(lineStarts, o, normTarget.length)).join(", ");
           hint = ` Exact match found outside range at ${hitLines} \u2014 adjust startLine/endLine or omit them.`;
         } else {
           const effStart = hunk.startLine ?? 1;
@@ -2810,7 +2436,7 @@ function planHunksForContent(normalizedContent, hunks, displayPath) {
       continue;
     }
     if (foundOffsets.length > 1 && !hunk.replaceAll) {
-      const lines = foundOffsets.slice(0, 10).map((o) => offsetToLine(lineStarts, o)).join(", ");
+      const lines = foundOffsets.slice(0, 10).map((o) => formatMatchLineRange(lineStarts, o, normTarget.length, "")).join(", ");
       errors.push(
         `${displayPath} hunk #${idx + 1}: target matched ${foundOffsets.length} times (lines: ${lines}). Provide startLine/endLine, more surrounding context, or set replaceAll: true.`
       );
@@ -2826,7 +2452,7 @@ function planHunksForContent(normalizedContent, hunks, displayPath) {
     }
   }
   if (errors.length > 0) {
-    return { newNormalized: normalizedContent, appliedMatches: 0, errors };
+    return { newNormalized: normalizedContent, appliedMatches: 0, spans: [], errors };
   }
   spans.sort((a, b) => a.start - b.start || a.end - b.end);
   for (let i = 1; i < spans.length; i++) {
@@ -2840,7 +2466,7 @@ function planHunksForContent(normalizedContent, hunks, displayPath) {
     }
   }
   if (errors.length > 0) {
-    return { newNormalized: normalizedContent, appliedMatches: 0, errors };
+    return { newNormalized: normalizedContent, appliedMatches: 0, spans: [], errors };
   }
   const pieces = [];
   let cursor = 0;
@@ -2853,8 +2479,63 @@ function planHunksForContent(normalizedContent, hunks, displayPath) {
   return {
     newNormalized: pieces.join(""),
     appliedMatches: spans.length,
+    spans,
     errors: []
   };
+}
+function buildNormToRawOffsetMap(rawContent, normLength) {
+  const map = new Int32Array(normLength + 1);
+  let normIdx = 0;
+  for (let rawIdx = 0; rawIdx < rawContent.length; rawIdx++) {
+    if (rawContent[rawIdx] === "\r" && rawContent[rawIdx + 1] === "\n") {
+      map[normIdx++] = rawIdx;
+      rawIdx++;
+    } else {
+      map[normIdx++] = rawIdx;
+    }
+  }
+  map[normIdx] = rawContent.length;
+  return map;
+}
+function detectLocalSpanEol(rawContent, rawStart, rawEnd, fallbackEol) {
+  let crlfCount = 0;
+  let lfOnlyCount = 0;
+  for (let i = rawStart; i < rawEnd; i++) {
+    if (rawContent[i] === "\n") {
+      if (i > rawStart && rawContent[i - 1] === "\r") crlfCount++;
+      else lfOnlyCount++;
+    }
+  }
+  if (crlfCount > lfOnlyCount) return "\r\n";
+  if (lfOnlyCount > crlfCount) return "\n";
+  for (let i = rawEnd; i < rawContent.length; i++) {
+    if (rawContent[i] === "\n") {
+      return i > 0 && rawContent[i - 1] === "\r" ? "\r\n" : "\n";
+    }
+  }
+  for (let i = rawStart - 1; i >= 0; i--) {
+    if (rawContent[i] === "\n") {
+      return i > 0 && rawContent[i - 1] === "\r" ? "\r\n" : "\n";
+    }
+  }
+  return fallbackEol;
+}
+function applySpansPreservingMixedEol(rawContent, normLength, spans, fallbackEol) {
+  const normToRaw = buildNormToRawOffsetMap(rawContent, normLength);
+  const pieces = [];
+  let rawCursor = 0;
+  for (const span of spans) {
+    const rawStart = normToRaw[span.start];
+    const rawEnd = normToRaw[span.end];
+    pieces.push(rawContent.slice(rawCursor, rawStart));
+    const localEol = detectLocalSpanEol(rawContent, rawStart, rawEnd, fallbackEol);
+    pieces.push(
+      localEol === "\r\n" ? span.replacement.replace(/\n/g, "\r\n") : span.replacement
+    );
+    rawCursor = rawEnd;
+  }
+  pieces.push(rawContent.slice(rawCursor));
+  return pieces.join("");
 }
 function countLines(text) {
   if (!text) return 0;
@@ -2866,45 +2547,149 @@ function countLines(text) {
   }
   return count;
 }
+var OVERWRITE_HEADER_PEEK_BYTES = 8192;
+async function readFileHeaderBytes(filePath, maxBytes = OVERWRITE_HEADER_PEEK_BYTES) {
+  const fh = await fs2.open(filePath, "r");
+  try {
+    const buf = Buffer.allocUnsafe(maxBytes);
+    const { bytesRead } = await fh.read(buf, 0, maxBytes, 0);
+    return buf.subarray(0, bytesRead);
+  } finally {
+    await fh.close();
+  }
+}
+function classifyNonTextOverwriteBuffer(buf, relPath) {
+  const utf16Bom = detectUtf16Bom(buf);
+  if (utf16Bom) {
+    return `${relPath}: UTF-16 encoded file is not supported (convert to UTF-8 first) [${utf16Bom}]`;
+  }
+  if (isLikelyBinary(buf)) {
+    return `${relPath}: Cannot overwrite binary file with text content`;
+  }
+  return null;
+}
+async function readOverwriteOriginal(writeTargetPath, size, relPath) {
+  if (size > OVERWRITE_HEADER_PEEK_BYTES) {
+    const header = await readFileHeaderBytes(writeTargetPath, OVERWRITE_HEADER_PEEK_BYTES);
+    const nonTextErr2 = classifyNonTextOverwriteBuffer(header, relPath);
+    if (nonTextErr2) {
+      return { ok: false, error: nonTextErr2 };
+    }
+  }
+  const buffer = await fs2.readFile(writeTargetPath);
+  const nonTextErr = classifyNonTextOverwriteBuffer(buffer, relPath);
+  if (nonTextErr) {
+    return { ok: false, error: nonTextErr };
+  }
+  return { ok: true, buffer };
+}
+function isGitInternalPath(filePath, platform = process.platform) {
+  const segments = filePath.split(/[\\/]+/);
+  for (const rawSeg of segments) {
+    if (!rawSeg) continue;
+    let seg = rawSeg.toLowerCase();
+    if (platform === "win32") {
+      seg = seg.replace(/[. ]+$/, "").replace(/:.*$/, "").replace(/[. ]+$/, "");
+    }
+    if (seg === ".git") {
+      return true;
+    }
+  }
+  return false;
+}
+async function canonicalizeTargetPath(absPath) {
+  try {
+    return await fs2.realpath(absPath);
+  } catch {
+    const trailingSegments = [];
+    let current = absPath;
+    while (true) {
+      const parent = path3.dirname(current);
+      if (parent === current) {
+        return absPath;
+      }
+      trailingSegments.push(path3.basename(current));
+      current = parent;
+      try {
+        const realAncestor = await fs2.realpath(current);
+        return path3.join(realAncestor, ...trailingSegments.reverse());
+      } catch {
+      }
+    }
+  }
+}
+async function findMissingAncestorDirs(dir) {
+  const missing = [];
+  let current = path3.resolve(dir);
+  while (true) {
+    try {
+      await fs2.lstat(current);
+      break;
+    } catch (err) {
+      if (err?.code !== "ENOENT") {
+        break;
+      }
+      missing.push(current);
+      const parent = path3.dirname(current);
+      if (parent === current) break;
+      current = parent;
+    }
+  }
+  return missing;
+}
 async function commitPlannedWrites(plans) {
   const written = [];
+  const createdDirs = [];
+  const createdDirSet = /* @__PURE__ */ new Set();
   try {
     for (const plan of plans) {
+      if (plan.isNoOp) continue;
       const target = plan.writeTargetPath;
-      const dir = path4.dirname(target);
-      await fs3.mkdir(dir, { recursive: true });
-      const tmpPath = `${target}.agy-fast-tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const dir = path3.dirname(target);
+      const missingDirs = await findMissingAncestorDirs(dir);
+      for (let i = missingDirs.length - 1; i >= 0; i--) {
+        const d = missingDirs[i];
+        if (!createdDirSet.has(d)) {
+          createdDirSet.add(d);
+          createdDirs.push(d);
+        }
+      }
+      await fs2.mkdir(dir, { recursive: true });
+      const tmpPath = path3.join(
+        dir,
+        `.agy-tmp-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+      );
       try {
-        await fs3.writeFile(tmpPath, plan.newContent, "utf8");
+        await fs2.writeFile(tmpPath, plan.newContent, "utf8");
         if (plan.originalMode !== null && process.platform !== "win32") {
-          await fs3.chmod(tmpPath, plan.originalMode);
+          await fs2.chmod(tmpPath, plan.originalMode);
         }
       } catch (tmpErr) {
         try {
-          await fs3.unlink(tmpPath);
+          await fs2.unlink(tmpPath);
         } catch {
         }
         throw tmpErr;
       }
       try {
-        await fs3.rename(tmpPath, target);
+        await fs2.rename(tmpPath, target);
         written.push(plan);
       } catch (renameErr) {
         try {
-          await fs3.unlink(tmpPath);
+          await fs2.unlink(tmpPath);
         } catch {
         }
         written.push(plan);
         if (plan.originalSymlinkTarget) {
           try {
-            await fs3.unlink(target);
+            await fs2.unlink(target);
           } catch {
           }
         }
-        await fs3.writeFile(target, plan.newContent, "utf8");
+        await fs2.writeFile(target, plan.newContent, "utf8");
         if (plan.originalMode !== null && process.platform !== "win32") {
           try {
-            await fs3.chmod(target, plan.originalMode);
+            await fs2.chmod(target, plan.originalMode);
           } catch {
           }
         }
@@ -2917,17 +2702,23 @@ async function commitPlannedWrites(plans) {
       const target = item.writeTargetPath;
       try {
         if (item.originalSymlinkTarget) {
-          await fs3.unlink(target).catch(() => {
+          await fs2.unlink(target).catch(() => {
           });
-          await fs3.symlink(item.originalSymlinkTarget, target);
+          await fs2.symlink(item.originalSymlinkTarget, target);
         } else if (item.existed && item.originalBuffer !== null) {
-          await fs3.writeFile(target, item.originalBuffer);
+          await fs2.writeFile(target, item.originalBuffer);
           if (item.originalMode !== null && process.platform !== "win32") {
-            await fs3.chmod(target, item.originalMode);
+            await fs2.chmod(target, item.originalMode);
           }
         } else if (!item.existed) {
-          await fs3.unlink(target);
+          await fs2.unlink(target);
         }
+      } catch {
+      }
+    }
+    for (let i = createdDirs.length - 1; i >= 0; i--) {
+      try {
+        await fs2.rmdir(createdDirs[i]);
       } catch {
       }
     }
@@ -2945,6 +2736,189 @@ function corruptedEditsError(items) {
     isError: true
   };
 }
+function resolveHunkFieldWithAliases(rawHunk, canonicalKey, aliasKeys) {
+  const hasCanonical = rawHunk[canonicalKey] !== void 0;
+  const presentAliases = aliasKeys.filter((key) => rawHunk[key] !== void 0);
+  if (hasCanonical) {
+    const canonicalVal = rawHunk[canonicalKey];
+    for (const aliasKey of presentAliases) {
+      if (rawHunk[aliasKey] !== canonicalVal) {
+        return {
+          ok: false,
+          error: `conflicting '${canonicalKey}' and alias '${aliasKey}' (values differ; omit the alias or make them identical)`
+        };
+      }
+    }
+    return { ok: true, value: canonicalVal };
+  }
+  if (presentAliases.length === 0) {
+    return { ok: true, value: void 0 };
+  }
+  const firstKey = presentAliases[0];
+  const firstVal = rawHunk[firstKey];
+  for (let k = 1; k < presentAliases.length; k++) {
+    const otherKey = presentAliases[k];
+    if (rawHunk[otherKey] !== firstVal) {
+      return {
+        ok: false,
+        error: `conflicting aliases '${firstKey}' and '${otherKey}' (values differ; use '${canonicalKey}')`
+      };
+    }
+  }
+  return { ok: true, value: firstVal };
+}
+function normalizeEditHunk(rawHunk) {
+  const targetRes = resolveHunkFieldWithAliases(rawHunk, "target", [
+    "oldText",
+    "old_string"
+  ]);
+  const replacementRes = resolveHunkFieldWithAliases(rawHunk, "replacement", [
+    "newText",
+    "new_string"
+  ]);
+  const errors = [];
+  if (!targetRes.ok) errors.push(targetRes.error);
+  if (!replacementRes.ok) errors.push(replacementRes.error);
+  if (errors.length > 0) {
+    return { ok: false, errors };
+  }
+  return {
+    ok: true,
+    hunk: {
+      ...rawHunk,
+      target: targetRes.value,
+      replacement: replacementRes.value
+    }
+  };
+}
+function formatErrorBulletsWithinBytes(heading, errors, maxBytes) {
+  const full = `${heading}
+- ${errors.join("\n- ")}`;
+  if (Buffer.byteLength(full, "utf8") <= maxBytes) {
+    return full;
+  }
+  const headingPrefix = `${heading}
+`;
+  const availBytes = maxBytes - Buffer.byteLength(headingPrefix, "utf8");
+  if (availBytes <= 64 || errors.length <= 1) {
+    return truncateWithByteNotice(full, maxBytes);
+  }
+  const fittedBullets = fitSectionsToByteBudget(
+    errors.map((e) => `- ${e}`),
+    availBytes,
+    availBytes,
+    "\n"
+  );
+  const assembled = `${headingPrefix}${fittedBullets}`;
+  return Buffer.byteLength(assembled, "utf8") <= maxBytes ? assembled : truncateWithByteNotice(assembled, maxBytes);
+}
+function formatAppliedCountPhrase(totalCount, noOpCount, dryRun) {
+  if (dryRun) {
+    return noOpCount > 0 ? `${totalCount} valid (${noOpCount} unchanged)` : `${totalCount} valid`;
+  }
+  const writtenCount = totalCount - noOpCount;
+  return noOpCount > 0 ? `${writtenCount} written, ${noOpCount} unchanged` : `${writtenCount} written`;
+}
+function formatAppliedSummaryCompact(totalCount, noOpCount, dryRun) {
+  if (dryRun) {
+    return noOpCount > 0 ? `${totalCount} file(s) valid (${noOpCount} unchanged)` : `${totalCount} file(s) valid`;
+  }
+  const writtenCount = totalCount - noOpCount;
+  return noOpCount > 0 ? `${writtenCount} file(s) written, ${noOpCount} unchanged` : `${writtenCount} file(s) written`;
+}
+function compactSummaryLinesToBytes(header, summaryLines, noOpCount, maxBytes) {
+  const full = `${header}
+${summaryLines.join("\n")}`;
+  if (Buffer.byteLength(full, "utf8") <= maxBytes) {
+    return full;
+  }
+  const countSummary = formatAppliedSummaryCompact(summaryLines.length, noOpCount, false);
+  const totalPhrase = formatAppliedCountPhrase(summaryLines.length, noOpCount, false);
+  const minimal = `${header} (${countSummary}; list omitted to preserve verify diagnostics)`;
+  const headerPrefix = `${header}
+`;
+  const kept = [];
+  let usedBytes = Buffer.byteLength(headerPrefix, "utf8");
+  for (let i = 0; i < summaryLines.length; i++) {
+    const line = summaryLines[i];
+    const remaining = summaryLines.length - (i + 1);
+    const omitNotice = remaining > 0 ? `
+... (+${remaining} more applied file(s) omitted; total ${totalPhrase})` : "";
+    const lineBytes = (kept.length > 0 ? 1 : 0) + Buffer.byteLength(line, "utf8");
+    if (usedBytes + lineBytes + Buffer.byteLength(omitNotice, "utf8") > maxBytes) {
+      break;
+    }
+    kept.push(line);
+    usedBytes += lineBytes;
+  }
+  if (kept.length > 0) {
+    const omitted = summaryLines.length - kept.length;
+    return omitted > 0 ? `${headerPrefix}${kept.join("\n")}
+... (+${omitted} more applied file(s) omitted; total ${totalPhrase})` : `${headerPrefix}${kept.join("\n")}`;
+  }
+  return Buffer.byteLength(minimal, "utf8") <= maxBytes ? minimal : truncateWithByteNotice(minimal, maxBytes);
+}
+function formatBestEffortPartialResult(params) {
+  const { partialHeader, errors, summaryLines, noOpCount, dryRun, verifySkipped, maxBytes } = params;
+  const failedHeading = dryRun ? "Failed (fix only these):" : "Failed (retry ONLY these failed file(s); do NOT re-send applied files):";
+  const failedFull = `${failedHeading}
+- ${errors.join("\n- ")}`;
+  const appliedFull = `Applied:
+${summaryLines.join("\n")}`;
+  const verifyNote = verifySkipped ? "Verify skipped because failed file(s) remain; fix only the failed file(s) and re-run verify." : "";
+  const joinSections = (failedText, appliedText) => {
+    const parts = [partialHeader, failedText, appliedText];
+    if (verifyNote) parts.push(verifyNote);
+    return parts.join("\n\n");
+  };
+  const fullText = joinSections(failedFull, appliedFull);
+  if (Buffer.byteLength(fullText, "utf8") <= maxBytes) {
+    return fullText;
+  }
+  const countSummary = formatAppliedSummaryCompact(summaryLines.length, noOpCount, dryRun);
+  const totalPhrase = formatAppliedCountPhrase(summaryLines.length, noOpCount, dryRun);
+  const minimalApplied = `Applied: ${countSummary} (list omitted to preserve failure diagnostics).`;
+  const fixedBytes = Buffer.byteLength(partialHeader, "utf8") + 4 + // "\n\n" before failed + "\n\n" before applied
+  (verifyNote ? 2 + Buffer.byteLength(verifyNote, "utf8") : 0);
+  const minAppliedBytes = Math.min(
+    Buffer.byteLength(appliedFull, "utf8"),
+    Buffer.byteLength(minimalApplied, "utf8")
+  );
+  const maxFailedBytes = Math.max(256, maxBytes - fixedBytes - minAppliedBytes);
+  const failedSection = formatErrorBulletsWithinBytes(
+    failedHeading,
+    errors,
+    maxFailedBytes
+  );
+  const remainingForApplied = maxBytes - fixedBytes - Buffer.byteLength(failedSection, "utf8");
+  let appliedSection = minimalApplied;
+  if (remainingForApplied >= Buffer.byteLength(appliedFull, "utf8")) {
+    appliedSection = appliedFull;
+  } else {
+    const appliedPrefix = "Applied:\n";
+    const keptLines = [];
+    let usedBytes = Buffer.byteLength(appliedPrefix, "utf8");
+    for (let i = 0; i < summaryLines.length; i++) {
+      const line = summaryLines[i];
+      const remainingCount = summaryLines.length - (i + 1);
+      const omitNotice = remainingCount > 0 ? `
+... (+${remainingCount} more applied file(s) omitted; total ${totalPhrase})` : "";
+      const lineBytes = (keptLines.length > 0 ? 1 : 0) + Buffer.byteLength(line, "utf8");
+      if (usedBytes + lineBytes + Buffer.byteLength(omitNotice, "utf8") > remainingForApplied) {
+        break;
+      }
+      keptLines.push(line);
+      usedBytes += lineBytes;
+    }
+    if (keptLines.length > 0) {
+      const omitted = summaryLines.length - keptLines.length;
+      appliedSection = omitted > 0 ? `${appliedPrefix}${keptLines.join("\n")}
+... (+${omitted} more applied file(s) omitted; total ${totalPhrase})` : `${appliedPrefix}${keptLines.join("\n")}`;
+    }
+  }
+  const assembled = joinSections(failedSection, appliedSection);
+  return Buffer.byteLength(assembled, "utf8") <= maxBytes ? assembled : truncateWithByteNotice(assembled, maxBytes);
+}
 async function runApplyEdits(input) {
   const parsedEdits = parseMaybeJsonArray(input?.edits);
   if (!parsedEdits.ok) {
@@ -2959,12 +2933,18 @@ async function runApplyEdits(input) {
     }
     if (parsedEdits.kind === "invalid_json") {
       return {
-        text: `Error: 'edits' is not a valid JSON array (0 files modified): ${parsedEdits.detail}`,
+        text: withValidationExample(
+          `Error: 'edits' is not a valid JSON array (0 files modified): ${parsedEdits.detail}`,
+          TOOL_VALIDATION_EXAMPLES.apply_edits
+        ),
         isError: true
       };
     }
     return {
-      text: "Error: 'edits' must be a non-empty JSON array string (or array) of file edit objects.",
+      text: withValidationExample(
+        "Error: 'edits' must be a non-empty JSON array string (or array) of file edit objects.",
+        TOOL_VALIDATION_EXAMPLES.apply_edits
+      ),
       isError: true
     };
   }
@@ -2989,6 +2969,7 @@ async function runApplyEdits(input) {
       continue;
     }
     let normalizedHunks;
+    const hunkAliasErrors = [];
     if (rawEntry.hunks !== void 0) {
       const parsedHunks = parseMaybeJsonArray(rawEntry.hunks);
       if (!parsedHunks.ok) {
@@ -3000,24 +2981,36 @@ async function runApplyEdits(input) {
         continue;
       }
       let hunkCorrupted = false;
+      const resolvedHunks = [];
       for (let j = 0; j < parsedHunks.value.length; j++) {
-        if (!isPlainObject(parsedHunks.value[j])) {
+        const rawHunk = parsedHunks.value[j];
+        if (!isPlainObject(rawHunk)) {
           corruptedItems.push({
             label: `edits[${i}].hunks[${j}]`,
-            value: parsedHunks.value[j],
+            value: rawHunk,
             expected: "a hunk object"
           });
           hunkCorrupted = true;
+          continue;
+        }
+        const normRes = normalizeEditHunk(rawHunk);
+        if (!normRes.ok) {
+          for (const message of normRes.errors) {
+            hunkAliasErrors.push({ hunkIndex: j, message });
+          }
+        } else {
+          resolvedHunks.push(normRes.hunk);
         }
       }
       if (hunkCorrupted) continue;
-      normalizedHunks = parsedHunks.value;
+      normalizedHunks = resolvedHunks;
     }
     normalizedEdits.push({
       path: rawEntry.path,
       hunks: normalizedHunks,
       create: rawEntry.create,
-      overwrite: rawEntry.overwrite
+      overwrite: rawEntry.overwrite,
+      ...hunkAliasErrors.length > 0 ? { hunkAliasErrors } : {}
     });
   }
   if (corruptedItems.length > 0) {
@@ -3033,13 +3026,19 @@ async function runApplyEdits(input) {
       const cmd = input.verify.command;
       if (typeof cmd !== "string" || !cmd.trim()) {
         return {
-          text: "Validation failed (0 files modified):\n- 'verify.command' must be a non-empty string.",
+          text: withValidationExample(
+            "Validation failed (0 files modified):\n- 'verify.command' must be a non-empty string.",
+            TOOL_VALIDATION_EXAMPLES.apply_edits
+          ),
           isError: true
         };
       }
       if (input.verify.cwd !== void 0 && typeof input.verify.cwd !== "string") {
         return {
-          text: "Validation failed (0 files modified):\n- 'verify.cwd' must be a string.",
+          text: withValidationExample(
+            "Validation failed (0 files modified):\n- 'verify.cwd' must be a string.",
+            TOOL_VALIDATION_EXAMPLES.apply_edits
+          ),
           isError: true
         };
       }
@@ -3052,32 +3051,60 @@ async function runApplyEdits(input) {
       };
     } else {
       return {
-        text: "Validation failed (0 files modified):\n- 'verify' must be a command string or { command, cwd?, timeoutSec? } object.",
+        text: withValidationExample(
+          "Validation failed (0 files modified):\n- 'verify' must be a command string or { command, cwd?, timeoutSec? } object.",
+          TOOL_VALIDATION_EXAMPLES.apply_edits
+        ),
         isError: true
       };
     }
   }
   const baseCwd = resolvePath(input.cwd || process.cwd());
+  if (!input.dryRun && validatedVerify?.cwd) {
+    const resolvedVerifyCwd = resolvePath(validatedVerify.cwd, baseCwd);
+    try {
+      const st = await fs2.stat(resolvedVerifyCwd);
+      if (!st.isDirectory()) {
+        return {
+          text: `Validation failed (0 files modified):
+- 'verify.cwd' is not a directory: ${validatedVerify.cwd}`,
+          isError: true
+        };
+      }
+    } catch {
+      return {
+        text: `Validation failed (0 files modified):
+- 'verify.cwd' directory not found: ${validatedVerify.cwd}`,
+        isError: true
+      };
+    }
+  }
   const mergedByPath = /* @__PURE__ */ new Map();
   const errors = [];
   for (let i = 0; i < normalizedEdits.length; i++) {
     const entry = normalizedEdits[i];
     if (typeof entry.path !== "string" || !entry.path.trim()) {
       errors.push(`edits[${i}]: 'path' must be a non-empty string`);
+      if (entry.hunkAliasErrors) {
+        for (const err of entry.hunkAliasErrors) {
+          errors.push(`edits[${i}] hunk #${err.hunkIndex + 1}: ${err.message}`);
+        }
+      }
       continue;
     }
     const absPath = resolvePath(entry.path, baseCwd);
-    let writeTargetPath = absPath;
-    try {
-      writeTargetPath = await fs3.realpath(absPath);
-    } catch {
-      try {
-        const realParent = await fs3.realpath(path4.dirname(absPath));
-        writeTargetPath = path4.join(realParent, path4.basename(absPath));
-      } catch {
+    const writeTargetPath = await canonicalizeTargetPath(absPath);
+    const relPath = toPosixPath(path3.relative(baseCwd, absPath)) || path3.basename(absPath);
+    if (entry.hunkAliasErrors && entry.hunkAliasErrors.length > 0) {
+      for (const err of entry.hunkAliasErrors) {
+        errors.push(`${relPath} hunk #${err.hunkIndex + 1}: ${err.message}`);
       }
+      continue;
     }
-    const relPath = toPosixPath(path4.relative(baseCwd, absPath)) || path4.basename(absPath);
+    if (isGitInternalPath(absPath) || isGitInternalPath(writeTargetPath)) {
+      errors.push(`${relPath}: refusing to modify Git internal metadata path (.git)`);
+      continue;
+    }
     const hasCreate = typeof entry.create === "string";
     const hasHunks = Array.isArray(entry.hunks) && entry.hunks.length > 0;
     if (!hasCreate && !hasHunks) {
@@ -3107,9 +3134,16 @@ async function runApplyEdits(input) {
     }
   }
   if (errors.length > 0) {
+    const exampleSuffix = `
+Example: ${TOOL_VALIDATION_EXAMPLES.apply_edits}`;
+    const exampleSuffixBytes = Buffer.byteLength(exampleSuffix, "utf8");
+    const formatted = formatErrorBulletsWithinBytes(
+      "Validation failed (0 files modified):",
+      errors,
+      DEFAULT_INLINE_MAX_BYTES - exampleSuffixBytes
+    );
     return {
-      text: `Validation failed (0 files modified):
-- ${errors.join("\n- ")}`,
+      text: withValidationExample(formatted, TOOL_VALIDATION_EXAMPLES.apply_edits),
       isError: true
     };
   }
@@ -3121,10 +3155,10 @@ async function runApplyEdits(input) {
       let originalMode = null;
       let originalSymlinkTarget = null;
       try {
-        const lst = await fs3.lstat(item.writeTargetPath);
+        const lst = await fs2.lstat(item.writeTargetPath);
         if (lst.isSymbolicLink()) {
           try {
-            const st = await fs3.stat(item.writeTargetPath);
+            const st = await fs2.stat(item.writeTargetPath);
             if (st.isDirectory()) {
               errors.push(`${item.relPath}: target path is a directory`);
               continue;
@@ -3137,7 +3171,16 @@ async function runApplyEdits(input) {
               continue;
             }
             originalMode = st.mode & 4095;
-            originalBuffer = await fs3.readFile(item.writeTargetPath);
+            const origRes = await readOverwriteOriginal(
+              item.writeTargetPath,
+              st.size,
+              item.relPath
+            );
+            if (!origRes.ok) {
+              errors.push(origRes.error);
+              continue;
+            }
+            originalBuffer = origRes.buffer;
           } catch (statErr) {
             if (statErr?.code === "ENOENT") {
               exists = true;
@@ -3147,7 +3190,7 @@ async function runApplyEdits(input) {
                 );
                 continue;
               }
-              originalSymlinkTarget = await fs3.readlink(item.writeTargetPath);
+              originalSymlinkTarget = await fs2.readlink(item.writeTargetPath);
             } else {
               errors.push(
                 `${item.relPath}: ${statErr instanceof Error ? statErr.message : String(statErr)}`
@@ -3156,7 +3199,7 @@ async function runApplyEdits(input) {
             }
           }
         } else {
-          const st = await fs3.stat(item.writeTargetPath);
+          const st = await fs2.stat(item.writeTargetPath);
           if (st.isDirectory()) {
             errors.push(`${item.relPath}: target path is a directory`);
             continue;
@@ -3169,7 +3212,16 @@ async function runApplyEdits(input) {
             continue;
           }
           originalMode = st.mode & 4095;
-          originalBuffer = await fs3.readFile(item.writeTargetPath);
+          const origRes = await readOverwriteOriginal(
+            item.writeTargetPath,
+            st.size,
+            item.relPath
+          );
+          if (!origRes.ok) {
+            errors.push(origRes.error);
+            continue;
+          }
+          originalBuffer = origRes.buffer;
         }
       } catch (err) {
         if (err?.code === "ENOENT") {
@@ -3183,8 +3235,11 @@ async function runApplyEdits(input) {
           continue;
         }
       }
-      const oldLines = originalBuffer ? countLines(originalBuffer.toString("utf8")) : 0;
-      const newLines = countLines(item.create);
+      const originalHadBom = originalBuffer ? hasUtf8Bom(originalBuffer) : false;
+      const oldLines = originalBuffer ? countLines((originalHadBom ? originalBuffer.subarray(3) : originalBuffer).toString("utf8")) : 0;
+      const newContent2 = originalHadBom && !item.create.startsWith("\uFEFF") ? `\uFEFF${item.create}` : item.create;
+      const createBody = item.create.startsWith("\uFEFF") ? item.create.slice(1) : item.create;
+      const newLines = countLines(createBody);
       plans.push({
         absPath: item.absPath,
         writeTargetPath: item.writeTargetPath,
@@ -3193,10 +3248,11 @@ async function runApplyEdits(input) {
         originalBuffer,
         originalMode,
         originalSymlinkTarget,
-        newContent: item.create,
+        newContent: newContent2,
         hunkCount: 1,
         lineDelta: newLines - oldLines,
-        created: !exists
+        created: !exists,
+        isNoOp: false
       });
       continue;
     }
@@ -3209,14 +3265,32 @@ async function runApplyEdits(input) {
       );
       continue;
     }
-    const normalizedOriginal = fileData.content.replace(/\r\n/g, "\n");
+    if (!isUtf8(fileData.rawBuffer)) {
+      errors.push(
+        `${item.relPath}: file is not valid UTF-8 (hunk edits would corrupt non-UTF-8 bytes; convert to UTF-8 first or rewrite the whole file with create + overwrite: true)`
+      );
+      continue;
+    }
+    const normalizedOriginal = fileData.rawContent.replace(/\r\n/g, "\n");
     const planned = planHunksForContent(normalizedOriginal, item.hunks, item.relPath);
     if (planned.errors.length > 0) {
       errors.push(...planned.errors);
       continue;
     }
-    const finalContent = fileData.eol === "\r\n" ? planned.newNormalized.replace(/\n/g, "\r\n") : planned.newNormalized;
-    const lineDelta = countLines(planned.newNormalized) - countLines(normalizedOriginal);
+    const normalizedUnchanged = planned.newNormalized === normalizedOriginal;
+    let newContent = "";
+    let isNoOp = normalizedUnchanged;
+    if (!normalizedUnchanged) {
+      const finalContent = fileData.mixedEol ? applySpansPreservingMixedEol(
+        fileData.rawContent,
+        normalizedOriginal.length,
+        planned.spans,
+        fileData.eol
+      ) : fileData.eol === "\r\n" ? planned.newNormalized.replace(/\n/g, "\r\n") : planned.newNormalized;
+      newContent = fileData.hasBom && !finalContent.startsWith("\uFEFF") ? `\uFEFF${finalContent}` : finalContent;
+      isNoOp = Buffer.byteLength(newContent, "utf8") === fileData.rawBuffer.length && Buffer.from(newContent, "utf8").equals(fileData.rawBuffer);
+    }
+    const lineDelta = normalizedUnchanged ? 0 : countLines(planned.newNormalized) - countLines(normalizedOriginal);
     plans.push({
       absPath: item.absPath,
       writeTargetPath: item.writeTargetPath,
@@ -3224,21 +3298,35 @@ async function runApplyEdits(input) {
       existed: true,
       originalBuffer: fileData.rawBuffer,
       originalMode: fileData.mode,
-      newContent: finalContent,
+      newContent,
       hunkCount: planned.appliedMatches,
       lineDelta,
-      created: false
+      created: false,
+      isNoOp
     });
   }
   const bestEffort = Boolean(input.bestEffort);
   if (errors.length > 0 && (!bestEffort || plans.length === 0)) {
     const prefix = bestEffort ? "Edit aborted (0 files modified):" : "Atomic edit aborted (0 files modified):";
+    const hasSchemaTypeError = errors.some(
+      (e) => e.includes("'target' must be") || e.includes("'replacement' must be") || e.includes("must be an object with 'target' and 'replacement'")
+    );
+    if (hasSchemaTypeError) {
+      const exampleSuffix = `
+Example: ${TOOL_VALIDATION_EXAMPLES.apply_edits}`;
+      const exampleSuffixBytes = Buffer.byteLength(exampleSuffix, "utf8");
+      const formatted = formatErrorBulletsWithinBytes(
+        prefix,
+        errors,
+        DEFAULT_INLINE_MAX_BYTES - exampleSuffixBytes
+      );
+      return {
+        text: withValidationExample(formatted, TOOL_VALIDATION_EXAMPLES.apply_edits),
+        isError: true
+      };
+    }
     return {
-      text: truncateWithByteNotice(
-        `${prefix}
-- ${errors.join("\n- ")}`,
-        DEFAULT_INLINE_MAX_BYTES
-      ),
+      text: formatErrorBulletsWithinBytes(prefix, errors, DEFAULT_INLINE_MAX_BYTES),
       isError: true
     };
   }
@@ -3253,37 +3341,36 @@ async function runApplyEdits(input) {
     }
   }
   const summaryLines = plans.map((p) => {
+    if (p.isNoOp) {
+      return `- ${p.relPath}: unchanged (no-op: replacement identical to target)`;
+    }
     const deltaStr = p.lineDelta >= 0 ? `+${p.lineDelta}` : `${p.lineDelta}`;
     const action = p.created ? "created" : `updated (${p.hunkCount} match${p.hunkCount === 1 ? "" : "es"})`;
     return `- ${p.relPath}: ${action}, lines ${deltaStr}`;
   });
+  const noOpCount = plans.filter((p) => p.isNoOp).length;
+  const writtenCount = plans.length - noOpCount;
   if (bestEffort && errors.length > 0) {
     const totalFiles = mergedByPath.size;
     const failedFileCount = Math.max(1, totalFiles - plans.length);
-    const partialHeader = input.dryRun ? `Partial dry-run (${plans.length}/${totalFiles} file(s) valid; ${failedFileCount} file(s) failed):` : `Partial edit applied (${plans.length}/${totalFiles} file(s) written; ${failedFileCount} file(s) failed \u2014 do NOT re-send applied files):`;
-    const partialParts = [
-      partialHeader,
-      `Applied:
-${summaryLines.join("\n")}`,
-      `Failed (fix only these):
-- ${errors.join("\n- ")}`
-    ];
-    if (!input.dryRun && input.verify) {
-      partialParts.push(
-        "Verify skipped because failed file(s) remain; fix only the failed file(s) and re-run verify."
-      );
-    }
+    const unchangedSuffix = noOpCount > 0 ? `, ${noOpCount} unchanged` : "";
+    const partialHeader = input.dryRun ? `Partial dry-run (${plans.length}/${totalFiles} file(s) valid; ${failedFileCount} file(s) failed):` : `Partial edit applied (${writtenCount}/${totalFiles} file(s) written${unchangedSuffix}; ${failedFileCount} file(s) failed \u2014 do NOT re-send applied files):`;
     return {
-      text: truncateWithByteNotice(
-        partialParts.join("\n\n"),
-        DEFAULT_INLINE_MAX_BYTES
-      ),
+      text: formatBestEffortPartialResult({
+        partialHeader,
+        errors,
+        summaryLines,
+        noOpCount,
+        dryRun: Boolean(input.dryRun),
+        verifySkipped: Boolean(!input.dryRun && input.verify),
+        maxBytes: DEFAULT_INLINE_MAX_BYTES
+      }),
       isError: true
     };
   }
-  const header = input.dryRun ? `Dry run validated ${plans.length} file(s) (0 files modified):` : `Applied edits to ${plans.length} file(s):`;
-  const parts = [`${header}
-${summaryLines.join("\n")}`];
+  const header = input.dryRun ? `Dry run validated ${plans.length} file(s) (0 files modified):` : noOpCount > 0 ? `Applied edits to ${writtenCount} file(s) (${noOpCount} unchanged):` : `Applied edits to ${plans.length} file(s):`;
+  const appliedFull = `${header}
+${summaryLines.join("\n")}`;
   if (!input.dryRun && validatedVerify) {
     const verifySpec = validatedVerify;
     const verifyCwd = verifySpec.cwd ? resolvePath(verifySpec.cwd, baseCwd) : baseCwd;
@@ -3296,29 +3383,74 @@ ${summaryLines.join("\n")}`];
       cwd: verifyCwd,
       timeoutMs
     });
-    const status = res.timedOut ? "TIMEOUT" : res.exitCode === 0 ? "PASS" : `FAIL (exit ${res.exitCode ?? "err"})`;
-    const formatted = formatCompactCommandOutput({
+    const status = res.timedOut ? "TIMEOUT" : res.error ? "ERROR" : res.exitCode === 0 ? "PASS" : `FAIL (${formatExitFailureLabel(res.exitCode, res.signal)})`;
+    const verifyPrefix = `
+
+Verify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:
+`;
+    const preparedVerify = prepareCompactCommandOutput({
       stdout: res.stdout,
       stderr: res.stderr,
       exitCode: res.exitCode,
+      signal: res.signal,
       timedOut: res.timedOut,
-      error: res.error,
-      maxChars: maxVerifyChars
+      error: res.error
     });
-    parts.push(
-      `
-Verify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:
-${formatted}`
+    const minApplied = `${header} (${formatAppliedSummaryCompact(summaryLines.length, noOpCount, false)}; list omitted to preserve verify diagnostics)`;
+    const reservedForApplied = status === "PASS" ? Math.min(
+      Buffer.byteLength(appliedFull, "utf8"),
+      DEFAULT_INLINE_MAX_BYTES - 512
+    ) : Math.min(
+      Buffer.byteLength(appliedFull, "utf8"),
+      Buffer.byteLength(minApplied, "utf8")
     );
+    const maxVerifyBodyBytes = Math.max(
+      256,
+      DEFAULT_INLINE_MAX_BYTES - reservedForApplied - Buffer.byteLength(verifyPrefix, "utf8")
+    );
+    let targetChars = Math.min(maxVerifyChars, maxVerifyBodyBytes);
+    let formatted = renderPreparedCompactCommandOutput(
+      preparedVerify,
+      targetChars
+    ).text;
+    for (let iter = 0; iter < 4; iter++) {
+      const actualBytes = Buffer.byteLength(formatted, "utf8");
+      if (actualBytes <= maxVerifyBodyBytes || targetChars <= 64) break;
+      targetChars = Math.max(
+        64,
+        Math.floor(targetChars * (maxVerifyBodyBytes / actualBytes) * 0.94)
+      );
+      formatted = renderPreparedCompactCommandOutput(
+        preparedVerify,
+        targetChars
+      ).text;
+    }
+    if (Buffer.byteLength(formatted, "utf8") > maxVerifyBodyBytes) {
+      formatted = truncateHeadTailWithByteNotice(formatted, maxVerifyBodyBytes);
+    }
+    const verifySection = `${verifyPrefix}${formatted}`;
+    const remainingAppliedBytes = DEFAULT_INLINE_MAX_BYTES - Buffer.byteLength(verifySection, "utf8");
+    const appliedSection = compactSummaryLinesToBytes(
+      header,
+      summaryLines,
+      noOpCount,
+      Math.max(64, remainingAppliedBytes)
+    );
+    const combined = `${appliedSection}${verifySection}`;
+    return {
+      text: Buffer.byteLength(combined, "utf8") <= DEFAULT_INLINE_MAX_BYTES ? combined : truncateWithByteNotice(combined, DEFAULT_INLINE_MAX_BYTES),
+      isError: false
+    };
   }
-  const outText = parts.join("\n");
-  const finalText = truncateWithByteNotice(outText, DEFAULT_INLINE_MAX_BYTES);
-  return { text: finalText, isError: false };
+  return {
+    text: truncateWithByteNotice(appliedFull, DEFAULT_INLINE_MAX_BYTES),
+    isError: false
+  };
 }
 
 // src/tools/batch-search.ts
-import { promises as fs4 } from "node:fs";
-import path5 from "node:path";
+import { promises as fs3 } from "node:fs";
+import path4 from "node:path";
 
 // src/utils/fuzzy-match.ts
 function findContiguousIndex(haystack, needle) {
@@ -3414,6 +3546,16 @@ function rankFuzzyPaths(query, candidates, maxResults) {
 }
 
 // src/tools/batch-search.ts
+var MAX_CONTEXT_LINES = 10;
+var DEFAULT_BATCH_SEARCH_CALL_TIMEOUT_MS = 6e4;
+var DEFAULT_WALK_TIMEOUT_MS = 12e3;
+var DEFAULT_WALK_MAX_DIRS = 2e4;
+function getRemainingMs(deadline) {
+  return Math.max(0, deadline - Date.now());
+}
+function getEffectiveWalkTimeoutMs(budget) {
+  return Math.min(budget.walkTimeoutMs, getRemainingMs(budget.callDeadline));
+}
 var READONLY_GIT_SUBCOMMANDS = /* @__PURE__ */ new Set([
   "status",
   "diff",
@@ -3802,15 +3944,15 @@ function resolveFileTypeGlobs(fileType) {
 }
 function fileTypeMatcher(fileType) {
   const matchers = (resolveFileTypeGlobs(fileType) ?? []).map(globToRegExp);
-  return (file) => matchers.length === 0 || matchers.some((matcher) => matcher.test(path5.basename(file)));
+  return (file) => matchers.length === 0 || matchers.some((matcher) => matcher.test(path4.basename(file)));
 }
-async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
-  const maxResults = clampInt(query.maxResults ?? 40, 1, 200);
-  const contextLines = clampInt(query.contextLines ?? 0, 0, 5);
+async function runTextOrRegexWithRg(query, searchRoot, baseCwd, budget) {
+  const maxResults = clampInt(query.maxResults, 1, 200, 40);
+  const contextLines = clampInt(query.contextLines, 0, MAX_CONTEXT_LINES, 0);
   const summary = query.outputMode === "count" || query.outputMode === "files_with_matches";
   const typeGlobs = resolveFileTypeGlobs(query.fileType);
   const matchesType = fileTypeMatcher(query.fileType);
-  const fileStat = await fs4.stat(searchRoot);
+  const fileStat = await fs3.stat(searchRoot);
   const isFileTarget = fileStat.isFile();
   if (isFileTarget) {
     if (typeGlobs && !matchesType(searchRoot)) {
@@ -3824,12 +3966,12 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       const rawGlob = negated ? query.glob.slice(1) : query.glob;
       const globRe = globToRegExp(rawGlob);
       const relPosix = relativeFile(baseCwd, searchRoot);
-      const matched = globRe.test(relPosix) || globRe.test(path5.basename(searchRoot));
+      const matched = globRe.test(relPosix) || globRe.test(path4.basename(searchRoot));
       if (negated ? matched : !matched) {
         return { files: [], totalMatches: 0, truncated: false };
       }
     }
-    const fh = await fs4.open(searchRoot, "r");
+    const fh = await fs3.open(searchRoot, "r");
     try {
       const head = Buffer.alloc(Math.min(fileStat.size, 8192));
       const { bytesRead } = await fh.read(head, 0, head.length, 0);
@@ -3856,7 +3998,12 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
   if (query.glob) {
     args.push(`--glob=${query.glob}`);
   }
-  const normRoot = toPosixPath(searchRoot);
+  const relNative = path4.relative(baseCwd, searchRoot);
+  const relRoot = toPosixPath(relNative);
+  const isInsideBaseCwd = relRoot === "" || relRoot !== ".." && !relRoot.startsWith("../") && !path4.isAbsolute(relRoot);
+  const rgSearchTarget = isInsideBaseCwd ? !relNative ? "." : relNative === "-" ? `.${path4.sep}-` : relNative : searchRoot;
+  const rootSegments = isInsideBaseCwd ? relRoot ? relRoot.split("/") : [] : toPosixPath(searchRoot).split("/").filter(Boolean);
+  const positiveGlob = query.glob && !query.glob.startsWith("!") ? query.glob : null;
   for (const dir of [
     "node_modules",
     ".git",
@@ -3868,16 +4015,33 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
     ".venv",
     ".next"
   ]) {
-    if (!normRoot.split("/").includes(dir)) {
+    if (!rootSegments.includes(dir) && !(positiveGlob && globTargetsDir(positiveGlob, dir))) {
       args.push(`--glob=!**/${dir}/**`);
     }
   }
+  let rgTimedOut = false;
   const runRg = async (runArgs, opts) => {
+    const remainingMs = getRemainingMs(budget.callDeadline);
+    if (remainingMs <= 0) {
+      rgTimedOut = true;
+      return {
+        exitCode: null,
+        signal: null,
+        timedOut: true,
+        durationMs: 0,
+        stdout: "",
+        stderr: "",
+        truncated: false
+      };
+    }
     const res = await execBinaryAsync("rg", runArgs, {
       cwd: baseCwd,
-      timeoutMs: 15e3,
+      timeoutMs: Math.max(250, Math.min(15e3, remainingMs)),
       maxOutputBytes: 2 * 1024 * 1024
     });
+    if (res.timedOut) {
+      rgTimedOut = true;
+    }
     if (res.error) {
       throw new Error(`rg spawn error: ${res.error}`);
     }
@@ -3893,7 +4057,7 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       ...query.outputMode === "count" ? [query.multiline ? "--count-matches" : "--count", "--with-filename", "--null"] : ["--files-with-matches", "--null"],
       "--",
       query.pattern,
-      searchRoot
+      rgSearchTarget
     ]);
     const files2 = [];
     const out = res.stdout;
@@ -3919,7 +4083,8 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
     return {
       files: files2.slice(0, maxResults),
       totalMatches: 0,
-      truncated: files2.length > maxResults || cutShort(res)
+      truncated: files2.length > maxResults || cutShort(res),
+      ...rgTimedOut ? { budgetExceeded: true } : {}
     };
   }
   const maxCountArgs = query.multiline ? [] : ["--max-count", String(perFileCap + 1)];
@@ -3942,7 +4107,7 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       "--null",
       "--",
       query.pattern,
-      searchRoot
+      rgSearchTarget
     ]);
     const counted = [];
     for (const record of counts.stdout.split("\n").slice(0, -1)) {
@@ -3963,13 +4128,18 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
     }
     truncated = cutShort(counts) || chosen.length < counted.length;
     if (chosen.length === 0) {
-      return { files: [], totalMatches: 0, truncated };
+      return {
+        files: [],
+        totalMatches: 0,
+        truncated,
+        ...rgTimedOut ? { budgetExceeded: true } : {}
+      };
     }
   }
   const toRgArgPath = (rawFile) => {
-    const rel = path5.relative(baseCwd, rawFile);
-    const chosenPath = rel && !rel.startsWith("..") && !path5.isAbsolute(rel) ? rel : rawFile;
-    return chosenPath === "-" ? `.${path5.sep}-` : chosenPath;
+    const rel = path4.relative(baseCwd, path4.resolve(baseCwd, rawFile));
+    const chosenPath = rel && rel !== ".." && !rel.startsWith(`..${path4.sep}`) && !path4.isAbsolute(rel) ? rel : rawFile;
+    return chosenPath === "-" ? `.${path4.sep}-` : chosenPath;
   };
   const rgChunks = [];
   let currentChunk = [];
@@ -4013,7 +4183,8 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       if (ev.type !== "match" && ev.type !== "context") continue;
       const rawFile = ev.data?.path?.text ?? (ev.data?.path?.bytes ? Buffer.from(ev.data.path.bytes, "base64").toString("utf8") : void 0);
       const lineNumber = ev.data?.line_number;
-      const rawText = ev.data?.lines?.text ?? (ev.data?.lines?.bytes ? Buffer.from(ev.data.lines.bytes, "base64").toString("utf8") : "");
+      const rawBuf = ev.data?.lines?.bytes ? Buffer.from(ev.data.lines.bytes, "base64") : null;
+      const rawText = ev.data?.lines?.text ?? (rawBuf ? rawBuf.toString("utf8") : "");
       if (!rawFile || typeof lineNumber !== "number") continue;
       const relFile = relativeFile(baseCwd, rawFile);
       let lineMap = byFile.get(relFile);
@@ -4022,11 +4193,55 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
         byFile.set(relFile, lineMap);
       }
       const isMatch = ev.type === "match";
+      const submatchRanges = [];
+      if (isMatch && Array.isArray(ev.data?.submatches) && ev.data.submatches.length > 0) {
+        let utf8Buf = rawBuf;
+        const isAsciiOnly = !utf8Buf && Buffer.byteLength(rawText, "utf8") === rawText.length;
+        const byteToChar = (byteOffset) => {
+          if (byteOffset <= 0) return 0;
+          if (isAsciiOnly) return Math.min(byteOffset, rawText.length);
+          if (!utf8Buf) utf8Buf = Buffer.from(rawText, "utf8");
+          const clamped = Math.min(byteOffset, utf8Buf.length);
+          return utf8Buf.subarray(0, clamped).toString("utf8").length;
+        };
+        for (const sm of ev.data.submatches) {
+          if (typeof sm?.start !== "number") continue;
+          const start = byteToChar(sm.start);
+          const end = typeof sm.end === "number" ? Math.max(start, byteToChar(sm.end)) : start;
+          submatchRanges.push({ start, end });
+        }
+      }
       const lineText = rawText.replace(/\r?\n$/, "");
       const segments = isMatch && query.multiline ? lineText.split(/\r?\n/) : [lineText];
+      let segStart = 0;
       for (const [offset, text] of segments.entries()) {
+        const segEnd = segStart + text.length;
         const line = lineNumber + offset;
-        if (!lineMap.get(line)?.isMatch) lineMap.set(line, { lineNumber: line, text, isMatch });
+        if (!lineMap.get(line)?.isMatch) {
+          let matchStart;
+          let matchEnd;
+          if (isMatch && submatchRanges.length > 0) {
+            const hit = submatchRanges.find(
+              (r) => r.start === r.end ? r.start >= segStart && r.start <= segEnd : r.start <= segEnd && r.end > segStart
+            );
+            if (hit) {
+              matchStart = Math.max(0, Math.min(hit.start - segStart, text.length));
+              matchEnd = Math.max(matchStart, Math.min(hit.end - segStart, text.length));
+            }
+          }
+          lineMap.set(line, {
+            lineNumber: line,
+            text,
+            isMatch,
+            ...matchStart !== void 0 ? { matchStart, matchEnd } : {}
+          });
+        }
+        segStart = segEnd;
+        if (rawText[segStart] === "\r" && rawText[segStart + 1] === "\n") {
+          segStart += 2;
+        } else if (rawText[segStart] === "\n") {
+          segStart += 1;
+        }
       }
     }
   }
@@ -4038,7 +4253,7 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       break;
     }
     const fileCap = query.multiline ? maxResults : Math.min(count, perFileCap);
-    const budget = Math.min(fileCap, maxResults - totalMatches);
+    const budget2 = Math.min(fileCap, maxResults - totalMatches);
     const sorted = [...byFile.get(relFile)?.values() ?? []].sort(
       (a, b) => a.lineNumber - b.lineNumber
     );
@@ -4047,17 +4262,17 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
     let lastKeptMatchLine = -1;
     for (const line of sorted) {
       if (line.isMatch) {
-        if (kept === budget) {
+        if (kept === budget2) {
           truncated = true;
           if (lastKeptMatchLine !== -1 && line.lineNumber <= lastKeptMatchLine + contextLines) {
-            lines.push({ ...line, isMatch: false });
+            lines.push({ lineNumber: line.lineNumber, text: line.text, isMatch: false });
           }
           continue;
         }
         kept += 1;
         lastKeptMatchLine = line.lineNumber;
         lines.push(line);
-      } else if (kept < budget || line.lineNumber <= lastKeptMatchLine + contextLines) {
+      } else if (kept < budget2 || line.lineNumber <= lastKeptMatchLine + contextLines) {
         lines.push(line);
       }
     }
@@ -4065,7 +4280,12 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
     files.push({ file: relFile, lines });
     totalMatches += kept;
   }
-  return { files, totalMatches, truncated };
+  return {
+    files,
+    totalMatches,
+    truncated,
+    ...rgTimedOut ? { budgetExceeded: true } : {}
+  };
 }
 function* multilineMatches(content, regex) {
   let previousEnd = -1;
@@ -4080,29 +4300,40 @@ function* multilineMatches(content, regex) {
   }
 }
 function multilineMatchLines(content, regex, limit) {
-  const indices = [];
+  const results = [];
   let line = 0;
+  let lineStart = 0;
   let nextBreak = content.indexOf("\n");
   for (const match of multilineMatches(content, regex)) {
     const start = match.index;
+    const rawEnd = start + match[0].length;
     const end = start + Math.max(0, match[0].length - 1);
     while (nextBreak !== -1 && nextBreak < start) {
       line++;
-      nextBreak = content.indexOf("\n", nextBreak + 1);
+      lineStart = nextBreak + 1;
+      nextBreak = content.indexOf("\n", lineStart);
     }
     while (true) {
-      if (indices.at(-1) !== line) indices.push(line);
-      if (indices.length >= limit) return indices;
+      if (results.at(-1)?.lineIndex !== line) {
+        const rawLineEnd = nextBreak === -1 ? content.length : nextBreak;
+        const lineEnd = rawLineEnd > lineStart && content[rawLineEnd - 1] === "\r" ? rawLineEnd - 1 : rawLineEnd;
+        const lineLen = lineEnd - lineStart;
+        const matchStart = Math.max(0, Math.min(start - lineStart, lineLen));
+        const matchEnd = Math.max(matchStart, Math.min(rawEnd - lineStart, lineLen));
+        results.push({ lineIndex: line, matchStart, matchEnd });
+      }
+      if (results.length >= limit) return results;
       if (nextBreak === -1 || nextBreak >= end) break;
       line++;
-      nextBreak = content.indexOf("\n", nextBreak + 1);
+      lineStart = nextBreak + 1;
+      nextBreak = content.indexOf("\n", lineStart);
     }
   }
-  return indices;
+  return results;
 }
-async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
-  const maxResults = clampInt(query.maxResults ?? 40, 1, 200);
-  const contextLines = clampInt(query.contextLines ?? 0, 0, 5);
+async function runTextOrRegexWithNode(query, searchRoot, baseCwd, budget) {
+  const maxResults = clampInt(query.maxResults, 1, 200, 40);
+  const contextLines = clampInt(query.contextLines, 0, MAX_CONTEXT_LINES, 0);
   const flags = (query.caseSensitive === false ? "i" : "") + (query.multiline ? "gmsu" : "");
   let regex;
   if (query.type === "regex") {
@@ -4143,45 +4374,98 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
     }
     return globNegated ? !matched : matched;
   };
-  const stat = await fs4.stat(searchRoot);
+  const stat = await fs3.stat(searchRoot);
   const perFileCap = stat.isFile() ? maxResults : Math.min(maxResults, 50);
   let targetFiles;
+  let discoveryBudgetExceeded = false;
   if (stat.isFile()) {
-    const relPosix = toPosixPath(path5.relative(baseCwd, searchRoot)) || path5.basename(searchRoot);
-    targetFiles = globMatchesFile(relPosix) ? [searchRoot] : [];
+    const relPosix = toPosixPath(path4.relative(baseCwd, searchRoot)) || path4.basename(searchRoot);
+    targetFiles = globMatchesFile(relPosix) ? [{ abs: searchRoot, rel: relativeFile(baseCwd, searchRoot) }] : [];
   } else {
     const includeHidden = Boolean(
-      rawGlob && !globNegated && (rawGlob.startsWith(".") || rawGlob.includes("/."))
+      rawGlob && !globNegated && patternTargetsHidden(rawGlob)
     );
+    let ignoreDirs;
+    if (rawGlob && !globNegated) {
+      const targeted = [...DEFAULT_IGNORE_DIRS].filter(
+        (dir) => globTargetsDir(rawGlob, dir)
+      );
+      if (targeted.length > 0) {
+        ignoreDirs = new Set(DEFAULT_IGNORE_DIRS);
+        for (const dir of targeted) ignoreDirs.delete(dir);
+      }
+    }
+    const walkRemainingMs = getEffectiveWalkTimeoutMs(budget);
+    if (walkRemainingMs <= 0) {
+      return { files: [], totalMatches: 0, truncated: true, budgetExceeded: true };
+    }
     const walked = await walkFiles(searchRoot, {
       maxFiles: 8e3,
       includeHidden,
-      fileFilter: globMatchesFile
+      ignoreDirs,
+      fileFilter: globMatchesFile,
+      timeoutMs: walkRemainingMs,
+      maxDirs: budget.walkMaxDirs
     });
     discoveryTruncated = walked.truncated;
-    targetFiles = walked.files.map((rel) => path5.join(searchRoot, rel));
-    targetFiles.sort((a, b) => {
-      const ra = relativeFile(baseCwd, a);
-      const rb = relativeFile(baseCwd, b);
-      return ra < rb ? -1 : ra > rb ? 1 : 0;
+    if (walked.timedOut || walked.dirsTruncated) {
+      discoveryBudgetExceeded = true;
+    }
+    const rootRel = toPosixPath(path4.relative(baseCwd, searchRoot));
+    const useFastPrefix = Boolean(
+      rootRel === "" || !rootRel.startsWith("..") && !path4.isAbsolute(rootRel)
+    );
+    targetFiles = walked.files.map((rel) => {
+      const abs = path4.join(searchRoot, rel);
+      const displayRel = useFastPrefix ? rootRel ? `${rootRel}/${rel}` : rel : relativeFile(baseCwd, abs);
+      return { abs, rel: displayRel };
     });
+    targetFiles.sort((a, b) => a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0);
+  }
+  const canBufPrecheck = query.type === "text" && query.caseSensitive !== false && !query.multiline && query.pattern.length > 0 && !query.pattern.includes("\uFFFD");
+  const patternBuf = canBufPrecheck ? Buffer.from(query.pattern, "utf8") : null;
+  const canTextCaseInsensitivePrecheck = query.type === "text" && query.caseSensitive === false && !query.multiline && query.pattern.length > 0;
+  let wholeFileRegex = null;
+  const regexHasDollar = query.type === "regex" && query.pattern.includes("$");
+  const regexUnsafeForWholeFile = query.type === "regex" && /\(\?<?[=!]|\(\?[a-z]*-[a-z]*m/.test(query.pattern);
+  if (query.type === "regex" && !query.multiline && !regexUnsafeForWholeFile) {
+    try {
+      wholeFileRegex = new RegExp(
+        regex.source,
+        `${query.caseSensitive === false ? "i" : ""}m`
+      );
+    } catch {
+      wholeFileRegex = null;
+    }
   }
   const files = [];
   let totalMatches = 0;
   let truncated = false;
-  const buildFileMatches = (relFile, allLines, keptIndices) => {
+  const buildFileMatches = (relFile, allLines, keptMatches) => {
     const lineMap = /* @__PURE__ */ new Map();
-    for (const mIdx of keptIndices) {
+    for (const match of keptMatches) {
+      const mIdx = match.lineIndex;
       const from = Math.max(0, mIdx - contextLines);
       const to = Math.min(allLines.length - 1, mIdx + contextLines);
       for (let j = from; j <= to; j++) {
         const ln = j + 1;
         const prev = lineMap.get(ln);
-        lineMap.set(ln, {
-          lineNumber: ln,
-          text: allLines[j],
-          isMatch: j === mIdx || Boolean(prev?.isMatch)
-        });
+        if (j === mIdx) {
+          if (!prev?.isMatch) {
+            lineMap.set(ln, {
+              lineNumber: ln,
+              text: allLines[j],
+              isMatch: true,
+              ...match.matchStart !== void 0 ? { matchStart: match.matchStart, matchEnd: match.matchEnd } : {}
+            });
+          }
+        } else if (!prev) {
+          lineMap.set(ln, {
+            lineNumber: ln,
+            text: allLines[j],
+            isMatch: false
+          });
+        }
       }
     }
     return {
@@ -4191,20 +4475,29 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
   };
   const batchSize = 16;
   let anyFileTruncated = false;
+  let scanTimedOut = false;
   for (let i = 0; i < targetFiles.length && !truncated; i += batchSize) {
+    if (Date.now() >= budget.callDeadline) {
+      scanTimedOut = true;
+      truncated = true;
+      break;
+    }
     const batch = targetFiles.slice(i, i + batchSize);
     const results = await Promise.all(
-      batch.map(async (absFile) => {
+      batch.map(async ({ abs: absFile, rel: relFile }) => {
         try {
-          const st = await fs4.stat(absFile);
+          const st = await fs3.stat(absFile);
           if (st.size > 2 * 1024 * 1024) return null;
-          const buf = await fs4.readFile(absFile);
+          const buf = await fs3.readFile(absFile);
           if (isLikelyBinary(buf)) return null;
+          if (patternBuf && buf.indexOf(patternBuf) === -1) return null;
           const content = buf.toString("utf8");
-          const lines = content.split(/\r?\n/);
-          if (lines.length > 0 && lines.at(-1) === "") lines.pop();
-          const relFile = relativeFile(baseCwd, absFile);
-          let matchedIndices = [];
+          if (canTextCaseInsensitivePrecheck && !regex.test(content)) return null;
+          if (wholeFileRegex && (!regexHasDollar || buf.indexOf(13) === -1)) {
+            if (!wholeFileRegex.test(content)) return null;
+          }
+          let lines = [];
+          let matchedLines = [];
           let count = 0;
           let fileTruncated = false;
           if (query.multiline && summary) {
@@ -4213,22 +4506,44 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
               if (query.outputMode === "files_with_matches") break;
             }
           } else if (query.multiline) {
-            matchedIndices = multilineMatchLines(content, regex, maxResults + 1);
-            count = matchedIndices.length;
+            matchedLines = multilineMatchLines(content, regex, maxResults + 1);
+            count = matchedLines.length;
+            if (count > 0) {
+              lines = content.split(/\r?\n/);
+              if (lines.length > 0 && lines.at(-1) === "") lines.pop();
+            }
           } else {
+            lines = content.split(/\r?\n/);
+            if (lines.length > 0 && lines.at(-1) === "") lines.pop();
             for (let idx = 0; idx < lines.length; idx++) {
-              if (regex.test(lines[idx])) {
-                if (!summary && matchedIndices.length >= perFileCap) {
+              const line = lines[idx];
+              const hit = summary ? regex.test(line) ? { index: 0, length: 0 } : null : (() => {
+                const m = regex.exec(line);
+                return m ? { index: m.index, length: m[0].length } : null;
+              })();
+              if (hit) {
+                if (!summary && matchedLines.length >= perFileCap) {
                   fileTruncated = true;
                   break;
                 }
-                matchedIndices.push(idx);
+                matchedLines.push({
+                  lineIndex: idx,
+                  matchStart: hit.index,
+                  matchEnd: hit.index + hit.length
+                });
                 if (query.outputMode === "files_with_matches") break;
               }
             }
-            count = matchedIndices.length;
+            count = matchedLines.length;
           }
-          return count ? { relFile, lines, matchedIndices, count, fileTruncated } : null;
+          if (!count) return null;
+          return {
+            relFile,
+            lines: summary ? [] : lines,
+            matchedLines,
+            count,
+            fileTruncated
+          };
         } catch {
           return null;
         }
@@ -4247,24 +4562,25 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
       if (item.fileTruncated) {
         anyFileTruncated = true;
       }
-      if (totalMatches + item.matchedIndices.length > maxResults) {
+      if (totalMatches + item.matchedLines.length > maxResults) {
         const remaining = maxResults - totalMatches;
         if (remaining > 0) {
-          const kept = item.matchedIndices.slice(0, remaining);
+          const kept = item.matchedLines.slice(0, remaining);
           files.push(buildFileMatches(item.relFile, item.lines, kept));
           totalMatches += kept.length;
         }
         truncated = true;
         break;
       }
-      files.push(buildFileMatches(item.relFile, item.lines, item.matchedIndices));
-      totalMatches += item.matchedIndices.length;
+      files.push(buildFileMatches(item.relFile, item.lines, item.matchedLines));
+      totalMatches += item.matchedLines.length;
     }
   }
   return {
     files,
     totalMatches,
-    truncated: truncated || anyFileTruncated || (summary || query.multiline === true) && discoveryTruncated
+    truncated: truncated || anyFileTruncated || discoveryTruncated,
+    ...discoveryBudgetExceeded || scanTimedOut ? { budgetExceeded: true } : {}
   };
 }
 function buildGlobFallbackPlan(pattern) {
@@ -4304,13 +4620,13 @@ function buildGlobFallbackPlan(pattern) {
   return null;
 }
 async function formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, sortBy, notePrefix) {
-  const relPrefix = toPosixPath(path5.relative(baseCwd, searchRoot));
+  const relPrefix = toPosixPath(path4.relative(baseCwd, searchRoot));
   const sortedFiles = [...walked.files].sort((a, b) => a < b ? -1 : a > b ? 1 : 0);
   if (sortBy === "mtime") {
     const mtimes = /* @__PURE__ */ new Map();
     for (let i = 0; i < sortedFiles.length; i += 32) {
       await Promise.all(sortedFiles.slice(i, i + 32).map(async (file) => {
-        const stat = await fs4.lstat(path5.join(searchRoot, file)).catch(() => void 0);
+        const stat = await fs3.lstat(path4.join(searchRoot, file)).catch(() => void 0);
         mtimes.set(file, stat?.mtimeMs ?? -Infinity);
       }));
     }
@@ -4336,19 +4652,20 @@ async function formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, sor
   const topDirs = [...dirCounts.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)).slice(0, 6).map(([dir, cnt]) => `${dir} (${cnt})`);
   const totalLabel = walked.truncated ? `${walked.files.length}+` : String(walked.files.length);
   const dirSummary = topDirs.length > 0 ? `; omitted dirs: ${topDirs.join(", ")}` : "";
+  const budgetNote = walked.timedOut || walked.dirsTruncated ? "; scan budget reached \u2014 narrow 'path' or 'glob'" : "";
   const suffix = `
-... [truncated at ${maxResults} of ${totalLabel} files${dirSummary}]`;
+... [truncated at ${maxResults} of ${totalLabel} files${dirSummary}${budgetNote}]`;
   return `${header}${items.join("\n")}${suffix}`;
 }
-async function runGlobQuery(query, searchRoot, baseCwd, isFileTarget) {
-  const maxResults = clampInt(query.maxResults ?? 80, 1, 300);
+async function runGlobQuery(query, searchRoot, baseCwd, isFileTarget, budget) {
+  const maxResults = clampInt(query.maxResults, 1, 300, 80);
   const pattern = query.pattern.trim() || "**/*";
   const matcher = globToRegExp(pattern);
   const matchBasename = !pattern.includes("/");
-  const includeHidden = pattern.startsWith(".") || pattern.includes("/.");
+  const includeHidden = patternTargetsHidden(pattern);
   if (isFileTarget) {
-    const rel = toPosixPath(path5.relative(baseCwd, searchRoot)) || path5.basename(searchRoot);
-    const base = path5.basename(searchRoot);
+    const rel = toPosixPath(path4.relative(baseCwd, searchRoot)) || path4.basename(searchRoot);
+    const base = path4.basename(searchRoot);
     const matched = matcher.test(rel) || matchBasename && matcher.test(base);
     if (matched) return rel;
     const fallback2 = buildGlobFallbackPlan(pattern);
@@ -4358,10 +4675,16 @@ ${rel}` : fallback2.emptyMessage;
     }
     return "(no files matched)";
   }
+  const walkRemainingMs = getEffectiveWalkTimeoutMs(budget);
+  if (walkRemainingMs <= 0) {
+    return "(no files matched before scan budget reached \u2014 narrow 'path' or 'glob')";
+  }
   const scanLimit = Math.max(maxResults + 1, 2e3);
   const walked = await walkFiles(searchRoot, {
     maxFiles: scanLimit,
     includeHidden,
+    timeoutMs: walkRemainingMs,
+    maxDirs: budget.walkMaxDirs,
     fileFilter: (relPosix) => {
       if (matcher.test(relPosix)) return true;
       if (matchBasename) {
@@ -4374,11 +4697,20 @@ ${rel}` : fallback2.emptyMessage;
   if (walked.files.length > 0) {
     return formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, query.sortBy);
   }
+  if (walked.timedOut || walked.dirsTruncated) {
+    return "(no files matched before scan budget reached \u2014 narrow 'path' or 'glob')";
+  }
   const fallback = buildGlobFallbackPlan(pattern);
   if (fallback) {
+    const fallbackRemainingMs = getEffectiveWalkTimeoutMs(budget);
+    if (fallbackRemainingMs <= 0) {
+      return "(no files matched before scan budget reached \u2014 narrow 'path' or 'glob')";
+    }
     const fallbackWalked = await walkFiles(searchRoot, {
       maxFiles: scanLimit,
       includeHidden,
+      timeoutMs: fallbackRemainingMs,
+      maxDirs: budget.walkMaxDirs,
       fileFilter: (relPosix) => {
         const base = relPosix.split("/").pop() ?? relPosix;
         return fallback.match(relPosix, base);
@@ -4394,24 +4726,41 @@ ${rel}` : fallback2.emptyMessage;
         fallback.matchedNote
       );
     }
+    if (fallbackWalked.timedOut || fallbackWalked.dirsTruncated) {
+      return "(no files matched before scan budget reached \u2014 narrow 'path' or 'glob')";
+    }
     return fallback.emptyMessage;
   }
   return "(no files matched)";
 }
 function relativeFile(baseCwd, file) {
-  return toPosixPath(path5.relative(baseCwd, path5.resolve(baseCwd, file))) || path5.basename(file);
+  return toPosixPath(path4.relative(baseCwd, path4.resolve(baseCwd, file))) || path4.basename(file);
 }
-async function runFuzzyQuery(query, searchRoot, baseCwd, isFileTarget) {
+async function runFuzzyQuery(query, searchRoot, baseCwd, isFileTarget, budget) {
   const pattern = query.pattern.trim();
   if (!pattern) throw new Error("Fuzzy pattern must not be blank");
   const matchesType = fileTypeMatcher(query.fileType);
-  const maxResults = clampInt(query.maxResults ?? 30, 1, 200);
-  const walked = isFileTarget ? { files: [searchRoot], truncated: false } : await walkFiles(searchRoot, { maxFiles: 8e3, fileFilter: matchesType });
-  const candidates = walked.files.filter(matchesType).map((file) => relativeFile(baseCwd, path5.resolve(searchRoot, file)));
+  const maxResults = clampInt(query.maxResults, 1, 200, 30);
+  const walkRemainingMs = getEffectiveWalkTimeoutMs(budget);
+  if (!isFileTarget && walkRemainingMs <= 0) {
+    return "(no files matched before scan budget reached \u2014 narrow 'path')";
+  }
+  const walked = isFileTarget ? { files: [searchRoot], truncated: false, timedOut: false, dirsTruncated: false } : await walkFiles(searchRoot, {
+    maxFiles: 8e3,
+    fileFilter: matchesType,
+    timeoutMs: walkRemainingMs,
+    maxDirs: budget.walkMaxDirs
+  });
+  const candidates = walked.files.filter(matchesType).map((file) => relativeFile(baseCwd, path4.resolve(searchRoot, file)));
   const { matches, totalMatched } = rankFuzzyPaths(pattern, candidates, maxResults);
-  const body = matches.map((match) => match.path).join("\n") || "(no files matched)";
+  const budgetHit = Boolean(walked.timedOut || walked.dirsTruncated);
+  if (matches.length === 0) {
+    return budgetHit ? "(no files matched before scan budget reached \u2014 narrow 'path')" : "(no files matched)";
+  }
+  const body = matches.map((match) => match.path).join("\n");
+  const budgetNote = budgetHit ? "; scan budget reached \u2014 narrow 'path'" : "";
   const footer = walked.truncated || totalMatched > maxResults ? `
-... [truncated; showing ${matches.length} files]` : "";
+... [truncated; showing ${matches.length} files${budgetNote}]` : "";
   return body + footer;
 }
 var SHORTLOG_VALUE_FLAGS = /* @__PURE__ */ new Set([
@@ -4483,6 +4832,8 @@ function hardenGitExecArgs(validatedArgs) {
     "-c",
     "core.fsmonitor=false",
     "-c",
+    "core.quotePath=false",
+    "-c",
     "diff.external=",
     "-c",
     "gpg.program=false",
@@ -4496,13 +4847,18 @@ function hardenGitExecArgs(validatedArgs) {
     ...subcmd ? [subcmd, ...subArgs] : subArgs
   ];
 }
-async function runGitQuery(query, searchRoot) {
+async function runGitQuery(query, searchRoot, budget) {
   const gitArgs = validateReadonlyGitArgs(query.pattern);
   const execArgs = hardenGitExecArgs(gitArgs);
+  const remainingMs = getRemainingMs(budget.callDeadline);
+  if (remainingMs <= 0) {
+    throw new Error("git query timed out");
+  }
   const res = await execBinaryAsync("git", execArgs, {
     cwd: searchRoot,
-    timeoutMs: 1e4,
-    maxOutputBytes: 512 * 1024
+    timeoutMs: Math.max(250, Math.min(1e4, remainingMs)),
+    maxOutputBytes: 512 * 1024,
+    env: withNonInteractiveGitEnv()
   });
   if (res.error) {
     throw new Error(`git execution error: ${res.error}`);
@@ -4517,6 +4873,51 @@ async function runGitQuery(query, searchRoot) {
   const out = res.stdout.trimEnd();
   return out || "(empty output)";
 }
+var MAX_SEARCH_LINE_CHARS = 240;
+function isHighSurrogate(code) {
+  return code >= 55296 && code <= 56319;
+}
+function isLowSurrogate(code) {
+  return code >= 56320 && code <= 57343;
+}
+function formatLineSnippet(line, maxChars = MAX_SEARCH_LINE_CHARS) {
+  const text = line.text;
+  if (text.length <= maxChars) return text;
+  if (!line.isMatch || line.matchStart === void 0) {
+    return `${sliceSafeChars(text, maxChars)}...`;
+  }
+  const len = text.length;
+  const mStart = clampInt(line.matchStart, 0, len);
+  const mEnd = line.matchEnd !== void 0 ? clampInt(line.matchEnd, mStart, len) : mStart;
+  const prefix = sliceSafeChars(text, maxChars);
+  if (mStart < prefix.length && mEnd <= prefix.length) {
+    return `${prefix}...`;
+  }
+  const matchLen = mEnd - mStart;
+  const lead = matchLen >= maxChars ? Math.min(Math.floor(maxChars * 0.1), mStart) : Math.min(
+    Math.min(80, Math.floor(maxChars * 0.35)),
+    Math.floor((maxChars - matchLen) / 2)
+  );
+  let winStart = Math.max(0, mStart - lead);
+  let winEnd = Math.min(len, winStart + maxChars);
+  if (winEnd === len) {
+    winStart = Math.max(0, winEnd - maxChars);
+  }
+  if (winStart > 0 && winStart < len && isLowSurrogate(text.charCodeAt(winStart))) {
+    if (winStart === mStart && isHighSurrogate(text.charCodeAt(winStart - 1))) {
+      winStart -= 1;
+    } else {
+      winStart += 1;
+    }
+  }
+  if (winEnd < len && winEnd > winStart && isHighSurrogate(text.charCodeAt(winEnd - 1))) {
+    winEnd -= 1;
+  }
+  if (winEnd < winStart) winEnd = winStart;
+  const leadEllipsis = winStart > 0 ? "..." : "";
+  const trailEllipsis = winEnd < len ? "..." : "";
+  return `${leadEllipsis}${text.slice(winStart, winEnd)}${trailEllipsis}`;
+}
 function formatFileMatches(files, totalMatches, truncated) {
   if (files.length === 0) {
     return "(no matches)";
@@ -4525,8 +4926,7 @@ function formatFileMatches(files, totalMatches, truncated) {
   for (const fm of files) {
     const lines = fm.lines.map((l) => {
       const sep = l.isMatch ? ":" : "-";
-      const text = l.text.length > 240 ? `${sliceSafeChars(l.text, 240)}...` : l.text;
-      return `  ${l.lineNumber}${sep} ${text}`;
+      return `  ${l.lineNumber}${sep} ${formatLineSnippet(l)}`;
     });
     blocks.push(`${fm.file}
 ${lines.join("\n")}`);
@@ -4535,73 +4935,514 @@ ${lines.join("\n")}`);
 ... [truncated at ${totalMatches} matches]` : "";
   return `${blocks.join("\n")}${footer}`;
 }
-async function executeSingleQuery(query, index, baseCwd, useRg) {
+function measureCost(text) {
+  return { chars: text.length, bytes: Buffer.byteLength(text, "utf8") };
+}
+function fileOmissionMarker(omitted) {
+  if (omitted <= 0) return "";
+  return `
+  ... (+${omitted} more ${omitted === 1 ? "match" : "matches"})`;
+}
+function buildTruncatedNotice(shownMatches, totalMatches, shownFiles, totalFiles, maxResultsTruncated, omittedContextOnly) {
+  const totalLabel = maxResultsTruncated ? `${totalMatches}+` : `${totalMatches}`;
+  const filesLabel = shownFiles < totalFiles ? `across ${shownFiles} of ${totalFiles} files` : totalFiles === 1 ? "in 1 file" : `across ${totalFiles} files`;
+  if (omittedContextOnly) {
+    return `
+... [truncated: showed all ${shownMatches} ${shownMatches === 1 ? "match" : "matches"} ${filesLabel}; omitted context lines${maxResultsTruncated ? `; capped at ${totalMatches} matches` : ""}]`;
+  }
+  return `
+... [truncated: showed ${shownMatches} of ${totalLabel} matches ${filesLabel}]`;
+}
+function fitShrunkMatchLine(line, maxChars, maxBytes) {
+  const prefix = `  ${line.lineNumber}: `;
+  const prefixBytes = Buffer.byteLength(prefix, "utf8");
+  const availChars = maxChars - prefix.length;
+  const availBytes = maxBytes - prefixBytes;
+  if (availChars < 24 || availBytes < 24) return null;
+  let winBudget = Math.min(
+    MAX_SEARCH_LINE_CHARS,
+    Math.max(16, Math.min(availChars, availBytes) - 6)
+  );
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const snippet = formatLineSnippet(line, winBudget);
+    const full = `${prefix}${snippet}`;
+    const fullBytes = Buffer.byteLength(full, "utf8");
+    if (full.length <= maxChars && fullBytes <= maxBytes) {
+      return full;
+    }
+    const ratio = Math.min(
+      availChars / Math.max(1, snippet.length),
+      availBytes / Math.max(1, fullBytes - prefixBytes)
+    );
+    const nextWin = Math.floor(Math.min(winBudget, snippet.length) * ratio) - 4;
+    if (nextWin < 16 || nextWin >= winBudget) break;
+    winBudget = nextWin;
+  }
+  return null;
+}
+function formatBudgetedContentSection(params) {
+  const {
+    header,
+    files,
+    totalMatches,
+    maxResultsTruncated,
+    contextLines,
+    charBudget,
+    byteBudget
+  } = params;
+  const headerCost = measureCost(header);
+  if (charBudget <= headerCost.chars + 40 || byteBudget <= headerCost.bytes + 40) {
+    return null;
+  }
+  const states = [];
+  let totalContextCount = 0;
+  for (const fm of files) {
+    const matchEntries = [];
+    const contextEntries = [];
+    let firstMatchLine;
+    for (const l of fm.lines) {
+      const sep = l.isMatch ? ":" : "-";
+      const formatted = `  ${l.lineNumber}${sep} ${formatLineSnippet(l)}`;
+      const entry = {
+        lineNumber: l.lineNumber,
+        isMatch: l.isMatch,
+        formatted,
+        cost: {
+          chars: 1 + formatted.length,
+          bytes: 1 + Buffer.byteLength(formatted, "utf8")
+        }
+      };
+      if (l.isMatch) {
+        if (!firstMatchLine) firstMatchLine = l;
+        matchEntries.push(entry);
+      } else {
+        contextEntries.push(entry);
+        totalContextCount += 1;
+      }
+    }
+    if (matchEntries.length === 0 || !firstMatchLine) continue;
+    states.push({
+      file: fm.file,
+      headerCost: {
+        chars: 1 + fm.file.length,
+        bytes: 1 + Buffer.byteLength(fm.file, "utf8")
+      },
+      matchEntries,
+      contextEntries,
+      firstMatchLine,
+      shownMatches: 0,
+      selectedContexts: [],
+      selectedLineNums: /* @__PURE__ */ new Set()
+    });
+  }
+  if (states.length === 0) return null;
+  const totalFiles = states.length;
+  const effectiveTotalMatches = states.reduce((acc, s) => acc + s.matchEntries.length, 0);
+  const actualTotalMatches = Math.max(totalMatches, effectiveTotalMatches);
+  let usedChars = headerCost.chars;
+  let usedBytes = headerCost.bytes;
+  let shownMatches = 0;
+  let shownContexts = 0;
+  let shownFiles = 0;
+  let allFilesFirstChars = headerCost.chars;
+  let allFilesFirstBytes = headerCost.bytes;
+  for (const st of states) {
+    const first = st.matchEntries[0];
+    const markerCost = measureCost(fileOmissionMarker(st.matchEntries.length - 1));
+    allFilesFirstChars += st.headerCost.chars + first.cost.chars + markerCost.chars;
+    allFilesFirstBytes += st.headerCost.bytes + first.cost.bytes + markerCost.bytes;
+  }
+  const allShownInitialNotice = measureCost(
+    buildTruncatedNotice(
+      totalFiles,
+      actualTotalMatches,
+      totalFiles,
+      totalFiles,
+      maxResultsTruncated,
+      totalFiles === actualTotalMatches
+    )
+  );
+  if (allFilesFirstChars + allShownInitialNotice.chars <= charBudget && allFilesFirstBytes + allShownInitialNotice.bytes <= byteBudget) {
+    for (const st of states) {
+      const first = st.matchEntries[0];
+      const markerCost = measureCost(fileOmissionMarker(st.matchEntries.length - 1));
+      st.shownMatches = 1;
+      st.selectedLineNums.add(first.lineNumber);
+      usedChars += st.headerCost.chars + first.cost.chars + markerCost.chars;
+      usedBytes += st.headerCost.bytes + first.cost.bytes + markerCost.bytes;
+      shownMatches += 1;
+      shownFiles += 1;
+    }
+  } else {
+    const worstTruncNotice = measureCost(
+      buildTruncatedNotice(
+        actualTotalMatches,
+        actualTotalMatches,
+        totalFiles,
+        totalFiles,
+        maxResultsTruncated,
+        false
+      )
+    );
+    const minOmittedNotice = totalFiles > 1 ? measureCost(
+      `
+... [+${totalFiles} more files; use outputMode: "files_with_matches"]`
+    ) : { chars: 0, bytes: 0 };
+    const bodyChars = Math.max(0, charBudget - headerCost.chars - worstTruncNotice.chars);
+    const bodyBytes = Math.max(0, byteBudget - headerCost.bytes - worstTruncNotice.bytes);
+    const targetOmittedChars = totalFiles > 1 ? Math.max(minOmittedNotice.chars, Math.min(220, Math.floor(bodyChars * 0.25))) : 0;
+    const targetOmittedBytes = totalFiles > 1 ? Math.max(minOmittedNotice.bytes, Math.min(220, Math.floor(bodyBytes * 0.25))) : 0;
+    const tryAddFirstMatch = (st, reserveChars, reserveBytes) => {
+      const first = st.matchEntries[0];
+      const markerCost = measureCost(fileOmissionMarker(st.matchEntries.length - 1));
+      const addChars = st.headerCost.chars + first.cost.chars + markerCost.chars;
+      const addBytes = st.headerCost.bytes + first.cost.bytes + markerCost.bytes;
+      if (usedChars + addChars + worstTruncNotice.chars + reserveChars <= charBudget && usedBytes + addBytes + worstTruncNotice.bytes + reserveBytes <= byteBudget) {
+        st.shownMatches = 1;
+        st.selectedLineNums.add(first.lineNumber);
+        usedChars += addChars;
+        usedBytes += addBytes;
+        shownMatches += 1;
+        shownFiles += 1;
+        return true;
+      }
+      return false;
+    };
+    for (const st of states) {
+      if (tryAddFirstMatch(st, targetOmittedChars, targetOmittedBytes)) {
+        continue;
+      }
+      if (shownFiles === 0) {
+        if (tryAddFirstMatch(st, minOmittedNotice.chars, minOmittedNotice.bytes)) {
+          break;
+        }
+        const markerCost = measureCost(fileOmissionMarker(st.matchEntries.length - 1));
+        const availLineChars = charBudget - usedChars - st.headerCost.chars - markerCost.chars - worstTruncNotice.chars - minOmittedNotice.chars - 1;
+        const availLineBytes = byteBudget - usedBytes - st.headerCost.bytes - markerCost.bytes - worstTruncNotice.bytes - minOmittedNotice.bytes - 1;
+        const shrunk = fitShrunkMatchLine(st.firstMatchLine, availLineChars, availLineBytes);
+        if (shrunk) {
+          const shrunkCost = {
+            chars: 1 + shrunk.length,
+            bytes: 1 + Buffer.byteLength(shrunk, "utf8")
+          };
+          st.matchEntries[0] = {
+            ...st.matchEntries[0],
+            formatted: shrunk,
+            cost: shrunkCost
+          };
+          st.shownMatches = 1;
+          st.selectedLineNums.add(st.matchEntries[0].lineNumber);
+          usedChars += st.headerCost.chars + shrunkCost.chars + markerCost.chars;
+          usedBytes += st.headerCost.bytes + shrunkCost.bytes + markerCost.bytes;
+          shownMatches += 1;
+          shownFiles += 1;
+        }
+      }
+      break;
+    }
+    if (shownFiles === 0) {
+      return null;
+    }
+  }
+  if (shownFiles === totalFiles) {
+    const matchExhausted = new Array(totalFiles).fill(false);
+    let progressed = true;
+    while (progressed) {
+      progressed = false;
+      for (let f = 0; f < totalFiles; f++) {
+        if (matchExhausted[f]) continue;
+        const st = states[f];
+        if (st.shownMatches >= st.matchEntries.length) {
+          matchExhausted[f] = true;
+          continue;
+        }
+        const entry = st.matchEntries[st.shownMatches];
+        const prevMarkerCost = measureCost(
+          fileOmissionMarker(st.matchEntries.length - st.shownMatches)
+        );
+        const nextMarkerCost = measureCost(
+          fileOmissionMarker(st.matchEntries.length - (st.shownMatches + 1))
+        );
+        const deltaChars = entry.cost.chars + nextMarkerCost.chars - prevMarkerCost.chars;
+        const deltaBytes = entry.cost.bytes + nextMarkerCost.bytes - prevMarkerCost.bytes;
+        const nextShownMatches = shownMatches + 1;
+        const nextNoticeCost = measureCost(
+          buildTruncatedNotice(
+            nextShownMatches,
+            actualTotalMatches,
+            shownFiles,
+            totalFiles,
+            maxResultsTruncated,
+            nextShownMatches === actualTotalMatches
+          )
+        );
+        if (usedChars + deltaChars + nextNoticeCost.chars <= charBudget && usedBytes + deltaBytes + nextNoticeCost.bytes <= byteBudget) {
+          st.shownMatches += 1;
+          st.selectedLineNums.add(entry.lineNumber);
+          usedChars += deltaChars;
+          usedBytes += deltaBytes;
+          shownMatches = nextShownMatches;
+          progressed = true;
+        } else {
+          matchExhausted[f] = true;
+        }
+      }
+    }
+    if (contextLines > 0 && totalContextCount > 0) {
+      const eligibleByFile = states.map((st) => {
+        if (st.contextEntries.length === 0) return [];
+        const renderedMatches = st.matchEntries.slice(0, st.shownMatches).map((m) => m.lineNumber);
+        const unrenderedSet = new Set(
+          st.matchEntries.slice(st.shownMatches).map((m) => m.lineNumber)
+        );
+        const eligible = [];
+        for (const ctx of st.contextEntries) {
+          let bestDist = Number.POSITIVE_INFINITY;
+          for (const mLn of renderedMatches) {
+            const dist = Math.abs(ctx.lineNumber - mLn);
+            if (dist > contextLines || dist >= bestDist) continue;
+            const lo = Math.min(ctx.lineNumber, mLn);
+            const hi = Math.max(ctx.lineNumber, mLn);
+            let blocked = false;
+            for (let ln = lo + 1; ln < hi; ln++) {
+              if (unrenderedSet.has(ln)) {
+                blocked = true;
+                break;
+              }
+            }
+            if (!blocked) {
+              bestDist = dist;
+            }
+          }
+          if (bestDist <= contextLines) {
+            eligible.push({ entry: ctx, dist: bestDist });
+          }
+        }
+        eligible.sort((a, b) => a.dist - b.dist || a.entry.lineNumber - b.entry.lineNumber);
+        return eligible.map((e) => e.entry);
+      });
+      const noticeCost = measureCost(
+        buildTruncatedNotice(
+          shownMatches,
+          actualTotalMatches,
+          shownFiles,
+          totalFiles,
+          maxResultsTruncated,
+          shownMatches === actualTotalMatches
+        )
+      );
+      const pickedCtxIdx = states.map(() => /* @__PURE__ */ new Set());
+      let ctxProgressed = true;
+      while (ctxProgressed) {
+        ctxProgressed = false;
+        for (let f = 0; f < totalFiles; f++) {
+          const candidates = eligibleByFile[f];
+          if (candidates.length === 0) continue;
+          const st = states[f];
+          const picked = pickedCtxIdx[f];
+          for (let cIdx = 0; cIdx < candidates.length; cIdx++) {
+            if (picked.has(cIdx)) continue;
+            const ctx = candidates[cIdx];
+            if (!st.selectedLineNums.has(ctx.lineNumber - 1) && !st.selectedLineNums.has(ctx.lineNumber + 1)) {
+              continue;
+            }
+            if (usedChars + ctx.cost.chars + noticeCost.chars <= charBudget && usedBytes + ctx.cost.bytes + noticeCost.bytes <= byteBudget) {
+              picked.add(cIdx);
+              st.selectedContexts.push(ctx);
+              st.selectedLineNums.add(ctx.lineNumber);
+              usedChars += ctx.cost.chars;
+              usedBytes += ctx.cost.bytes;
+              shownContexts += 1;
+              ctxProgressed = true;
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
+  const parts = [header];
+  for (let f = 0; f < shownFiles; f++) {
+    const st = states[f];
+    parts.push(`
+${st.file}`);
+    const chosenLines = [
+      ...st.matchEntries.slice(0, st.shownMatches),
+      ...st.selectedContexts
+    ].sort((a, b) => a.lineNumber - b.lineNumber);
+    for (const line of chosenLines) {
+      parts.push(`
+${line.formatted}`);
+    }
+    const omittedInFile = st.matchEntries.length - st.shownMatches;
+    if (omittedInFile > 0) {
+      parts.push(fileOmissionMarker(omittedInFile));
+    }
+  }
+  const omittedContextOnly = shownFiles === totalFiles && shownMatches === actualTotalMatches && shownContexts < totalContextCount;
+  const truncLine = shownFiles < totalFiles || shownMatches < actualTotalMatches || shownContexts < totalContextCount ? buildTruncatedNotice(
+    shownMatches,
+    actualTotalMatches,
+    shownFiles,
+    totalFiles,
+    maxResultsTruncated,
+    omittedContextOnly
+  ) : maxResultsTruncated ? `
+... [truncated at ${totalMatches} matches]` : "";
+  let omittedFilesLine = "";
+  if (shownFiles < totalFiles) {
+    const bodySoFar = parts.join("");
+    const truncCost = measureCost(truncLine);
+    const remChars = charBudget - bodySoFar.length - truncCost.chars;
+    const remBytes = byteBudget - Buffer.byteLength(bodySoFar, "utf8") - truncCost.bytes;
+    const unshown = states.slice(shownFiles);
+    const allItems = unshown.map((st) => `${st.file} (${st.matchEntries.length})`);
+    const allLine = `
+... [more files: ${allItems.join(", ")}]`;
+    if (allLine.length <= remChars && Buffer.byteLength(allLine, "utf8") <= remBytes) {
+      omittedFilesLine = allLine;
+    } else {
+      const named = [];
+      let bestLine = "";
+      for (let i = 0; i < unshown.length; i++) {
+        const item = allItems[i];
+        const leftAfter = unshown.length - (i + 1);
+        const list = named.length === 0 ? item : `${named.join(", ")}, ${item}`;
+        const suffix = leftAfter > 0 ? `, +${leftAfter} more ${leftAfter === 1 ? "file" : "files"}; use outputMode: "files_with_matches"]` : "]";
+        const candidate = `
+... [more files: ${list}${suffix}`;
+        if (candidate.length <= remChars && Buffer.byteLength(candidate, "utf8") <= remBytes) {
+          named.push(item);
+          bestLine = candidate;
+        } else {
+          break;
+        }
+      }
+      if (bestLine) {
+        omittedFilesLine = bestLine;
+      } else {
+        const fallback = `
+... [+${unshown.length} more ${unshown.length === 1 ? "file" : "files"}; use outputMode: "files_with_matches"]`;
+        const shortFallback = `
+... [+${unshown.length} more ${unshown.length === 1 ? "file" : "files"}]`;
+        if (fallback.length <= remChars && Buffer.byteLength(fallback, "utf8") <= remBytes) {
+          omittedFilesLine = fallback;
+        } else if (shortFallback.length <= remChars && Buffer.byteLength(shortFallback, "utf8") <= remBytes) {
+          omittedFilesLine = shortFallback;
+        }
+      }
+    }
+  }
+  const result = `${parts.join("")}${omittedFilesLine}${truncLine}`;
+  if (result.length <= charBudget && Buffer.byteLength(result, "utf8") <= byteBudget) {
+    return result;
+  }
+  return null;
+}
+async function executeSingleQuery(query, index, baseCwd, useRg, budget) {
   const header = `## Query ${index + 1} [${query.type}] ${query.pattern}${query.path ? ` (in ${query.path})` : ""}`;
   try {
     if (!query.pattern || typeof query.pattern !== "string") {
-      throw new Error("Query 'pattern' must be a non-empty string");
+      throw new Error(
+        withValidationExample(
+          "Query 'pattern' must be a non-empty string",
+          TOOL_VALIDATION_EXAMPLES.batch_search
+        )
+      );
     }
     if (query.multiline !== void 0 && typeof query.multiline !== "boolean") {
-      throw new Error("multiline must be a boolean");
+      throw new Error(
+        withValidationExample(
+          "multiline must be a boolean",
+          TOOL_VALIDATION_EXAMPLES.batch_search
+        )
+      );
     }
     if (query.outputMode !== void 0 && !["content", "files_with_matches", "count"].includes(query.outputMode)) {
-      throw new Error("Invalid outputMode");
+      throw new Error(
+        withValidationExample(
+          "Invalid outputMode",
+          TOOL_VALIDATION_EXAMPLES.batch_search
+        )
+      );
     }
     if (query.sortBy !== void 0 && !["path", "mtime"].includes(query.sortBy)) {
-      throw new Error("Invalid sortBy");
+      throw new Error(
+        withValidationExample(
+          "Invalid sortBy",
+          TOOL_VALIDATION_EXAMPLES.batch_search
+        )
+      );
     }
     const searchRoot = query.path ? resolvePath(query.path, baseCwd) : baseCwd;
     let targetStat;
     try {
-      targetStat = await fs4.stat(searchRoot);
+      targetStat = await fs3.stat(searchRoot);
     } catch {
       throw new Error(`Path does not exist: ${query.path || baseCwd}`);
     }
     if (query.type === "git") {
-      const gitCwd = targetStat.isFile() ? path5.dirname(searchRoot) : searchRoot;
-      const out = await runGitQuery(query, gitCwd);
-      return `${header}
-${out}`;
+      const gitCwd = targetStat.isFile() ? path4.dirname(searchRoot) : searchRoot;
+      const out = await runGitQuery(query, gitCwd, budget);
+      return { header, text: `${header}
+${out}` };
     }
     if (query.type === "glob") {
-      const out = await runGlobQuery(query, searchRoot, baseCwd, targetStat.isFile());
-      return `${header}
-${out}`;
+      const out = await runGlobQuery(query, searchRoot, baseCwd, targetStat.isFile(), budget);
+      return { header, text: `${header}
+${out}` };
     }
     if (query.type === "fuzzy") {
-      const out = await runFuzzyQuery(query, searchRoot, baseCwd, targetStat.isFile());
-      return `${header}
-${out}`;
+      const out = await runFuzzyQuery(query, searchRoot, baseCwd, targetStat.isFile(), budget);
+      return { header, text: `${header}
+${out}` };
     }
     if (query.type === "text" || query.type === "regex") {
       let res;
       if (useRg) {
         try {
-          res = await runTextOrRegexWithRg(query, searchRoot, baseCwd);
+          res = await runTextOrRegexWithRg(query, searchRoot, baseCwd, budget);
         } catch (err) {
           if (err instanceof Error && err.message.startsWith("rg spawn error:")) {
-            res = await runTextOrRegexWithNode(query, searchRoot, baseCwd);
+            res = await runTextOrRegexWithNode(query, searchRoot, baseCwd, budget);
           } else {
             throw err;
           }
         }
       } else {
-        res = await runTextOrRegexWithNode(query, searchRoot, baseCwd);
+        res = await runTextOrRegexWithNode(query, searchRoot, baseCwd, budget);
       }
+      const budgetNote = res.budgetExceeded ? "; scan budget reached \u2014 narrow 'path' or 'glob'" : "";
       if (query.outputMode === "count" || query.outputMode === "files_with_matches") {
-        const body = res.files.map(({ file, count }) => query.outputMode === "count" ? `${file}: ${count} ${query.multiline ? "matches" : "matching lines"}` : file).join("\n") || "(no matches)";
-        const footer = res.truncated ? `
-... [truncated; showing ${res.files.length} files]` : "";
-        return `${header}
-${body}${footer}`;
+        const body = res.files.map(({ file, count }) => query.outputMode === "count" ? `${file}: ${count} ${query.multiline ? "matches" : "matching lines"}` : file).join("\n") || (res.budgetExceeded ? "(no matches before scan budget reached \u2014 narrow 'path' or 'glob')" : "(no matches)");
+        const footer = res.truncated && res.files.length > 0 ? `
+... [truncated; showing ${res.files.length} files${budgetNote}]` : "";
+        return { header, text: `${header}
+${body}${footer}` };
       }
-      return `${header}
-${formatFileMatches(res.files, res.totalMatches, res.truncated)}`;
+      const formattedBody = res.files.length === 0 && res.budgetExceeded ? "(no matches before scan budget reached \u2014 narrow 'path' or 'glob')" : formatFileMatches(res.files, res.totalMatches, res.truncated) + (res.budgetExceeded && res.files.length > 0 ? "\n... [scan budget reached \u2014 narrow 'path' or 'glob']" : "");
+      const text = `${header}
+${formattedBody}`;
+      return {
+        header,
+        text,
+        contentResult: res.files.length > 0 ? {
+          files: res.files,
+          totalMatches: res.totalMatches,
+          truncated: res.truncated,
+          contextLines: clampInt(query.contextLines, 0, MAX_CONTEXT_LINES, 0)
+        } : void 0
+      };
     }
-    throw new Error(`Unsupported query type: ${String(query.type)}`);
+    throw new Error(
+      withValidationExample(
+        `Unsupported query type: ${String(query.type)}`,
+        TOOL_VALIDATION_EXAMPLES.batch_search
+      )
+    );
   } catch (err) {
-    return `${header}
-ERROR: ${err instanceof Error ? err.message : String(err)}`;
+    return { header, text: `${header}
+ERROR: ${err instanceof Error ? err.message : String(err)}` };
   }
 }
 async function runBatchSearch(input, options = {}) {
@@ -4625,14 +5466,20 @@ async function runBatchSearch(input, options = {}) {
       };
     }
     return {
-      text: "Error: 'queries' must be a non-empty array of search queries.",
+      text: withValidationExample(
+        "Error: 'queries' must be a non-empty array of search queries.",
+        TOOL_VALIDATION_EXAMPLES.batch_search
+      ),
       isError: true
     };
   }
   const rawQueries = parsedQueries.value;
   if (rawQueries.length === 0) {
     return {
-      text: "Error: 'queries' must be a non-empty array of search queries.",
+      text: withValidationExample(
+        "Error: 'queries' must be a non-empty array of search queries.",
+        TOOL_VALIDATION_EXAMPLES.batch_search
+      ),
       isError: true
     };
   }
@@ -4666,34 +5513,88 @@ async function runBatchSearch(input, options = {}) {
   const queries = rawQueries;
   const baseCwd = resolvePath(input.cwd || process.cwd());
   try {
-    const st = await fs4.stat(baseCwd);
+    const st = await fs3.stat(baseCwd);
     if (!st.isDirectory()) {
       return { text: `Error: cwd is not a directory: ${baseCwd}`, isError: true };
     }
   } catch {
     return { text: `Error: cwd does not exist: ${baseCwd}`, isError: true };
   }
-  const maxChars = clampInt(input.maxChars ?? 8500, 500, DEFAULT_INLINE_MAX_BYTES);
+  const maxChars = clampInt(input.maxChars, 500, DEFAULT_INLINE_MAX_BYTES, 8500);
   const maxBytes = DEFAULT_INLINE_MAX_BYTES;
   const needsTextSearch = queries.some(
     (q) => q.type === "text" || q.type === "regex"
   );
   const useRg = needsTextSearch && !options.forceNodeFallback && await isRipgrepAvailable();
-  const sections = await Promise.all(
-    queries.map((q, idx) => executeSingleQuery(q, idx, baseCwd, useRg))
+  const callTimeoutMs = options.callTimeoutMs !== void 0 && Number.isFinite(options.callTimeoutMs) && options.callTimeoutMs > 0 ? Math.max(1, Math.trunc(options.callTimeoutMs)) : DEFAULT_BATCH_SEARCH_CALL_TIMEOUT_MS;
+  const walkTimeoutMs = options.walkTimeoutMs !== void 0 && Number.isFinite(options.walkTimeoutMs) && options.walkTimeoutMs > 0 ? Math.max(1, Math.trunc(options.walkTimeoutMs)) : DEFAULT_WALK_TIMEOUT_MS;
+  const walkMaxDirs = options.walkMaxDirs !== void 0 && Number.isFinite(options.walkMaxDirs) && options.walkMaxDirs > 0 ? Math.max(1, Math.trunc(options.walkMaxDirs)) : DEFAULT_WALK_MAX_DIRS;
+  const budget = {
+    callDeadline: Date.now() + callTimeoutMs,
+    walkTimeoutMs,
+    walkMaxDirs
+  };
+  const executed = await Promise.all(
+    queries.map((q, idx) => executeSingleQuery(q, idx, baseCwd, useRg, budget))
   );
+  const separator = "\n\n";
+  const rawSections = executed.map((e) => e.text);
+  const joined = rawSections.join(separator);
+  const sepChars = separator.length * Math.max(0, rawSections.length - 1);
+  const sepBytes = Buffer.byteLength(separator, "utf8") * Math.max(0, rawSections.length - 1);
+  const overChars = joined.length > maxChars;
+  const overBytes = Buffer.byteLength(joined, "utf8") > maxBytes;
+  let finalSections = rawSections;
+  if (overChars || overBytes) {
+    const rawCharLens = rawSections.map((s) => s.length);
+    const rawByteLens = rawSections.map((s) => Buffer.byteLength(s, "utf8"));
+    const byteBudgets = overBytes ? computeWaterFillBudgets(rawByteLens, Math.max(0, maxBytes - sepBytes)) : rawByteLens.map(() => maxBytes);
+    const charBudgets = overChars ? computeWaterFillBudgets(rawCharLens, Math.max(0, maxChars - sepChars)) : computeWaterFillBudgets(
+      rawCharLens.map(
+        (len, idx) => rawByteLens[idx] > byteBudgets[idx] ? maxChars : len
+      ),
+      Math.max(0, maxChars - sepChars)
+    );
+    finalSections = executed.map((ex, idx) => {
+      const charBudget = charBudgets[idx] ?? 0;
+      const byteBudget = byteBudgets[idx] ?? 0;
+      if (!ex.contentResult || rawCharLens[idx] <= charBudget && rawByteLens[idx] <= byteBudget) {
+        return ex.text;
+      }
+      const budgeted = formatBudgetedContentSection({
+        header: ex.header,
+        files: ex.contentResult.files,
+        totalMatches: ex.contentResult.totalMatches,
+        maxResultsTruncated: ex.contentResult.truncated,
+        contextLines: ex.contentResult.contextLines,
+        charBudget,
+        byteBudget
+      });
+      return budgeted ?? ex.text;
+    });
+  }
   return {
-    text: fitSectionsToByteBudget(sections, maxChars, maxBytes, "\n\n"),
+    text: fitSectionsToByteBudget(finalSections, maxChars, maxBytes, separator),
     isError: false
   };
 }
-function clampInt(val, min, max) {
-  if (!Number.isFinite(val)) return min;
-  return Math.max(min, Math.min(max, Math.trunc(val)));
+function patternTargetsHidden(pattern) {
+  const normalized = pattern.replace(/\\/g, "/").replace(/^(?:\.\/)+/, "");
+  return /(?:^|[/,{])\.[^./]/.test(normalized);
+}
+function globTargetsDir(glob, dir) {
+  const normalized = glob.replace(/\\/g, "/").replace(/(^|[,{])(?:\.\/)+/g, "$1");
+  const escaped = dir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|[/,{])${escaped}(?:$|[/},])`).test(normalized);
+}
+function clampInt(val, min, max, fallback = min) {
+  const num = typeof val === "number" ? val : typeof val === "string" && val.trim() !== "" ? Number(val) : NaN;
+  if (!Number.isFinite(num)) return fallback;
+  return Math.max(min, Math.min(max, Math.trunc(num)));
 }
 
 // src/tools/read-slices.ts
-import path6 from "node:path";
+import path5 from "node:path";
 function isRegexStartContext(line, slashIdx) {
   let j = slashIdx - 1;
   while (j >= 0 && /\s/.test(line[j])) j--;
@@ -6711,7 +7612,7 @@ function extractSfcSymbols(lines, mode) {
   return symbols.length > 0 ? symbols : extractTsJsSymbols(lines);
 }
 function extractSymbolsFromLines(filePath, lines) {
-  const ext = path6.extname(filePath).toLowerCase();
+  const ext = path5.extname(filePath).toLowerCase();
   switch (ext) {
     case ".ts":
     case ".tsx":
@@ -6959,38 +7860,55 @@ ${pickedLines.join("\n")}${packed.footer}`;
 async function runReadSlices(input) {
   const corruptedItems = [];
   let outlines = [];
+  let sliceFormatError = null;
   if (input?.outlines !== void 0) {
-    const parsedOutlines = parseMaybeJsonArray(input.outlines);
+    const parsedOutlines = parseMaybeStringOrJsonArray(input.outlines);
     if (!parsedOutlines.ok) {
-      corruptedItems.push({
-        label: "outlines",
-        value: input.outlines,
-        expected: "an array of file path strings"
-      });
+      if (parsedOutlines.kind === "corrupted_literal" || input.outlines === null || typeof input.outlines === "boolean") {
+        corruptedItems.push({
+          label: "outlines",
+          value: parsedOutlines.kind === "corrupted_literal" ? parsedOutlines.value : input.outlines,
+          expected: "an array of file path strings"
+        });
+      } else {
+        sliceFormatError = withValidationExample(
+          `Error: 'outlines' must be an array of non-empty file path strings (${parsedOutlines.detail}).`,
+          TOOL_VALIDATION_EXAMPLES.read_slices
+        );
+      }
     } else {
       for (let i = 0; i < parsedOutlines.value.length; i++) {
         const item = parsedOutlines.value[i];
-        if (typeof item !== "string" || !item.trim()) {
+        if (item === null || typeof item === "boolean") {
           corruptedItems.push({
             label: `outlines[${i}]`,
             value: item,
             expected: "a non-empty file path string"
           });
+        } else if (typeof item !== "string" || !item.trim()) {
+          if (sliceFormatError === null) {
+            sliceFormatError = withValidationExample(
+              `Error: outlines[${i}] must be a non-empty file path string.`,
+              TOOL_VALIDATION_EXAMPLES.read_slices
+            );
+          }
         }
       }
-      if (corruptedItems.length === 0) {
+      if (corruptedItems.length === 0 && sliceFormatError === null) {
         outlines = parsedOutlines.value;
       }
     }
   }
   let slices = [];
-  let sliceFormatError = null;
   const parseSliceShorthand = (raw, label) => {
     const trimmed = raw.trim();
     const match = /^(.+):(\d+(?:-\d+)?(?:\s*,\s*\d+(?:-\d+)?)*)$/.exec(trimmed);
     if (!match || !match[1].trim()) {
       if (sliceFormatError === null) {
-        sliceFormatError = `Error: ${label} must use 'path:start-end' or 'path:start1-end1,start2-end2' format (got ${JSON.stringify(raw)}).`;
+        sliceFormatError = withValidationExample(
+          `Error: ${label} must use 'path:start-end' or 'path:start1-end1,start2-end2' format (got ${JSON.stringify(raw)}).`,
+          TOOL_VALIDATION_EXAMPLES.read_slices_line_range
+        );
       }
       return null;
     }
@@ -7009,11 +7927,18 @@ async function runReadSlices(input) {
   if (input?.slices !== void 0) {
     const parsedSlices = parseMaybeJsonArray(input.slices);
     if (!parsedSlices.ok) {
-      corruptedItems.push({
-        label: "slices",
-        value: input.slices,
-        expected: "an array of slice objects ({ path, ranges }) or 'path:start-end' strings"
-      });
+      if (parsedSlices.kind === "corrupted_literal" || input.slices === null || typeof input.slices === "boolean") {
+        corruptedItems.push({
+          label: "slices",
+          value: parsedSlices.kind === "corrupted_literal" ? parsedSlices.value : input.slices,
+          expected: "an array of slice objects ({ path, ranges }) or 'path:start-end' strings"
+        });
+      } else if (sliceFormatError === null) {
+        sliceFormatError = withValidationExample(
+          `Error: 'slices' must be an array of slice objects ({ path, ranges }) or 'path:start-end' strings (${parsedSlices.detail}).`,
+          TOOL_VALIDATION_EXAMPLES.read_slices
+        );
+      }
     } else {
       const normalizedSlices = [];
       for (let i = 0; i < parsedSlices.value.length; i++) {
@@ -7023,7 +7948,7 @@ async function runReadSlices(input) {
           if (parsed) normalizedSlices.push(parsed);
           continue;
         }
-        if (!isPlainObject(item)) {
+        if (item === null || typeof item === "boolean") {
           corruptedItems.push({
             label: `slices[${i}]`,
             value: item,
@@ -7031,12 +7956,28 @@ async function runReadSlices(input) {
           });
           continue;
         }
-        if (item.ranges !== void 0 && !Array.isArray(item.ranges)) {
+        if (!isPlainObject(item)) {
+          if (sliceFormatError === null) {
+            sliceFormatError = withValidationExample(
+              `Error: slices[${i}] must be a slice object ({ path, ranges }) or 'path:start-end' string.`,
+              TOOL_VALIDATION_EXAMPLES.read_slices
+            );
+          }
+          continue;
+        }
+        if (item.ranges === null || typeof item.ranges === "boolean") {
           corruptedItems.push({
             label: `slices[${i}].ranges`,
             value: item.ranges,
             expected: "an array of [startLine, endLine] pairs"
           });
+        } else if (item.ranges !== void 0 && !Array.isArray(item.ranges)) {
+          if (sliceFormatError === null) {
+            sliceFormatError = withValidationExample(
+              `Error: slices[${i}].ranges must be an array of [startLine, endLine] pairs.`,
+              TOOL_VALIDATION_EXAMPLES.read_slices
+            );
+          }
         } else if (Array.isArray(item.ranges)) {
           for (let j = 0; j < item.ranges.length; j++) {
             const r = item.ranges[j];
@@ -7057,13 +7998,20 @@ async function runReadSlices(input) {
     }
   }
   if (input?.lineRanges !== void 0) {
-    const parsedSpecs = parseMaybeJsonArray(input.lineRanges);
+    const parsedSpecs = parseMaybeStringOrJsonArray(input.lineRanges);
     if (!parsedSpecs.ok) {
-      corruptedItems.push({
-        label: "lineRanges",
-        value: input.lineRanges,
-        expected: "an array of 'path:start-end' strings"
-      });
+      if (parsedSpecs.kind === "corrupted_literal" || input.lineRanges === null || typeof input.lineRanges === "boolean") {
+        corruptedItems.push({
+          label: "lineRanges",
+          value: parsedSpecs.kind === "corrupted_literal" ? parsedSpecs.value : input.lineRanges,
+          expected: "an array of 'path:start-end' strings"
+        });
+      } else if (sliceFormatError === null) {
+        sliceFormatError = withValidationExample(
+          `Error: 'lineRanges' must be an array of 'path:start-end' strings (${parsedSpecs.detail}).`,
+          TOOL_VALIDATION_EXAMPLES.read_slices_line_range
+        );
+      }
     } else {
       const normalizedSpecs = [];
       for (let i = 0; i < parsedSpecs.value.length; i++) {
@@ -7076,7 +8024,10 @@ async function runReadSlices(input) {
           });
         } else if (typeof item !== "string" || !item.trim()) {
           if (sliceFormatError === null) {
-            sliceFormatError = `Error: lineRanges[${i}] must be a non-empty 'path:start-end' string.`;
+            sliceFormatError = withValidationExample(
+              `Error: lineRanges[${i}] must be a non-empty 'path:start-end' string.`,
+              TOOL_VALIDATION_EXAMPLES.read_slices_line_range
+            );
           }
         } else {
           const parsed = parseSliceShorthand(item, `lineRanges[${i}]`);
@@ -7104,7 +8055,10 @@ async function runReadSlices(input) {
   }
   if (outlines.length === 0 && slices.length === 0) {
     return {
-      text: "Error: provide at least one entry in 'outlines', 'slices', or 'lineRanges'.",
+      text: withValidationExample(
+        "Error: provide at least one entry in 'outlines', 'slices', or 'lineRanges'.",
+        TOOL_VALIDATION_EXAMPLES.read_slices
+      ),
       isError: true
     };
   }
@@ -7133,7 +8087,7 @@ async function runReadSlices(input) {
     const outlineResults = await Promise.all(
       outlines.map(async (rawPath) => {
         const absPath = resolvePath(rawPath, baseCwd);
-        const relPath = toPosixPath(path6.relative(baseCwd, absPath)) || path6.basename(absPath);
+        const relPath = toPosixPath(path5.relative(baseCwd, absPath)) || path5.basename(absPath);
         try {
           const { lines } = await loadLines(absPath);
           const symbols = extractSymbolsFromLines(absPath, lines);
@@ -7174,7 +8128,7 @@ ERROR: ${err instanceof Error ? err.message : String(err)}`
           };
         }
         const absPath = resolvePath(req.path, baseCwd);
-        const relPath = toPosixPath(path6.relative(baseCwd, absPath)) || path6.basename(absPath);
+        const relPath = toPosixPath(path5.relative(baseCwd, absPath)) || path5.basename(absPath);
         if (!Array.isArray(req.ranges) || req.ranges.length === 0) {
           return {
             kind: "static",
@@ -7288,11 +8242,14 @@ async function runQuickOutline(input) {
   const rawPaths = rawInput?.paths !== void 0 ? rawInput.paths : rawInput?.outlines !== void 0 ? rawInput.outlines : rawInput?.files;
   if (rawPaths === void 0) {
     return {
-      text: "Error: provide at least one file path in 'paths'.",
+      text: withValidationExample(
+        "Error: provide at least one file path in 'paths'.",
+        TOOL_VALIDATION_EXAMPLES.quick_outline
+      ),
       isError: true
     };
   }
-  const parsedPaths = parseMaybeJsonArray(rawPaths);
+  const parsedPaths = parseMaybeStringOrJsonArray(rawPaths);
   const corruptedItems = [];
   let firstInvalidError = null;
   if (!parsedPaths.ok) {
@@ -7303,7 +8260,10 @@ async function runQuickOutline(input) {
         expected: "an array of file path strings"
       });
     } else {
-      firstInvalidError = `Error: 'paths' must be an array of non-empty file path strings (${parsedPaths.detail}).`;
+      firstInvalidError = withValidationExample(
+        `Error: 'paths' must be an array of non-empty file path strings (${parsedPaths.detail}).`,
+        TOOL_VALIDATION_EXAMPLES.quick_outline
+      );
     }
   } else {
     for (let i = 0; i < parsedPaths.value.length; i++) {
@@ -7316,7 +8276,10 @@ async function runQuickOutline(input) {
         });
       } else if (typeof item !== "string" || !item.trim()) {
         if (firstInvalidError === null) {
-          firstInvalidError = `Error: paths[${i}] must be a non-empty file path string.`;
+          firstInvalidError = withValidationExample(
+            `Error: paths[${i}] must be a non-empty file path string.`,
+            TOOL_VALIDATION_EXAMPLES.quick_outline
+          );
         }
       }
     }
@@ -7338,7 +8301,10 @@ async function runQuickOutline(input) {
   const paths = parsedPaths.value;
   if (paths.length === 0) {
     return {
-      text: "Error: provide at least one file path in 'paths'.",
+      text: withValidationExample(
+        "Error: provide at least one file path in 'paths'.",
+        TOOL_VALIDATION_EXAMPLES.quick_outline
+      ),
       isError: true
     };
   }
@@ -7356,7 +8322,7 @@ async function runQuickOutline(input) {
 }
 
 // src/tools/run-checks.ts
-import { promises as fs5 } from "node:fs";
+import { promises as fs4 } from "node:fs";
 import { performance } from "node:perf_hooks";
 async function mapWithConcurrency(items, concurrency, worker) {
   const results = new Array(items.length);
@@ -7393,14 +8359,20 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
       };
     }
     return {
-      text: "Error: 'commands' must be a non-empty array of check commands.",
+      text: withValidationExample(
+        "Error: 'commands' must be a non-empty array of check commands.",
+        TOOL_VALIDATION_EXAMPLES.run_checks
+      ),
       isError: true
     };
   }
   const rawCommands = parsedCommands.value;
   if (rawCommands.length === 0) {
     return {
-      text: "Error: 'commands' must be a non-empty array of check commands.",
+      text: withValidationExample(
+        "Error: 'commands' must be a non-empty array of check commands.",
+        TOOL_VALIDATION_EXAMPLES.run_checks
+      ),
       isError: true
     };
   }
@@ -7434,7 +8406,7 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
   }
   const baseCwd = resolvePath(input.cwd || process.cwd());
   try {
-    const st = await fs5.stat(baseCwd);
+    const st = await fs4.stat(baseCwd);
     if (!st.isDirectory()) {
       return { text: `Error: cwd is not a directory: ${baseCwd}`, isError: true };
     }
@@ -7452,7 +8424,10 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
     const spec = typeof raw === "string" ? { command: raw } : raw;
     if (!spec || typeof spec.command !== "string" || !spec.command.trim()) {
       return {
-        text: `Error: commands[${i}] must contain a non-empty 'command' string.`,
+        text: withValidationExample(
+          `Error: commands[${i}] must contain a non-empty 'command' string.`,
+          TOOL_VALIDATION_EXAMPLES.run_checks
+        ),
         isError: true
       };
     }
@@ -7466,7 +8441,7 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
     const cmdCwd = trimmedSpecCwd ? resolvePath(trimmedSpecCwd, baseCwd) : baseCwd;
     if (trimmedSpecCwd) {
       try {
-        const st = await fs5.stat(cmdCwd);
+        const st = await fs4.stat(cmdCwd);
         if (!st.isDirectory()) {
           return {
             text: `Error: commands[${i}].cwd is not a directory: ${cmdCwd}`,
@@ -7598,7 +8573,7 @@ $ ${displayCmd}
           byteSize: Buffer.byteLength(block, "utf8")
         };
       }
-      const badge = result.error ? "ERROR" : result.timedOut ? "TIMEOUT" : passed ? "PASS" : `FAIL (exit ${result.exitCode ?? "err"})`;
+      const badge = result.error ? "ERROR" : result.timedOut ? "TIMEOUT" : passed ? "PASS" : `FAIL (${formatExitFailureLabel(result.exitCode, result.signal)})`;
       const headerLine = `## [${badge}] ${spec.name} (${result.durationMs}ms)`;
       const fullPrefix = `${headerLine}
 $ ${spec.command}
@@ -7689,7 +8664,7 @@ $ ${spec.command}
         passEntries.push({ index: i, compactHeader, body, fullBlock });
         continue;
       }
-      const badge = result.error ? "ERROR" : result.timedOut ? "TIMEOUT" : `FAIL (exit ${result.exitCode ?? "err"})`;
+      const badge = result.error ? "ERROR" : result.timedOut ? "TIMEOUT" : `FAIL (${formatExitFailureLabel(result.exitCode, result.signal)})`;
       const badgeLine = `## [${badge} ${result.durationMs}ms] ${spec.name}`;
       const header = `${badgeLine}
 $ ${spec.command}
@@ -7698,6 +8673,7 @@ $ ${spec.command}
         stdout: result.stdout,
         stderr: result.stderr,
         exitCode: result.exitCode,
+        signal: result.signal,
         timedOut: result.timedOut,
         error: result.error
       });
@@ -7896,12 +8872,1755 @@ function clampInt2(val, min, max, fallback) {
   return Math.max(min, Math.min(max, Math.trunc(num)));
 }
 
-// src/mcp-server.ts
-var SERVER_VERSION = "0.2.10";
+// src/cli-runner.ts
+var MAX_CLI_STDIN_BYTES = 2 * 1024 * 1024;
+var IMPLICIT_STDIN_FIRST_BYTE_TIMEOUT_MS = 500;
+var TOOL_ALIASES = {
+  search: "batch_search",
+  batch_search: "batch_search",
+  outline: "quick_outline",
+  quick_outline: "quick_outline",
+  slice: "read_slices",
+  slices: "read_slices",
+  read_slices: "read_slices",
+  edit: "apply_edits",
+  apply_edits: "apply_edits",
+  check: "run_checks",
+  checks: "run_checks",
+  run_checks: "run_checks"
+};
+function resolveCliToolAlias(name) {
+  if (!name) return null;
+  return TOOL_ALIASES[name.trim().toLowerCase()] ?? null;
+}
+function formatCliUsage() {
+  return [
+    "agy-fast direct CLI mode (for Swarm workers, scripts, and non-MCP environments)",
+    "",
+    "Usage:",
+    "  node <plugin>/dist/mcp-server.mjs --cli <command> [options] [args...]",
+    "",
+    "Commands (aliases):",
+    "  outline | quick_outline <file...> [--cwd <dir>] [--max-chars <N>]",
+    "  slice   | read_slices   <path:start-end,...> [--outline <file>] [--cwd <dir>]",
+    "  search  | batch_search  [--text <p>] [--regex <p>] [--glob <p>] [--fuzzy <p>] [--git <cmd>]",
+    "                          [--pattern <p>] [--type text|regex|glob|fuzzy|git]",
+    "                          [--path <dir>] [--file-type <t>] [--glob-filter <g>]",
+    "                          [--output-mode content|files_with_matches|count] [--sort-by path|mtime]",
+    "                          [--context <0..5>] [--max-results <N>] [-i|--ignore-case] [--multiline]",
+    "                          (modifiers before a query scope only to that query; trailing modifiers apply to all)",
+    "  check   | run_checks    <cmd...> [--compact|--full] [--concurrency <N>] [--timeout <sec>]",
+    "  edit    | apply_edits   [--best-effort] [--dry-run] [--verify <cmd>] (JSON via --json or stdin)",
+    "",
+    "JSON input (works for every command using the exact MCP tool schema):",
+    "  --json '<json>'         Pass tool arguments JSON object (or shorthand array) inline",
+    "  --stdin                 Read tool arguments JSON from stdin (or pipe/heredoc with no positional args)",
+    "  --cwd <dir>             Override working directory (defaults to shell CWD)",
+    "  --max-chars <N>         Override output character cap (hard UTF-8 ceiling <= 8800 bytes)"
+  ].join("\n");
+}
+function parseIntFlag(flag, raw) {
+  if (raw === void 0 || !/^-?\d+$/.test(raw.trim())) {
+    throw new Error(`Expected integer value after ${flag}`);
+  }
+  const n = Number.parseInt(raw.trim(), 10);
+  if (!Number.isFinite(n)) {
+    throw new Error(`Invalid integer value after ${flag}: ${raw}`);
+  }
+  return n;
+}
+async function readStdinText(stream, explicitStdin) {
+  if (!explicitStdin && stream.isTTY) {
+    return "";
+  }
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let totalBytes = 0;
+    let settled = false;
+    let firstByteTimer;
+    const cleanup = () => {
+      if (firstByteTimer !== void 0) {
+        clearTimeout(firstByteTimer);
+        firstByteTimer = void 0;
+      }
+      stream.removeListener("data", onData);
+      stream.removeListener("end", onEnd);
+      stream.removeListener("error", onError);
+    };
+    const finish = (text) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(text);
+    };
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (typeof stream.pause === "function") {
+        stream.pause();
+      }
+      const maybeUnref = stream.unref;
+      if (typeof maybeUnref === "function") {
+        maybeUnref.call(stream);
+      }
+      reject(err);
+    };
+    const onData = (chunk) => {
+      if (firstByteTimer !== void 0) {
+        clearTimeout(firstByteTimer);
+        firstByteTimer = void 0;
+      }
+      const buf = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
+      totalBytes += buf.length;
+      if (totalBytes > MAX_CLI_STDIN_BYTES) {
+        fail(new Error(`stdin payload exceeds ${MAX_CLI_STDIN_BYTES} bytes limit`));
+        return;
+      }
+      chunks.push(buf);
+    };
+    const onEnd = () => {
+      finish(Buffer.concat(chunks).toString("utf8"));
+    };
+    const onError = (err) => {
+      fail(err);
+    };
+    if (!explicitStdin) {
+      firstByteTimer = setTimeout(() => {
+        if (totalBytes === 0) {
+          if (typeof stream.pause === "function") {
+            stream.pause();
+          }
+          finish("");
+        }
+      }, IMPLICIT_STDIN_FIRST_BYTE_TIMEOUT_MS);
+    }
+    stream.on("data", onData);
+    stream.on("end", onEnd);
+    stream.on("error", onError);
+    if (typeof stream.resume === "function") {
+      stream.resume();
+    }
+  });
+}
+function parseJsonPayload(rawText, tool) {
+  let parsed;
+  try {
+    parsed = JSON.parse(rawText);
+  } catch (err) {
+    throw new Error(
+      `Invalid JSON input for '${tool}': ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+  if (Array.isArray(parsed)) {
+    if (tool === "batch_search") return { queries: parsed };
+    if (tool === "apply_edits") return { edits: parsed };
+    if (tool === "quick_outline") return { paths: parsed };
+    if (tool === "read_slices") {
+      if (parsed.every((item) => typeof item === "string")) {
+        return { lineRanges: parsed };
+      }
+      return { slices: parsed };
+    }
+    if (tool === "run_checks") {
+      return {
+        commands: parsed.map(
+          (item) => typeof item === "string" ? { command: item } : item
+        )
+      };
+    }
+  }
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    return { ...parsed };
+  }
+  throw new Error(`JSON input for '${tool}' must be an object (or shorthand array).`);
+}
+function applySearchModifiers(q, mods) {
+  return {
+    ...q,
+    ...mods.path !== void 0 && q.path === void 0 ? { path: mods.path } : {},
+    ...mods.fileType !== void 0 && q.fileType === void 0 ? { fileType: mods.fileType } : {},
+    ...mods.glob !== void 0 && q.glob === void 0 ? { glob: mods.glob } : {},
+    ...mods.outputMode !== void 0 && q.outputMode === void 0 ? { outputMode: mods.outputMode } : {},
+    ...mods.sortBy !== void 0 && q.sortBy === void 0 ? { sortBy: mods.sortBy } : {},
+    ...mods.contextLines !== void 0 && q.contextLines === void 0 ? { contextLines: mods.contextLines } : {},
+    ...mods.maxResults !== void 0 && q.maxResults === void 0 ? { maxResults: mods.maxResults } : {},
+    ...mods.caseSensitive !== void 0 && q.caseSensitive === void 0 ? { caseSensitive: mods.caseSensitive } : {},
+    ...mods.multiline !== void 0 && q.multiline === void 0 ? { multiline: mods.multiline } : {}
+  };
+}
+var SEARCH_QUERY_TYPES = /* @__PURE__ */ new Set([
+  "text",
+  "regex",
+  "glob",
+  "fuzzy",
+  "git"
+]);
+var VALUE_LONG_FLAGS = /* @__PURE__ */ new Set([
+  "--cwd",
+  "--max-chars",
+  "--json",
+  "--text",
+  "--regex",
+  "--glob",
+  "--fuzzy",
+  "--git",
+  "--pattern",
+  "--type",
+  "--path",
+  "--file-type",
+  "--glob-filter",
+  "--output-mode",
+  "--sort-by",
+  "--context",
+  "--max-results",
+  "--outline",
+  "--concurrency",
+  "--timeout",
+  "--verify",
+  "--verify-timeout",
+  "--max-verify-chars"
+]);
+function parseToolFlags(tool, rawArgs) {
+  const opts = {
+    showHelp: false,
+    explicitStdin: false,
+    positionals: [],
+    searchQueries: [],
+    implicitTypeQueryIndices: /* @__PURE__ */ new Set(),
+    trailingSearchMods: {},
+    outlineFiles: []
+  };
+  let pendingMods = {};
+  let pendingType;
+  const pushScopedQuery = (base, explicitType) => {
+    const idx = opts.searchQueries.length;
+    opts.searchQueries.push(applySearchModifiers(base, pendingMods));
+    if (!explicitType) {
+      opts.implicitTypeQueryIndices.add(idx);
+    }
+    pendingMods = {};
+    pendingType = void 0;
+  };
+  let afterDoubleDash = false;
+  for (let i = 0; i < rawArgs.length; i++) {
+    const rawArg = rawArgs[i];
+    if (afterDoubleDash) {
+      if (tool === "batch_search") {
+        const explicit = pendingType !== void 0;
+        pushScopedQuery({ type: pendingType ?? "text", pattern: rawArg }, explicit);
+      } else {
+        opts.positionals.push(rawArg);
+      }
+      continue;
+    }
+    if (rawArg === "--") {
+      afterDoubleDash = true;
+      continue;
+    }
+    let arg = rawArg;
+    let inlineValue;
+    if (rawArg.startsWith("--")) {
+      const eqIdx = rawArg.indexOf("=");
+      if (eqIdx > 2) {
+        const candidateFlag = rawArg.slice(0, eqIdx);
+        if (VALUE_LONG_FLAGS.has(candidateFlag)) {
+          arg = candidateFlag;
+          inlineValue = rawArg.slice(eqIdx + 1);
+        }
+      }
+    }
+    const consumeValue = () => {
+      if (inlineValue !== void 0) {
+        return inlineValue;
+      }
+      const next = rawArgs[i + 1];
+      if (next === void 0) {
+        throw new Error(`Missing value after ${arg}`);
+      }
+      i += 1;
+      return next;
+    };
+    if (arg === "--help" || arg === "-h") {
+      opts.showHelp = true;
+      continue;
+    }
+    if (arg === "--cwd") {
+      opts.cwd = consumeValue();
+      continue;
+    }
+    if (arg === "--max-chars") {
+      opts.maxChars = parseIntFlag(arg, consumeValue());
+      continue;
+    }
+    if (arg === "--json") {
+      opts.jsonRaw = consumeValue();
+      continue;
+    }
+    if (arg === "--stdin") {
+      opts.explicitStdin = true;
+      continue;
+    }
+    if (tool === "batch_search") {
+      if (arg === "--text" || arg === "-t") {
+        pushScopedQuery({ type: "text", pattern: consumeValue() }, true);
+        continue;
+      }
+      if (arg === "--regex" || arg === "-r") {
+        pushScopedQuery({ type: "regex", pattern: consumeValue() }, true);
+        continue;
+      }
+      if (arg === "--glob" || arg === "-g") {
+        pushScopedQuery({ type: "glob", pattern: consumeValue() }, true);
+        continue;
+      }
+      if (arg === "--fuzzy" || arg === "-f") {
+        pushScopedQuery({ type: "fuzzy", pattern: consumeValue() }, true);
+        continue;
+      }
+      if (arg === "--git") {
+        pushScopedQuery({ type: "git", pattern: consumeValue() }, true);
+        continue;
+      }
+      if (arg === "--type") {
+        const rawType = consumeValue().trim().toLowerCase();
+        if (!SEARCH_QUERY_TYPES.has(rawType)) {
+          throw new Error(
+            `Invalid --type: ${rawType} (expected text, regex, glob, fuzzy, or git)`
+          );
+        }
+        pendingType = rawType;
+        continue;
+      }
+      if (arg === "--pattern") {
+        const explicit = pendingType !== void 0;
+        pushScopedQuery({ type: pendingType ?? "text", pattern: consumeValue() }, explicit);
+        continue;
+      }
+      if (arg === "--path" || arg === "-p") {
+        pendingMods.path = consumeValue();
+        continue;
+      }
+      if (arg === "--file-type") {
+        pendingMods.fileType = consumeValue();
+        continue;
+      }
+      if (arg === "--glob-filter") {
+        pendingMods.glob = consumeValue();
+        continue;
+      }
+      if (arg === "--output-mode") {
+        const mode = consumeValue();
+        if (mode !== "content" && mode !== "files_with_matches" && mode !== "count") {
+          throw new Error(`Invalid --output-mode: ${mode}`);
+        }
+        pendingMods.outputMode = mode;
+        continue;
+      }
+      if (arg === "--sort-by") {
+        const sortBy = consumeValue();
+        if (sortBy !== "path" && sortBy !== "mtime") {
+          throw new Error(`Invalid --sort-by: ${sortBy}`);
+        }
+        pendingMods.sortBy = sortBy;
+        continue;
+      }
+      if (arg === "--context" || arg === "-C") {
+        pendingMods.contextLines = parseIntFlag(arg, consumeValue());
+        continue;
+      }
+      if (arg === "--max-results") {
+        pendingMods.maxResults = parseIntFlag(arg, consumeValue());
+        continue;
+      }
+      if (arg === "--ignore-case" || arg === "-i") {
+        pendingMods.caseSensitive = false;
+        continue;
+      }
+      if (arg === "--multiline") {
+        pendingMods.multiline = true;
+        continue;
+      }
+    } else if (tool === "read_slices") {
+      if (arg === "--outline" || arg === "-o") {
+        opts.outlineFiles.push(consumeValue());
+        continue;
+      }
+    } else if (tool === "run_checks") {
+      if (arg === "--compact") {
+        opts.outputMode = "compact";
+        continue;
+      }
+      if (arg === "--full") {
+        opts.outputMode = "full";
+        continue;
+      }
+      if (arg === "--output-mode") {
+        const mode = consumeValue();
+        if (mode !== "compact" && mode !== "full") {
+          throw new Error(`Invalid --output-mode for check: ${mode}`);
+        }
+        opts.outputMode = mode;
+        continue;
+      }
+      if (arg === "--concurrency") {
+        opts.concurrency = parseIntFlag(arg, consumeValue());
+        continue;
+      }
+      if (arg === "--timeout") {
+        opts.timeoutSec = parseIntFlag(arg, consumeValue());
+        continue;
+      }
+    } else if (tool === "apply_edits") {
+      if (arg === "--best-effort") {
+        opts.bestEffort = true;
+        continue;
+      }
+      if (arg === "--dry-run") {
+        opts.dryRun = true;
+        continue;
+      }
+      if (arg === "--verify") {
+        opts.verify = consumeValue();
+        continue;
+      }
+      if (arg === "--verify-timeout") {
+        opts.verifyTimeoutSec = parseIntFlag(arg, consumeValue());
+        continue;
+      }
+      if (arg === "--max-verify-chars") {
+        opts.maxVerifyChars = parseIntFlag(arg, consumeValue());
+        continue;
+      }
+    }
+    if (arg.startsWith("-")) {
+      throw new Error(`Unknown option '${rawArg}' for '${tool}'. Run with '--cli --help' for usage.`);
+    }
+    if (tool === "batch_search") {
+      const explicit = pendingType !== void 0;
+      pushScopedQuery({ type: pendingType ?? "text", pattern: rawArg }, explicit);
+    } else {
+      opts.positionals.push(rawArg);
+    }
+  }
+  opts.trailingSearchType = pendingType;
+  opts.trailingSearchMods = pendingMods;
+  return opts;
+}
+async function runAgyFastCli(argv, io = {}) {
+  const stdin = io.stdin ?? process.stdin;
+  const stdout = io.stdout ?? process.stdout;
+  const stderr = io.stderr ?? process.stderr;
+  const defaultCwd = io.cwd ?? process.cwd();
+  const cmdArg = argv[0];
+  if (!cmdArg || cmdArg === "--help" || cmdArg === "-h" || cmdArg === "help") {
+    stdout.write(`${formatCliUsage()}
+`);
+    return 0;
+  }
+  const rest = argv.slice(1);
+  const tool = resolveCliToolAlias(cmdArg);
+  if (!tool) {
+    stderr.write(
+      `Error: unknown --cli command '${cmdArg}'. Expected one of: search, outline, slice, edit, check (or --help).
+`
+    );
+    return 1;
+  }
+  let opts;
+  try {
+    opts = parseToolFlags(tool, rest);
+  } catch (err) {
+    stderr.write(`Error: ${err instanceof Error ? err.message : String(err)}
+`);
+    return 1;
+  }
+  if (opts.showHelp) {
+    stdout.write(`${formatCliUsage()}
+`);
+    return 0;
+  }
+  const hasShorthandArgs = opts.positionals.length > 0 || opts.searchQueries.length > 0 || opts.outlineFiles.length > 0;
+  let jsonInput = null;
+  try {
+    if (opts.jsonRaw !== void 0) {
+      jsonInput = parseJsonPayload(opts.jsonRaw, tool);
+    } else if (opts.explicitStdin || !hasShorthandArgs) {
+      const stdinText = (await readStdinText(stdin, opts.explicitStdin)).trim();
+      if (stdinText) {
+        jsonInput = parseJsonPayload(stdinText, tool);
+      }
+    }
+  } catch (err) {
+    stderr.write(`Error: ${err instanceof Error ? err.message : String(err)}
+`);
+    return 1;
+  }
+  let result;
+  const effectiveCwd = opts.cwd ?? (typeof jsonInput?.cwd === "string" ? jsonInput.cwd : defaultCwd);
+  if (tool === "batch_search") {
+    let payload;
+    if (jsonInput) {
+      payload = {
+        ...jsonInput,
+        cwd: effectiveCwd,
+        ...opts.maxChars !== void 0 ? { maxChars: opts.maxChars } : {}
+      };
+    } else {
+      const queries = [
+        ...opts.searchQueries.map(
+          (q, idx) => opts.trailingSearchType !== void 0 && opts.implicitTypeQueryIndices.has(idx) ? { ...q, type: opts.trailingSearchType } : q
+        ),
+        ...opts.positionals.map(
+          (pattern) => ({ type: opts.trailingSearchType ?? "text", pattern })
+        )
+      ].map((q) => applySearchModifiers(q, opts.trailingSearchMods));
+      if (queries.length === 0) {
+        stderr.write(
+          "Error: 'search' requires at least one query (--text/--regex/--glob/--fuzzy/--git/--pattern, --json, or JSON on stdin).\n"
+        );
+        return 1;
+      }
+      payload = {
+        cwd: effectiveCwd,
+        queries,
+        ...opts.maxChars !== void 0 ? { maxChars: opts.maxChars } : {}
+      };
+    }
+    result = await runBatchSearch(payload);
+  } else if (tool === "quick_outline") {
+    let payload;
+    if (jsonInput) {
+      payload = {
+        ...jsonInput,
+        cwd: effectiveCwd,
+        ...opts.maxChars !== void 0 ? { maxChars: opts.maxChars } : {}
+      };
+    } else {
+      if (opts.positionals.length === 0) {
+        stderr.write(
+          "Error: 'outline' requires one or more file paths (e.g. --cli outline src/a.ts src/b.ts) or JSON input.\n"
+        );
+        return 1;
+      }
+      payload = {
+        cwd: effectiveCwd,
+        paths: opts.positionals,
+        ...opts.maxChars !== void 0 ? { maxChars: opts.maxChars } : {}
+      };
+    }
+    result = await runQuickOutline(payload);
+  } else if (tool === "read_slices") {
+    let payload;
+    if (jsonInput) {
+      payload = {
+        ...jsonInput,
+        cwd: effectiveCwd,
+        ...opts.maxChars !== void 0 ? { maxChars: opts.maxChars } : {}
+      };
+    } else {
+      if (opts.positionals.length === 0 && opts.outlineFiles.length === 0) {
+        stderr.write(
+          "Error: 'slice' requires lineRanges specs (e.g. src/a.ts:1-60), --outline <file>, or JSON input.\n"
+        );
+        return 1;
+      }
+      payload = {
+        cwd: effectiveCwd,
+        ...opts.outlineFiles.length > 0 ? { outlines: opts.outlineFiles } : {},
+        ...opts.positionals.length > 0 ? { lineRanges: opts.positionals } : {},
+        ...opts.maxChars !== void 0 ? { maxChars: opts.maxChars } : {}
+      };
+    }
+    result = await runReadSlices(payload);
+  } else if (tool === "apply_edits") {
+    if (!jsonInput) {
+      stderr.write(
+        `Error: 'edit' requires JSON input via --json or stdin (e.g. {"edits":[...],"bestEffort":true}).
+`
+      );
+      return 1;
+    }
+    const effectiveMaxVerifyChars = opts.maxVerifyChars ?? (opts.maxChars !== void 0 ? Math.max(300, Math.min(7500, opts.maxChars)) : void 0);
+    const payload = {
+      ...jsonInput,
+      cwd: effectiveCwd,
+      ...opts.bestEffort !== void 0 ? { bestEffort: opts.bestEffort } : {},
+      ...opts.dryRun !== void 0 ? { dryRun: opts.dryRun } : {},
+      ...opts.verify !== void 0 ? { verify: opts.verify } : {},
+      ...opts.verifyTimeoutSec !== void 0 ? { verifyTimeoutSec: opts.verifyTimeoutSec } : {},
+      ...effectiveMaxVerifyChars !== void 0 ? { maxVerifyChars: effectiveMaxVerifyChars } : {}
+    };
+    result = await runApplyEdits(payload);
+  } else {
+    let payload;
+    if (jsonInput) {
+      payload = {
+        ...jsonInput,
+        cwd: effectiveCwd,
+        ...opts.outputMode !== void 0 ? { outputMode: opts.outputMode } : {},
+        ...opts.concurrency !== void 0 ? { concurrency: opts.concurrency } : {},
+        ...opts.timeoutSec !== void 0 ? { timeoutSec: opts.timeoutSec } : {},
+        ...opts.maxChars !== void 0 ? { maxChars: opts.maxChars } : {}
+      };
+    } else {
+      if (opts.positionals.length === 0) {
+        stderr.write(
+          `Error: 'check' requires one or more shell command strings (e.g. --cli check "npm run typecheck" "npm test") or JSON input.
+`
+        );
+        return 1;
+      }
+      payload = {
+        cwd: effectiveCwd,
+        commands: opts.positionals.map((command) => ({ command })),
+        ...opts.outputMode !== void 0 ? { outputMode: opts.outputMode } : {},
+        ...opts.concurrency !== void 0 ? { concurrency: opts.concurrency } : {},
+        ...opts.timeoutSec !== void 0 ? { timeoutSec: opts.timeoutSec } : {},
+        ...opts.maxChars !== void 0 ? { maxChars: opts.maxChars } : {}
+      };
+    }
+    result = await runChecks(payload);
+  }
+  stdout.write(result.text.endsWith("\n") ? result.text : `${result.text}
+`);
+  return shouldCliExitNonZero(tool, result) ? 1 : 0;
+}
+function shouldCliExitNonZero(tool, result) {
+  return result.isError || tool === "run_checks" && /^Checks:\s+\d+\/\d+\s+passed,\s+(?:[1-9]\d*\s+failed|[1-9]\d*\s+not run)\b/.test(
+    result.text
+  ) || tool === "apply_edits" && /(?:^|\n)Verify \[(?:FAIL|TIMEOUT|ERROR)\b/.test(result.text);
+}
+
+// src/mcp-server-core.ts
+import fs6 from "node:fs";
+import os4 from "node:os";
+import path7 from "node:path";
+import { fileURLToPath as fileURLToPath2 } from "node:url";
+
+// src/protocol/mcp.ts
+import { fileURLToPath } from "node:url";
+var SUPPORTED_PROTOCOL_VERSIONS = /* @__PURE__ */ new Set([
+  "2025-11-25",
+  "2025-06-18",
+  "2025-03-26",
+  "2024-11-05"
+]);
+var DEFAULT_PROTOCOL_VERSION = "2025-03-26";
+var ROOTS_REQUEST_TIMEOUT_MS = 1e3;
+var MAX_KNOWN_ROOTS_IDS = 64;
+var MAX_FRAME_BYTES = 64 * 1024 * 1024;
+var McpStdioServer = class {
+  tools = /* @__PURE__ */ new Map();
+  serverName;
+  serverVersion;
+  inFlight = 0;
+  stdinEnded = false;
+  onDrainExit;
+  onWorkspaceRoots;
+  shouldRequestRoots;
+  onInitialize;
+  sendToClient;
+  clientSupportsRoots = false;
+  rootsDirty = false;
+  rootsRequestCount = 0;
+  lastAppliedRootsSeq = 0;
+  pendingRoots = /* @__PURE__ */ new Map();
+  knownRootsIds = /* @__PURE__ */ new Map();
+  rootsWaiters = /* @__PURE__ */ new Set();
+  activeOutgoingQueue = null;
+  initWriteInFlight = 0;
+  postInitOutgoingQueue = [];
+  rootsTimeoutMs;
+  maxFrameBytes;
+  constructor(options) {
+    this.serverName = options.name;
+    this.serverVersion = options.version;
+    this.onWorkspaceRoots = options.onWorkspaceRoots;
+    this.shouldRequestRoots = options.shouldRequestRoots;
+    this.onInitialize = options.onInitialize;
+    this.rootsTimeoutMs = typeof options.rootsTimeoutMs === "number" && Number.isFinite(options.rootsTimeoutMs) && options.rootsTimeoutMs > 0 ? Math.trunc(options.rootsTimeoutMs) : ROOTS_REQUEST_TIMEOUT_MS;
+    this.maxFrameBytes = typeof options.maxFrameBytes === "number" && Number.isFinite(options.maxFrameBytes) && options.maxFrameBytes > 0 ? Math.trunc(options.maxFrameBytes) : MAX_FRAME_BYTES;
+  }
+  flushRootsWaiters() {
+    for (const waiter of this.rootsWaiters) {
+      let stillWaiting = false;
+      for (const pending of this.pendingRoots.values()) {
+        if (pending.seq <= waiter.minSeq) {
+          stillWaiting = true;
+          break;
+        }
+      }
+      if (!stillWaiting) {
+        this.rootsWaiters.delete(waiter);
+        waiter.resolve();
+      }
+    }
+  }
+  settleAllPendingRoots() {
+    for (const pending of this.pendingRoots.values()) {
+      clearTimeout(pending.timer);
+    }
+    this.pendingRoots.clear();
+    for (const waiter of this.rootsWaiters) {
+      waiter.resolve();
+    }
+    this.rootsWaiters.clear();
+  }
+  waitForRoots() {
+    if (this.pendingRoots.size === 0 || this.stdinEnded) {
+      return Promise.resolve();
+    }
+    if (this.activeOutgoingQueue && this.activeOutgoingQueue.length > 0) {
+      const tasks = this.activeOutgoingQueue.splice(0, this.activeOutgoingQueue.length);
+      if (this.initWriteInFlight > 0) {
+        this.postInitOutgoingQueue.push(...tasks);
+      } else {
+        for (const task of tasks) {
+          try {
+            task();
+          } catch {
+          }
+        }
+      }
+    }
+    const minSeq = this.rootsRequestCount;
+    return new Promise((resolve) => {
+      this.rootsWaiters.add({ minSeq, resolve });
+    });
+  }
+  pruneKnownRootsIds() {
+    if (this.knownRootsIds.size <= MAX_KNOWN_ROOTS_IDS) return;
+    for (const key of this.knownRootsIds.keys()) {
+      if (this.knownRootsIds.size <= MAX_KNOWN_ROOTS_IDS) break;
+      if (!this.pendingRoots.has(key)) {
+        this.knownRootsIds.delete(key);
+      }
+    }
+  }
+  // Tool calls wait for the pending answer (bounded by rootsTimeoutMs and stdin EOF),
+  // so the first call already sees the workspace roots without ever deadlocking.
+  requestRoots(useContentLength) {
+    if (this.stdinEnded || !this.clientSupportsRoots || !this.onWorkspaceRoots || !this.sendToClient) {
+      return;
+    }
+    this.rootsRequestCount += 1;
+    const seq = this.rootsRequestCount;
+    const id = `agy-fast-roots-${seq}`;
+    const timer = setTimeout(() => {
+      if (this.pendingRoots.delete(id)) {
+        this.pruneKnownRootsIds();
+        this.flushRootsWaiters();
+      }
+    }, this.rootsTimeoutMs);
+    timer.unref();
+    this.pendingRoots.set(id, { seq, timer });
+    this.knownRootsIds.set(id, seq);
+    this.pruneKnownRootsIds();
+    const send = this.sendToClient;
+    const sendTask = () => {
+      if (this.stdinEnded) return;
+      send({ jsonrpc: "2.0", id, method: "roots/list" }, useContentLength);
+    };
+    if (this.activeOutgoingQueue) {
+      this.activeOutgoingQueue.push(sendTask);
+    } else {
+      sendTask();
+    }
+  }
+  receiveRoots(result) {
+    if (!result || typeof result !== "object") return;
+    const rawRoots = result.roots;
+    if (!Array.isArray(rawRoots)) return;
+    const paths = [];
+    for (const root of rawRoots) {
+      if (!root || typeof root !== "object") continue;
+      const uri = root.uri;
+      if (typeof uri !== "string" || !/^file:/i.test(uri)) continue;
+      try {
+        paths.push(fileURLToPath(uri));
+      } catch {
+      }
+    }
+    if (paths.length > 0) {
+      try {
+        this.onWorkspaceRoots?.(paths);
+      } catch {
+      }
+    }
+  }
+  registerTool(definition, handler) {
+    const name = typeof definition === "function" ? definition().name : definition.name;
+    this.tools.set(name, { definition, handler });
+  }
+  async handleMessage(raw, useContentLength = false) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      return {
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32600, message: "Invalid Request" }
+      };
+    }
+    const msg = raw;
+    const hasId = Object.prototype.hasOwnProperty.call(msg, "id") && msg.id !== void 0;
+    const id = hasId ? msg.id ?? null : null;
+    const method = typeof msg.method === "string" ? msg.method : "";
+    if (!method && typeof id === "string" && this.knownRootsIds.has(id)) {
+      const seq = this.knownRootsIds.get(id);
+      this.knownRootsIds.delete(id);
+      const pending = this.pendingRoots.get(id);
+      if (pending) {
+        clearTimeout(pending.timer);
+        this.pendingRoots.delete(id);
+      }
+      const errField = msg.error;
+      const hasError = errField !== void 0 && errField !== null;
+      try {
+        if (!hasError && seq >= this.lastAppliedRootsSeq) {
+          this.lastAppliedRootsSeq = seq;
+          for (const [oldId, oldPending] of this.pendingRoots.entries()) {
+            if (oldPending.seq < seq) {
+              clearTimeout(oldPending.timer);
+              this.pendingRoots.delete(oldId);
+            }
+          }
+          this.receiveRoots(msg.result);
+        }
+      } finally {
+        this.pruneKnownRootsIds();
+        this.flushRootsWaiters();
+      }
+      return null;
+    }
+    if (!method) {
+      return {
+        jsonrpc: "2.0",
+        id,
+        error: { code: -32600, message: "Invalid Request: missing method" }
+      };
+    }
+    if (!hasId) {
+      if (method === "notifications/initialized" || method === "notifications/roots/list_changed") {
+        if (this.clientSupportsRoots) {
+          this.rootsDirty = true;
+        }
+      }
+      return null;
+    }
+    if (method === "initialize") {
+      const requested = typeof msg.params?.protocolVersion === "string" ? msg.params.protocolVersion.trim() : "";
+      const protocolVersion = SUPPORTED_PROTOCOL_VERSIONS.has(requested) ? requested : DEFAULT_PROTOCOL_VERSION;
+      const capabilities = msg.params?.capabilities;
+      this.clientSupportsRoots = capabilities?.roots !== null && typeof capabilities?.roots === "object" && !Array.isArray(capabilities?.roots);
+      this.rootsDirty = this.clientSupportsRoots;
+      const rawClientInfo = msg.params?.clientInfo;
+      let clientInfo;
+      if (rawClientInfo !== null && typeof rawClientInfo === "object" && !Array.isArray(rawClientInfo)) {
+        const ci = rawClientInfo;
+        clientInfo = {
+          name: typeof ci.name === "string" ? ci.name : void 0,
+          version: typeof ci.version === "string" ? ci.version : void 0
+        };
+      }
+      try {
+        this.onInitialize?.({ clientInfo, protocolVersion });
+      } catch {
+      }
+      return {
+        jsonrpc: "2.0",
+        id,
+        result: {
+          protocolVersion,
+          capabilities: {
+            tools: {}
+          },
+          serverInfo: {
+            name: this.serverName,
+            version: this.serverVersion
+          }
+        }
+      };
+    }
+    if (method === "ping") {
+      return { jsonrpc: "2.0", id, result: {} };
+    }
+    if (method === "tools/list") {
+      const definitions = [...this.tools.values()].map(
+        (t) => typeof t.definition === "function" ? t.definition() : t.definition
+      );
+      return { jsonrpc: "2.0", id, result: { tools: definitions } };
+    }
+    if (method === "resources/list") {
+      return { jsonrpc: "2.0", id, result: { resources: [] } };
+    }
+    if (method === "resources/templates/list") {
+      return { jsonrpc: "2.0", id, result: { resourceTemplates: [] } };
+    }
+    if (method === "prompts/list") {
+      return { jsonrpc: "2.0", id, result: { prompts: [] } };
+    }
+    if (method === "tools/call") {
+      const name = typeof msg.params?.name === "string" ? msg.params.name : "";
+      const tool = this.tools.get(name);
+      if (!tool) {
+        return {
+          jsonrpc: "2.0",
+          id,
+          error: { code: -32602, message: `Unknown tool: ${name}` }
+        };
+      }
+      const rawArgs = msg.params?.arguments;
+      let args;
+      if (rawArgs === void 0 || rawArgs === null) {
+        args = {};
+      } else if (typeof rawArgs === "object" && !Array.isArray(rawArgs)) {
+        args = rawArgs;
+      } else if (typeof rawArgs === "string" && rawArgs.trim().startsWith("{")) {
+        try {
+          const parsedArgs = JSON.parse(rawArgs);
+          if (parsedArgs && typeof parsedArgs === "object" && !Array.isArray(parsedArgs)) {
+            args = parsedArgs;
+          } else {
+            return {
+              jsonrpc: "2.0",
+              id,
+              error: {
+                code: -32602,
+                message: `Invalid params: 'arguments' for '${name}' must be a JSON object`
+              }
+            };
+          }
+        } catch {
+          return {
+            jsonrpc: "2.0",
+            id,
+            error: {
+              code: -32602,
+              message: `Invalid params: malformed JSON string in 'arguments' for '${name}'`
+            }
+          };
+        }
+      } else {
+        return {
+          jsonrpc: "2.0",
+          id,
+          error: {
+            code: -32602,
+            message: `Invalid params: 'arguments' for '${name}' must be an object (received ${Array.isArray(rawArgs) ? "array" : typeof rawArgs})`
+          }
+        };
+      }
+      try {
+        const needRoots = this.clientSupportsRoots && Boolean(this.onWorkspaceRoots) && (this.shouldRequestRoots ? this.shouldRequestRoots(name, args) : true);
+        if (needRoots) {
+          if (this.rootsDirty && !this.stdinEnded) {
+            this.rootsDirty = false;
+            this.requestRoots(useContentLength);
+          }
+          await this.waitForRoots();
+        }
+        const res = await tool.handler(args);
+        return {
+          jsonrpc: "2.0",
+          id,
+          result: {
+            content: [{ type: "text", text: res.text }],
+            isError: Boolean(res.isError)
+          }
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return {
+          jsonrpc: "2.0",
+          id,
+          result: {
+            content: [{ type: "text", text: `Tool error: ${message}` }],
+            isError: true
+          }
+        };
+      }
+    }
+    return {
+      jsonrpc: "2.0",
+      id,
+      error: { code: -32601, message: `Method not found: ${method}` }
+    };
+  }
+  listen(input = process.stdin, output = process.stdout, onExit) {
+    this.onDrainExit = onExit;
+    const maxFrameBytes = this.maxFrameBytes;
+    let buffer = Buffer.alloc(0);
+    let discardingOversizedLine = false;
+    const writeResponse = (payload, useContentLength) => {
+      const serialized = JSON.stringify(payload);
+      if (useContentLength) {
+        const len = Buffer.byteLength(serialized, "utf8");
+        output.write(`Content-Length: ${len}\r
+\r
+${serialized}`);
+      } else {
+        output.write(`${serialized}
+`);
+      }
+    };
+    this.sendToClient = (request, useContentLength) => writeResponse(request, useContentLength);
+    let drainExitCalled = false;
+    const triggerDrainExit = () => {
+      if (drainExitCalled) return;
+      drainExitCalled = true;
+      this.onDrainExit?.();
+    };
+    const dispatchRawJson = (jsonText, useContentLength) => {
+      let parsed;
+      try {
+        parsed = JSON.parse(jsonText);
+      } catch {
+        writeResponse(
+          {
+            jsonrpc: "2.0",
+            id: null,
+            error: { code: -32700, message: "Parse error" }
+          },
+          useContentLength
+        );
+        return;
+      }
+      this.inFlight += 1;
+      const finish = () => {
+        this.inFlight -= 1;
+        if (this.stdinEnded && this.inFlight === 0) {
+          triggerDrainExit();
+        }
+      };
+      const outgoingForCall = [];
+      const flushOutgoingForCall = () => {
+        for (const task of outgoingForCall) {
+          task();
+        }
+      };
+      if (Array.isArray(parsed)) {
+        if (parsed.length === 0) {
+          writeResponse(
+            {
+              jsonrpc: "2.0",
+              id: null,
+              error: { code: -32600, message: "Invalid Request: empty batch" }
+            },
+            useContentLength
+          );
+          finish();
+          return;
+        }
+        const prevQueue2 = this.activeOutgoingQueue;
+        this.activeOutgoingQueue = outgoingForCall;
+        let promises;
+        try {
+          promises = parsed.map((item) => this.handleMessage(item, useContentLength));
+        } finally {
+          this.activeOutgoingQueue = prevQueue2;
+        }
+        const isInitOnlyBatch = parsed.some(
+          (item) => item !== null && typeof item === "object" && item.method === "initialize"
+        ) && !parsed.some(
+          (item) => item !== null && typeof item === "object" && item.method === "tools/call"
+        );
+        if (isInitOnlyBatch) {
+          this.initWriteInFlight += 1;
+        }
+        const releaseInitFlush = () => {
+          if (!isInitOnlyBatch) return;
+          this.initWriteInFlight = Math.max(0, this.initWriteInFlight - 1);
+          if (this.initWriteInFlight === 0 && this.postInitOutgoingQueue.length > 0) {
+            const queued = this.postInitOutgoingQueue.splice(0, this.postInitOutgoingQueue.length);
+            for (const task of queued) {
+              try {
+                task();
+              } catch {
+              }
+            }
+          }
+        };
+        void Promise.all(promises).then((responses) => {
+          const nonNull = responses.filter(
+            (r) => r !== null
+          );
+          if (nonNull.length > 0) {
+            writeResponse(nonNull, useContentLength);
+          }
+          flushOutgoingForCall();
+          releaseInitFlush();
+        }).catch(() => {
+          releaseInitFlush();
+        }).finally(finish);
+        return;
+      }
+      const isSingleInit = parsed !== null && typeof parsed === "object" && parsed.method === "initialize";
+      if (isSingleInit) {
+        this.initWriteInFlight += 1;
+      }
+      const releaseSingleInitFlush = () => {
+        if (!isSingleInit) return;
+        this.initWriteInFlight = Math.max(0, this.initWriteInFlight - 1);
+        if (this.initWriteInFlight === 0 && this.postInitOutgoingQueue.length > 0) {
+          const queued = this.postInitOutgoingQueue.splice(0, this.postInitOutgoingQueue.length);
+          for (const task of queued) {
+            try {
+              task();
+            } catch {
+            }
+          }
+        }
+      };
+      const prevQueue = this.activeOutgoingQueue;
+      this.activeOutgoingQueue = outgoingForCall;
+      let promise;
+      try {
+        promise = this.handleMessage(parsed, useContentLength);
+      } finally {
+        this.activeOutgoingQueue = prevQueue;
+      }
+      void promise.then((response) => {
+        if (response !== null) {
+          writeResponse(response, useContentLength);
+        }
+        flushOutgoingForCall();
+        releaseSingleInitFlush();
+      }).catch(() => {
+        releaseSingleInitFlush();
+      }).finally(finish);
+    };
+    const drainBuffer = () => {
+      while (buffer.length > 0) {
+        if (discardingOversizedLine) {
+          const nlIdx = buffer.indexOf(10);
+          if (nlIdx === -1) {
+            buffer = Buffer.alloc(0);
+            break;
+          }
+          discardingOversizedLine = false;
+          buffer = nlIdx + 1 >= buffer.length ? Buffer.alloc(0) : Buffer.from(buffer.subarray(nlIdx + 1));
+          continue;
+        }
+        let offset = 0;
+        while (offset < buffer.length && (buffer[offset] === 10 || buffer[offset] === 13)) {
+          offset++;
+        }
+        if (offset > 0) {
+          buffer = buffer.subarray(offset);
+          if (buffer.length === 0) break;
+        }
+        const headerProbe = buffer.subarray(0, 16).toString("latin1").toLowerCase();
+        if (headerProbe.startsWith("content-length:") || headerProbe.startsWith("content-type:")) {
+          const headerScan = buffer.subarray(0, Math.min(buffer.length, 16384)).toString("latin1");
+          const sepMatch = /\r?\n\r?\n/.exec(headerScan);
+          if (!sepMatch) {
+            if (buffer.length >= 16384) {
+              writeResponse(
+                {
+                  jsonrpc: "2.0",
+                  id: null,
+                  error: { code: -32600, message: "Invalid Request: header too large" }
+                },
+                true
+              );
+              buffer = Buffer.alloc(0);
+            }
+            break;
+          }
+          const sepIdx = sepMatch.index;
+          const sepLen = sepMatch[0].length;
+          const headerText = headerScan.slice(0, sepIdx);
+          const clMatches = [...headerText.matchAll(/^content-length:[ \t]*(\d+)[ \t]*\r?$/gim)];
+          if (clMatches.length !== 1) {
+            writeResponse(
+              {
+                jsonrpc: "2.0",
+                id: null,
+                error: { code: -32600, message: "Invalid Request: invalid Content-Length header" }
+              },
+              true
+            );
+            buffer = buffer.subarray(sepIdx + sepLen);
+            continue;
+          }
+          const contentLength = Number(clMatches[0][1]);
+          if (!Number.isSafeInteger(contentLength) || contentLength < 0 || contentLength > maxFrameBytes) {
+            writeResponse(
+              {
+                jsonrpc: "2.0",
+                id: null,
+                error: { code: -32600, message: "Invalid Request: Content-Length out of bounds" }
+              },
+              true
+            );
+            buffer = Buffer.alloc(0);
+            break;
+          }
+          const bodyStart = sepIdx + sepLen;
+          if (buffer.length < bodyStart + contentLength) {
+            break;
+          }
+          const bodyText = buffer.subarray(bodyStart, bodyStart + contentLength).toString("utf8");
+          buffer = buffer.subarray(bodyStart + contentLength);
+          dispatchRawJson(bodyText, true);
+          continue;
+        }
+        const newlineIdx = buffer.indexOf(10);
+        if (newlineIdx === -1) {
+          const pendingLen = buffer.length > 0 && buffer[buffer.length - 1] === 13 ? buffer.length - 1 : buffer.length;
+          if (pendingLen > maxFrameBytes) {
+            writeResponse(
+              {
+                jsonrpc: "2.0",
+                id: null,
+                error: {
+                  code: -32600,
+                  message: "Invalid Request: NDJSON message exceeds maximum allowed size"
+                }
+              },
+              false
+            );
+            discardingOversizedLine = true;
+            buffer = Buffer.alloc(0);
+          }
+          break;
+        }
+        const lineLen = newlineIdx > 0 && buffer[newlineIdx - 1] === 13 ? newlineIdx - 1 : newlineIdx;
+        if (lineLen > maxFrameBytes) {
+          writeResponse(
+            {
+              jsonrpc: "2.0",
+              id: null,
+              error: {
+                code: -32600,
+                message: "Invalid Request: NDJSON message exceeds maximum allowed size"
+              }
+            },
+            false
+          );
+          buffer = newlineIdx + 1 >= buffer.length ? Buffer.alloc(0) : Buffer.from(buffer.subarray(newlineIdx + 1));
+          continue;
+        }
+        const lineBuf = buffer.subarray(0, newlineIdx);
+        buffer = buffer.subarray(newlineIdx + 1);
+        const line = lineBuf.toString("utf8").trim();
+        if (line.length > 0) {
+          dispatchRawJson(line, false);
+        }
+      }
+    };
+    input.on("data", (chunk) => {
+      const buf = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
+      buffer = buffer.length === 0 ? buf : Buffer.concat([buffer, buf]);
+      drainBuffer();
+    });
+    const handleInputClosed = (flushTrailing) => {
+      if (this.stdinEnded) return;
+      const wasDiscarding = discardingOversizedLine;
+      discardingOversizedLine = false;
+      const remaining = flushTrailing && !wasDiscarding ? buffer.toString("utf8").trim() : "";
+      buffer = Buffer.alloc(0);
+      this.stdinEnded = true;
+      if (flushTrailing && remaining.length > 0) {
+        const lowerRem = remaining.toLowerCase();
+        if (!lowerRem.startsWith("content-length:") && !lowerRem.startsWith("content-type:")) {
+          dispatchRawJson(remaining, false);
+        }
+      }
+      this.settleAllPendingRoots();
+      if (this.inFlight === 0) {
+        triggerDrainExit();
+      }
+    };
+    input.on("end", () => handleInputClosed(true));
+    input.on("close", () => handleInputClosed(false));
+    input.on("error", () => handleInputClosed(false));
+  }
+};
+
+// src/utils/host-compat.ts
+import fs5 from "node:fs";
+import os3 from "node:os";
+import path6 from "node:path";
+var HOST_COMPAT_RULES = [
+  {
+    id: "agy-cli-1.5-call-mcp-tool-empty-edits",
+    surface: "cli",
+    minVersion: "1.5.0",
+    // Antigravity CLI >= 1.5.8 supports `"eager": true` in mcp_config.json,
+    // which registers typed native mcp_agy-fast_fast_* tools and bypasses
+    // lazy call_mcp_tool altogether (keeping token-saving native array edits).
+    // Pre-eager CLI 1.5.0-1.5.7 keeps the JSON-string workaround automatically;
+    // any lazy/custom setup can still opt in via AGY_FAST_EDITS_FORMAT=string.
+    maxVersionExclusive: "1.5.8",
+    editsFormat: "string",
+    reason: "Pre-eager Antigravity CLI 1.5.0-1.5.7 loads tools lazily via call_mcp_tool where long native edits arrays can drop to []; JSON array string avoids payload loss"
+  }
+];
+function parseHostSemverParts(raw) {
+  const m = /(?:^|[^0-9.])v?(\d+)\.(\d+)\.(\d+)(?:\.\d+)?(?:-([0-9A-Za-z.-]+))?(?:$|[^0-9.])/.exec(
+    raw.trim()
+  );
+  if (!m) return null;
+  const major = Number.parseInt(m[1], 10);
+  const minor = Number.parseInt(m[2], 10);
+  const patch = Number.parseInt(m[3], 10);
+  if (!Number.isSafeInteger(major) || !Number.isSafeInteger(minor) || !Number.isSafeInteger(patch) || major > 999999 || minor > 999999 || patch > 999999) {
+    return null;
+  }
+  return { major, minor, patch, prerelease: m[4] ?? null };
+}
+function formatHostSemverParts(parts) {
+  const base = `${parts.major}.${parts.minor}.${parts.patch}`;
+  return parts.prerelease ? `${base}-${parts.prerelease}` : base;
+}
+function comparePrerelease(a, b) {
+  const aParts = a.split(".");
+  const bParts = b.split(".");
+  const len = Math.max(aParts.length, bParts.length);
+  for (let i = 0; i < len; i++) {
+    const ai = aParts[i];
+    const bi = bParts[i];
+    if (ai === void 0) return -1;
+    if (bi === void 0) return 1;
+    if (ai === bi) continue;
+    const aNum = /^\d+$/.test(ai);
+    const bNum = /^\d+$/.test(bi);
+    if (aNum && bNum) {
+      const diff = Number.parseInt(ai, 10) - Number.parseInt(bi, 10);
+      if (diff !== 0) return diff > 0 ? 1 : -1;
+    } else if (aNum !== bNum) {
+      return aNum ? -1 : 1;
+    } else {
+      return ai < bi ? -1 : 1;
+    }
+  }
+  return 0;
+}
+function compareHostSemver(a, b) {
+  const pa = parseHostSemverParts(a);
+  const pb = parseHostSemverParts(b);
+  if (!pa || !pb) return a.localeCompare(b);
+  if (pa.major !== pb.major) return pa.major > pb.major ? 1 : -1;
+  if (pa.minor !== pb.minor) return pa.minor > pb.minor ? 1 : -1;
+  if (pa.patch !== pb.patch) return pa.patch > pb.patch ? 1 : -1;
+  if (pa.prerelease === pb.prerelease) return 0;
+  if (pa.prerelease === null) return 1;
+  if (pb.prerelease === null) return -1;
+  return comparePrerelease(pa.prerelease, pb.prerelease);
+}
+function parseEditsFormatMode(raw) {
+  if (typeof raw !== "string") return null;
+  const v = raw.trim().toLowerCase();
+  if (v === "auto" || v === "array" || v === "string") return v;
+  return null;
+}
+function parseHostOverride(raw) {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim().toLowerCase();
+  if (!trimmed) return null;
+  const m = /^(cli|desktop|app|antigravity|ide|unknown)(?:[@\-/\s](.+))?$/.exec(trimmed);
+  if (!m) return null;
+  const surface = m[1] === "app" || m[1] === "antigravity" ? "desktop" : m[1];
+  if (m[2] !== void 0) {
+    const parts = parseHostSemverParts(m[2]);
+    if (!parts) return null;
+    return { surface, version: formatHostSemverParts(parts) };
+  }
+  return { surface, version: null };
+}
+var EXPLICIT_THIRD_PARTY_CLIENT_RE = /^(?:claude(?:[-_\s]|$)|cursor(?:[-_\s]|$)|windsurf(?:[-_\s]|$)|vscode(?:[-_\s]|$)|visual[\s_-]+studio[\s_-]+code|codex(?:[-_\s]|$)|zed(?:[-_\s]|$)|cline(?:[-_\s]|$)|roo[-_\s]?code|continue(?:[-_\s]|$)|opencode(?:[-_\s]|$)|aider(?:[-_\s]|$)|goose(?:[-_\s]|$)|jetbrains(?:[-_\s]|$)|neovim(?:[-_\s]|$)|nvim(?:[-_\s]|$)|emacs(?:[-_\s]|$)|mcp[-_\s]?inspector(?:[-_\s]|$))/i;
+function isExplicitThirdPartyClient(rawName) {
+  if (typeof rawName !== "string") return false;
+  return EXPLICIT_THIRD_PARTY_CLIENT_RE.test(rawName.trim());
+}
+function parseSurfaceFromClientName(rawName) {
+  if (typeof rawName !== "string") return null;
+  const s = rawName.trim().toLowerCase();
+  if (!s || s.startsWith("agy-fast")) return null;
+  if (/^(?:google[-_\s]?)?antigravity[-_\s]?cli$/.test(s) || /^agy(?:[-_\s]?cli)?$/.test(s)) {
+    return "cli";
+  }
+  if (/^(?:google[-_\s]?)?antigravity[-_\s]?ide$/.test(s)) {
+    return "ide";
+  }
+  if (/^(?:google[-_\s]?)?antigravity(?:[-_\s]?(?:2\.0|app|desktop))?$/.test(s)) {
+    return "desktop";
+  }
+  return null;
+}
+function parseLsVersion(raw) {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const parts = parseHostSemverParts(trimmed);
+  const version = parts ? formatHostSemverParts(parts) : null;
+  if (/^(?:antigravity[-_\s]?)?cli(?:[-_/@\s]|$)/i.test(trimmed)) {
+    return { surface: "cli", version };
+  }
+  if (/^(?:antigravity[-_\s]?)?ide(?:[-_/@\s]|$)/i.test(trimmed)) {
+    return { surface: "ide", version };
+  }
+  if (/^(?:antigravity[-_\s]?)?(?:desktop|app)(?:[-_/@\s]|$)/i.test(trimmed)) {
+    return { surface: "desktop", version };
+  }
+  if (/^antigravity(?:[-_/@\s]|$)/i.test(trimmed)) {
+    return { surface: "desktop", version };
+  }
+  if (version) {
+    return { surface: null, version };
+  }
+  return null;
+}
+function parseSurfaceFromPath(rawPath, allowTrailingAppDir = false) {
+  if (typeof rawPath !== "string" || !rawPath.trim()) return null;
+  const segs = rawPath.trim().replace(/\\/g, "/").split("/").filter(Boolean).map((s) => s.toLowerCase());
+  for (let i = 0; i < segs.length - 1; i++) {
+    if (segs[i] !== ".gemini") continue;
+    const next = segs[i + 1];
+    if (next === "antigravity-cli") return "cli";
+    if (next === "antigravity-ide") return "ide";
+    if (next === "antigravity") return "desktop";
+  }
+  if (allowTrailingAppDir && segs.length > 0) {
+    const tail = segs[segs.length - 1];
+    if (tail === "antigravity-cli") return "cli";
+    if (tail === "antigravity-ide") return "ide";
+    if (tail === "antigravity") return "desktop";
+  }
+  return null;
+}
+function detectHostIdentity(signals = {}) {
+  const env = signals.env ?? process.env;
+  const rawClientName = typeof signals.clientInfo?.name === "string" && signals.clientInfo.name.trim() ? signals.clientInfo.name.trim() : void 0;
+  const rawClientVersion = typeof signals.clientInfo?.version === "string" && signals.clientInfo.version.trim() ? signals.clientInfo.version.trim() : void 0;
+  const modelName = typeof signals.modelName === "string" && signals.modelName.trim() ? signals.modelName.trim() : void 0;
+  const override = parseHostOverride(env.AGY_FAST_HOST);
+  if (override) {
+    return {
+      surface: override.surface,
+      version: override.version,
+      source: "override",
+      rawClientName,
+      rawClientVersion,
+      modelName
+    };
+  }
+  if (isExplicitThirdPartyClient(rawClientName)) {
+    return {
+      surface: "unknown",
+      version: null,
+      source: "mcp:client-info",
+      rawClientName,
+      rawClientVersion,
+      modelName
+    };
+  }
+  const clientSurface = parseSurfaceFromClientName(rawClientName);
+  const clientVerParts = clientSurface && rawClientVersion ? parseHostSemverParts(rawClientVersion) : null;
+  const clientVersion = clientVerParts ? formatHostSemverParts(clientVerParts) : null;
+  const hookSurface = parseSurfaceFromPath(signals.transcriptPath) ?? parseSurfaceFromPath(signals.artifactDirectoryPath);
+  const lsInfo = parseLsVersion(env.ANTIGRAVITY_LS_VERSION);
+  const appDataSurface = parseSurfaceFromPath(env.ANTIGRAVITY_APP_DATA_DIR, true);
+  let surface = "unknown";
+  let source = "unknown";
+  if (clientSurface) {
+    surface = clientSurface;
+    source = "mcp:client-info";
+  } else if (hookSurface) {
+    surface = hookSurface;
+    source = "hook:path";
+  } else if (lsInfo?.surface) {
+    surface = lsInfo.surface;
+    source = "env:ls-version";
+  } else if (appDataSurface) {
+    surface = appDataSurface;
+    source = "env:app-data-dir";
+  }
+  let version = null;
+  if (clientSurface === surface && clientVersion) {
+    version = clientVersion;
+  } else if (surface !== "unknown" && lsInfo?.version && (lsInfo.surface === null || lsInfo.surface === surface)) {
+    version = lsInfo.version;
+  }
+  return {
+    surface,
+    version,
+    source,
+    rawClientName,
+    rawClientVersion,
+    modelName
+  };
+}
+function ruleMatchesIdentity(rule, identity) {
+  if (rule.surface !== identity.surface) return false;
+  if (rule.minVersion !== void 0 || rule.maxVersionExclusive !== void 0) {
+    if (!identity.version) return false;
+    if (rule.minVersion !== void 0 && compareHostSemver(identity.version, rule.minVersion) < 0) {
+      return false;
+    }
+    if (rule.maxVersionExclusive !== void 0 && compareHostSemver(identity.version, rule.maxVersionExclusive) >= 0) {
+      return false;
+    }
+  }
+  return true;
+}
+function resolveHostCompat(signals = {}, rules = HOST_COMPAT_RULES) {
+  const env = signals.env ?? process.env;
+  const identity = detectHostIdentity(signals);
+  let ruleEditsFormat;
+  let callBudgetSec = MCP_CALL_BUDGET_SEC;
+  let inlineMaxBytes = DEFAULT_INLINE_MAX_BYTES;
+  const matchedRuleIds = [];
+  const reasons = [];
+  for (const rule of rules) {
+    if (!ruleMatchesIdentity(rule, identity)) continue;
+    matchedRuleIds.push(rule.id);
+    if (rule.editsFormat !== void 0) ruleEditsFormat = rule.editsFormat;
+    if (rule.callBudgetSec !== void 0) callBudgetSec = rule.callBudgetSec;
+    if (rule.inlineMaxBytes !== void 0) inlineMaxBytes = rule.inlineMaxBytes;
+    if (rule.reason) reasons.push(rule.reason);
+  }
+  const envMode = parseEditsFormatMode(env.AGY_FAST_EDITS_FORMAT);
+  const cfgMode = parseEditsFormatMode(signals.configEditsFormat);
+  let editsFormat = "array";
+  let editsFormatSource = "token-saving-default";
+  let reason = reasons[0] ?? "Defaulting to native array edits for lower output token usage (~2.6-3.3x cheaper than double-escaped JSON strings)";
+  if (envMode === "array" || envMode === "string") {
+    editsFormat = envMode;
+    editsFormatSource = "env-override";
+    reason = `Forced by AGY_FAST_EDITS_FORMAT=${envMode}`;
+  } else if (envMode !== "auto" && (cfgMode === "array" || cfgMode === "string")) {
+    editsFormat = cfgMode;
+    editsFormatSource = "config-override";
+    reason = `Configured in agy-fast config.json (editsFormat=${cfgMode})`;
+  } else if (ruleEditsFormat !== void 0) {
+    editsFormat = ruleEditsFormat;
+    editsFormatSource = "compat-rule";
+  }
+  return {
+    identity,
+    editsFormat,
+    editsFormatSource,
+    callBudgetSec,
+    inlineMaxBytes,
+    matchedRuleIds,
+    reason
+  };
+}
+function getConfigPath(env = process.env) {
+  const custom = env.AGY_FAST_CACHE_DIR?.trim();
+  const home = process.platform === "win32" ? env.USERPROFILE || env.HOME || os3.homedir() : env.HOME || env.USERPROFILE || os3.homedir();
+  const cacheDir = custom ? path6.resolve(custom) : path6.join(home, ".gemini", "cache", "agy-fast");
+  return path6.join(cacheDir, "config.json");
+}
+function readSavedEditsFormatSync(env = process.env) {
+  try {
+    const raw = fs5.readFileSync(getConfigPath(env), "utf8");
+    const parsed = JSON.parse(raw);
+    return parseEditsFormatMode(parsed?.editsFormat) ?? void 0;
+  } catch {
+    return void 0;
+  }
+}
+
+// src/mcp-server-core.ts
+var SERVER_VERSION = "0.3.2";
 var DEFAULT_PLUGIN_ROOT = path7.resolve(
   path7.dirname(fileURLToPath2(import.meta.url)),
   ".."
 );
+var ALL_MCP_TOOLS = [
+  "batch_search",
+  "apply_edits",
+  "read_slices",
+  "quick_outline",
+  "run_checks"
+];
+var ALL_MCP_TOOL_SET = new Set(ALL_MCP_TOOLS);
+function parseToolFilter(raw, sourceLabel = "--tools") {
+  const parts = raw.split(",").map((s) => s.trim());
+  if (parts.length === 0 || parts.some((p) => p.length === 0)) {
+    throw new Error(
+      `Invalid ${sourceLabel} value "${raw}". Expected comma-separated tool names from: ${ALL_MCP_TOOLS.join(", ")}.`
+    );
+  }
+  const invalid = parts.filter((p) => !ALL_MCP_TOOL_SET.has(p));
+  if (invalid.length > 0) {
+    throw new Error(
+      `Unknown tool(s) in ${sourceLabel}: ${invalid.join(", ")}. Valid tools: ${ALL_MCP_TOOLS.join(", ")}.`
+    );
+  }
+  return new Set(parts);
+}
+function normalizeProvidedTools(tools) {
+  const list = [...tools];
+  if (list.length === 0) {
+    throw new Error(
+      `Invalid options.tools value (empty). Expected at least one tool from: ${ALL_MCP_TOOLS.join(", ")}.`
+    );
+  }
+  const invalid = list.filter((name) => !ALL_MCP_TOOL_SET.has(name));
+  if (invalid.length > 0) {
+    throw new Error(
+      `Unknown tool(s) in options.tools: ${invalid.join(", ")}. Valid tools: ${ALL_MCP_TOOLS.join(", ")}.`
+    );
+  }
+  return new Set(list);
+}
+var MINIMAL_SCHEMA_STRIPPED_KEYWORDS = /* @__PURE__ */ new Set([
+  "minimum",
+  "maximum",
+  "exclusiveMinimum",
+  "exclusiveMaximum",
+  "minItems",
+  "maxItems",
+  "minLength",
+  "maxLength",
+  "pattern",
+  "multipleOf"
+]);
+function parseSchemaCompatMode(raw) {
+  if (typeof raw !== "string") return null;
+  const v = raw.trim().toLowerCase();
+  if (v === "standard" || v === "minimal") return v;
+  return null;
+}
+function sanitizeSchemaToMinimalSubset(node) {
+  const out = {};
+  for (const [key, value] of Object.entries(node)) {
+    if (MINIMAL_SCHEMA_STRIPPED_KEYWORDS.has(key)) continue;
+    if (key === "properties" && value !== null && typeof value === "object" && !Array.isArray(value)) {
+      const props = {};
+      for (const [propName, propSchema] of Object.entries(
+        value
+      )) {
+        props[propName] = propSchema !== null && typeof propSchema === "object" && !Array.isArray(propSchema) ? sanitizeSchemaToMinimalSubset(propSchema) : propSchema;
+      }
+      out.properties = props;
+    } else if (key === "items" && value !== null && typeof value === "object" && !Array.isArray(value)) {
+      out.items = sanitizeSchemaToMinimalSubset(value);
+    } else if (Array.isArray(value)) {
+      out[key] = value.map(
+        (item) => item !== null && typeof item === "object" && !Array.isArray(item) ? sanitizeSchemaToMinimalSubset(item) : item
+      );
+    } else if (value !== null && typeof value === "object") {
+      out[key] = sanitizeSchemaToMinimalSubset(value);
+    } else {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+function parseMcpServerCliArgs(argv, env = process.env) {
+  let schemaCompat;
+  let tools;
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "-h" || arg === "--help") {
+      return { ok: true, help: true };
+    }
+    if (arg === "--tools" || arg.startsWith("--tools=")) {
+      let rawTools;
+      if (arg.startsWith("--tools=")) {
+        rawTools = arg.slice("--tools=".length);
+      } else {
+        const next = argv[i + 1];
+        if (next === void 0 || next.startsWith("-")) {
+          return {
+            ok: false,
+            error: `Missing value after --tools. Valid tools: ${ALL_MCP_TOOLS.join(", ")}.`
+          };
+        }
+        rawTools = next;
+        i++;
+      }
+      try {
+        tools = parseToolFilter(rawTools, "--tools");
+      } catch (err) {
+        return {
+          ok: false,
+          error: err instanceof Error ? err.message : String(err)
+        };
+      }
+      continue;
+    }
+    if (arg === "--schema-compat" || arg.startsWith("--schema-compat=")) {
+      const rawValue = arg.startsWith("--schema-compat=") ? arg.slice("--schema-compat=".length) : argv[++i];
+      if (rawValue === void 0 || !rawValue.trim()) {
+        return {
+          ok: false,
+          error: "Missing value for --schema-compat (expected: standard | minimal)."
+        };
+      }
+      const parsed = parseSchemaCompatMode(rawValue);
+      if (!parsed) {
+        return {
+          ok: false,
+          error: `Invalid --schema-compat value ${JSON.stringify(rawValue)} (expected: standard | minimal).`
+        };
+      }
+      schemaCompat = parsed;
+      continue;
+    }
+    return {
+      ok: false,
+      error: `Unknown argument ${JSON.stringify(arg)}. Run with --help for usage.`
+    };
+  }
+  if (tools === void 0) {
+    const envTools = env.AGY_FAST_TOOLS?.trim();
+    if (envTools) {
+      try {
+        tools = parseToolFilter(envTools, "AGY_FAST_TOOLS");
+      } catch (err) {
+        return {
+          ok: false,
+          error: err instanceof Error ? err.message : String(err)
+        };
+      }
+    }
+  }
+  return { ok: true, help: false, schemaCompat, tools };
+}
+function parseServerCliArgs(argv, env = process.env) {
+  const parsed = parseMcpServerCliArgs(argv, env);
+  if (!parsed.ok) {
+    throw new Error(parsed.error);
+  }
+  if (parsed.help) {
+    return { help: true };
+  }
+  return {
+    help: false,
+    schemaCompat: parsed.schemaCompat,
+    tools: parsed.tools
+  };
+}
+function printMcpServerHelp() {
+  process.stdout.write(
+    [
+      "agy-fast MCP stdio server",
+      "",
+      "Usage:",
+      "  agy-fast-mcp [--tools <tool1,tool2,...>] [--schema-compat <standard|minimal>]",
+      "  agy-fast mcp [--tools <tool1,tool2,...>] [--schema-compat <standard|minimal>]",
+      "  agy-fast-mcp --cli <search|outline|slice|edit|check> [args...]",
+      "",
+      "Options:",
+      "  --tools <list>",
+      "      Comma-separated subset of MCP tools to expose",
+      `      (valid: ${ALL_MCP_TOOLS.join(", ")}; env: AGY_FAST_TOOLS).`,
+      "  --schema-compat <standard|minimal>",
+      "      Schema keyword profile for tools/list (env: AGY_FAST_SCHEMA_COMPAT).",
+      "      'minimal' strips numeric/array range keywords (minimum/maximum/minItems/maxItems)",
+      "      for strict JSON Schema subset hosts while keeping all runtime checks intact.",
+      "  -h, --help",
+      "      Show this help message.",
+      ""
+    ].join("\n")
+  );
+}
 function canonicalizeDir(dirPath) {
   const resolved = path7.resolve(dirPath);
   try {
@@ -7922,6 +10641,32 @@ function isInstalledPluginPath(dirPath) {
   return /(?:^|\/)(?:\.gemini\/(?:config\/|antigravity[^/]*\/)?plugins|\.agents\/plugins)\/[^/]+(?:\/|$)/i.test(
     posix
   );
+}
+function isSameDir(a, b) {
+  const caseInsensitive = process.platform === "win32" || process.platform === "darwin";
+  return caseInsensitive ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+function detectNonWorkspaceCwd(env, currentCwd) {
+  const canonCwd = canonicalizeDir(currentCwd);
+  if (path7.parse(canonCwd).root === canonCwd) {
+    return { dir: canonCwd, place: "the filesystem root" };
+  }
+  const isFullAbsPath = (p) => process.platform === "win32" ? /^(?:[A-Za-z]:[\\/]|\\\\[^\\])/.test(p) : path7.isAbsolute(p);
+  const driveHome = process.platform === "win32" && typeof env.HOMEDRIVE === "string" && typeof env.HOMEPATH === "string" && env.HOMEDRIVE.trim() && env.HOMEPATH.trim() ? `${env.HOMEDRIVE.trim()}${env.HOMEPATH.trim()}` : "";
+  const homes = [env.HOME, env.USERPROFILE, driveHome].map((h) => typeof h === "string" ? h.trim() : "").filter((h) => h && isFullAbsPath(h));
+  if (homes.length === 0 && env === process.env) {
+    try {
+      const osHome = os4.homedir();
+      if (isFullAbsPath(osHome)) homes.push(osHome);
+    } catch {
+    }
+  }
+  for (const home of homes) {
+    if (home && isSameDir(canonCwd, canonicalizeDir(home))) {
+      return { dir: canonCwd, place: "the home directory" };
+    }
+  }
+  return null;
 }
 function detectPluginInstallCwd(env, currentCwd, scriptPluginRoot) {
   const canonCwd = canonicalizeDir(currentCwd);
@@ -7946,12 +10691,11 @@ function buildApplyEditsToolDefinition(compat) {
   const preferStringEdits = compat.editsFormat === "string";
   const editsSchema = preferStringEdits ? {
     type: "string",
-    description: 'JSON array string of 1-50 files to edit or create: [{"path", "hunks"?: [{"target", "replacement", "startLine"?, "endLine"?, "replaceAll"?}], "create"?, "overwrite"?}]. A hunk replaces exact target text (optional 1-based line window; replaceAll replaces every occurrence in it); "create" writes the whole file instead of hunks, and "overwrite" allows replacing an existing file. A native array is also accepted, but this host version can deliver a long array of objects in call_mcp_tool Arguments as [] while a string arrives intact.'
+    description: 'JSON array string (1-50 files): [{"path","hunks"?:[{"target","replacement","startLine"?,"endLine"?,"replaceAll"?}],"create"?,"overwrite"?}]. Exact target in 1-based window (all if replaceAll). Nonempty hunks XOR full-file create. overwrite allows replacing via create. Native arrays also work, but call_mcp_tool can turn long ones into [].'
   } : {
     type: "array",
     minItems: 1,
     maxItems: 50,
-    description: "Files to edit or create (a JSON array string of the same shape is also accepted).",
     items: {
       type: "object",
       properties: {
@@ -7961,72 +10705,42 @@ function buildApplyEditsToolDefinition(compat) {
           items: {
             type: "object",
             properties: {
-              target: { type: "string", description: "Exact text to replace." },
-              replacement: { type: "string", description: "Replacement text." },
-              startLine: {
-                type: "integer",
-                minimum: 1,
-                description: "Optional 1-based start line to narrow matching."
-              },
-              endLine: {
-                type: "integer",
-                minimum: 1,
-                description: "Optional 1-based end line to narrow matching."
-              },
-              replaceAll: {
-                type: "boolean",
-                description: "Replace every occurrence in range (default false)."
-              }
+              target: { type: "string" },
+              replacement: { type: "string" },
+              startLine: { type: "integer", minimum: 1 },
+              endLine: { type: "integer", minimum: 1 },
+              replaceAll: { type: "boolean" }
             },
             required: ["target", "replacement"]
           }
         },
-        create: {
-          type: "string",
-          description: "Create file with this full content instead of hunks."
-        },
-        overwrite: {
-          type: "boolean",
-          description: "Allow overwriting existing file when using 'create'."
-        }
+        create: { type: "string" },
+        overwrite: { type: "boolean" }
       },
       required: ["path"]
     }
   };
+  const baseDesc = `Atomic multi-file edits. bestEffort writes valid files atomically per file, gives closest lines, skips verify on failure. dryRun=false (true validates only). verify shell in cwd after writes (60s/4000 chars default, agy drops at 180s). 8800 UTF-8 bytes total. Absolute cwd if no roots/list (Desktop 2.0 Hub).`;
   return {
     name: "apply_edits",
-    description: preferStringEdits ? "Atomically apply multiple non-contiguous hunks across one or more files (all-or-nothing) with optional file creation and inline verify command. Pass 'edits' as one JSON array string." : "Atomically apply multiple non-contiguous hunks across one or more files (all-or-nothing) with optional file creation and inline verify command.",
+    description: preferStringEdits ? baseDesc : `${baseDesc} Exact target in 1-based window (all if replaceAll). Nonempty hunks XOR full-file create. overwrite allows replacing via create.`,
     inputSchema: {
       type: "object",
       properties: {
-        cwd: {
-          type: "string",
-          description: "Workspace root directory for relative file paths and verify command (required if the host does not report MCP roots/list, e.g. Desktop 2.0 Hub)."
-        },
+        cwd: { type: "string" },
         edits: editsSchema,
-        dryRun: {
-          type: "boolean",
-          description: "Validate all hunks without writing files (default false)."
-        },
-        bestEffort: {
-          type: "boolean",
-          description: "When true, write valid files even if other files fail validation (each file remains atomic; failed files return closest-line snippets and verify is skipped until fixed). Default false (all-or-nothing)."
-        },
-        verify: {
-          type: "string",
-          description: "Optional shell command run right after writing (e.g. 'npm run typecheck')."
-        },
+        dryRun: { type: "boolean" },
+        bestEffort: { type: "boolean" },
+        verify: { type: "string" },
         verifyTimeoutSec: {
           type: "integer",
           minimum: 1,
-          maximum: MCP_CALL_BUDGET_SEC,
-          description: `Optional timeout in seconds for the verify command (default 60, max ${MCP_CALL_BUDGET_SEC}: agy drops MCP results after 180s).`
+          maximum: MCP_CALL_BUDGET_SEC
         },
         maxVerifyChars: {
           type: "integer",
           minimum: 300,
-          maximum: 7500,
-          description: "Optional character cap for verify output (default 4000; full response hard-capped <= 8800 UTF-8 bytes)."
+          maximum: 7500
         }
       },
       required: ["edits"]
@@ -8038,6 +10752,10 @@ function createAgyFastServer(options = {}) {
   const getProcessCwd = options.processCwd ?? (() => process.cwd());
   const scriptPluginRoot = options.pluginRoot ?? DEFAULT_PLUGIN_ROOT;
   const savedEditsFormat = options.configEditsFormat ?? readSavedEditsFormatSync(env);
+  const selectedTools = options.tools !== void 0 ? normalizeProvidedTools(options.tools) : void 0;
+  const shouldRegister = (name) => !selectedTools || selectedTools.has(name);
+  const schemaCompat = options.schemaCompat ?? parseSchemaCompatMode(env.AGY_FAST_SCHEMA_COMPAT) ?? "standard";
+  const applySchemaCompat = (def) => schemaCompat === "minimal" ? { ...def, inputSchema: sanitizeSchemaToMinimalSubset(def.inputSchema) } : def;
   let hostCompat = resolveHostCompat({
     env,
     configEditsFormat: savedEditsFormat
@@ -8070,6 +10788,13 @@ function createAgyFastServer(options = {}) {
           error: `Error: 'cwd' is required because this host did not report a workspace root via MCP roots/list and the MCP server started inside the plugin directory (${pluginFallbackDir}). Pass the active workspace root explicitly in 'cwd'.`
         };
       }
+      const nonWorkspace = detectNonWorkspaceCwd(env, getProcessCwd());
+      if (nonWorkspace) {
+        return {
+          ok: false,
+          error: `Error: 'cwd' is required because this host did not report a workspace root via MCP roots/list and the MCP server started in ${nonWorkspace.place} (${nonWorkspace.dir}), which is not a workspace. Pass the active workspace root explicitly in 'cwd'.`
+        };
+      }
       return {
         ok: true,
         value: { ...args, cwd: void 0 }
@@ -8091,6 +10816,13 @@ function createAgyFastServer(options = {}) {
         return {
           ok: false,
           error: `Error: 'cwd' must be an absolute workspace path because this host did not report a workspace root via MCP roots/list and the MCP server started inside the plugin directory (${pluginFallbackDir}). Received relative cwd: ${JSON.stringify(rawCwd)}.`
+        };
+      }
+      const nonWorkspace = detectNonWorkspaceCwd(env, getProcessCwd());
+      if (nonWorkspace) {
+        return {
+          ok: false,
+          error: `Error: 'cwd' must be an absolute workspace path because this host did not report a workspace root via MCP roots/list and the MCP server started in ${nonWorkspace.place} (${nonWorkspace.dir}), which is not a workspace. Received relative cwd: ${JSON.stringify(rawCwd)}.`
         };
       }
     }
@@ -8128,261 +10860,214 @@ function createAgyFastServer(options = {}) {
       }
     }
   });
-  server.registerTool(
-    {
-      name: "batch_search",
-      description: "Run multiple read-only text/regex searches, file globs, fuzzy path lookups, and read-only git queries (status/diff/log/show/branch) concurrently in one call with bounded output.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          cwd: {
-            type: "string",
-            description: "Workspace root directory for relative paths (required if the host does not report MCP roots/list, e.g. Desktop 2.0 Hub)."
+  if (shouldRegister("batch_search")) {
+    server.registerTool(
+      applySchemaCompat({
+        name: "batch_search",
+        description: "Parallel search: literal text, regex, fuzzy paths, glob (*/{a,b}, no |), read-only git. Absolute cwd if no roots/list (Desktop 2.0 Hub). path rel/abs file/dir; glob filters text/regex; fileType lang/ext (text/regex/fuzzy). multiline spans lines (dot too); count/file=lines or multiline occurrences. Defaults: outputMode=content, caseSensitive=true, contextLines=0, maxResults=40, maxChars=8500 (8800B UTF-8 max); glob sortBy=path (mtime newest).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            cwd: { type: "string" },
+            queries: {
+              type: "array",
+              minItems: 1,
+              maxItems: 20,
+              items: {
+                type: "object",
+                properties: {
+                  type: {
+                    type: "string",
+                    enum: ["text", "regex", "glob", "fuzzy", "git"]
+                  },
+                  pattern: { type: "string" },
+                  path: { type: "string" },
+                  glob: { type: "string" },
+                  multiline: { type: "boolean" },
+                  outputMode: {
+                    type: "string",
+                    enum: ["content", "files_with_matches", "count"]
+                  },
+                  fileType: { type: "string" },
+                  sortBy: { type: "string", enum: ["path", "mtime"] },
+                  caseSensitive: { type: "boolean" },
+                  contextLines: { type: "integer", minimum: 0, maximum: 10 },
+                  maxResults: { type: "integer", minimum: 1, maximum: 200 }
+                },
+                required: ["type", "pattern"]
+              }
+            },
+            maxChars: { type: "integer", minimum: 500, maximum: 8800 }
           },
-          queries: {
-            type: "array",
-            minItems: 1,
-            maxItems: 20,
-            description: "List of search/glob/git queries to run concurrently.",
-            items: {
-              type: "object",
-              properties: {
-                type: {
-                  type: "string",
-                  enum: ["text", "regex", "glob", "fuzzy", "git"]
-                },
-                pattern: {
-                  type: "string",
-                  description: "Literal text, regex, fuzzy path query, glob pattern (use * and {a,b}, not regex |), or read-only git subcommand (e.g. 'status --short', 'log -n 5 --oneline')."
-                },
-                path: {
-                  type: "string",
-                  description: "Optional subdirectory or file relative to cwd."
-                },
-                glob: {
-                  type: "string",
-                  description: "Optional file filter glob for text/regex queries (e.g. '*.ts')."
-                },
-                multiline: {
-                  type: "boolean",
-                  description: "Allow text/regex to span lines. In multiline regex, dot matches newlines."
-                },
-                outputMode: {
-                  type: "string",
-                  enum: ["content", "files_with_matches", "count"],
-                  description: "Text/regex output (default content). Count reports matching lines per file, or occurrences in multiline mode."
-                },
-                fileType: {
-                  type: "string",
-                  description: "Language or extension filter for text, regex, or fuzzy queries (e.g. typescript or ts)."
-                },
-                sortBy: {
-                  type: "string",
-                  enum: ["path", "mtime"],
-                  description: "Glob order (default path). Use mtime for newest first."
-                },
-                caseSensitive: {
-                  type: "boolean",
-                  description: "Case sensitivity for text/regex (default true)."
-                },
-                contextLines: {
-                  type: "integer",
-                  minimum: 0,
-                  maximum: 5,
-                  description: "Context lines around matches (default 0)."
-                },
-                maxResults: {
-                  type: "integer",
-                  minimum: 1,
-                  maximum: 200,
-                  description: "Max matches/files for this query (default 40)."
-                }
-              },
-              required: ["type", "pattern"]
-            }
-          },
-          maxChars: {
-            type: "integer",
-            minimum: 500,
-            maximum: 8800,
-            description: "Total character cap (default 8500; hard inline UTF-8 cap <= 8800 bytes to avoid disk spills)."
-          }
-        },
-        required: ["queries"]
+          required: ["queries"]
+        }
+      }),
+      async (args) => {
+        const resolved = resolveToolArgs(args);
+        if (!resolved.ok) return { text: resolved.error, isError: true };
+        return runBatchSearch(resolved.value);
       }
-    },
-    async (args) => {
-      const resolved = resolveToolArgs(args);
-      if (!resolved.ok) return { text: resolved.error, isError: true };
-      return runBatchSearch(resolved.value);
-    }
-  );
-  server.registerTool(
-    () => buildApplyEditsToolDefinition(hostCompat),
-    async (args) => {
-      const resolved = resolveToolArgs(args);
-      if (!resolved.ok) return { text: resolved.error, isError: true };
-      return runApplyEdits(resolved.value);
-    }
-  );
-  server.registerTool(
-    {
-      name: "read_slices",
-      description: "Batch-extract symbol/section outlines (TS/JS/HTML/Vue/Svelte/CSS/Python/GDScript/Go/Rust/Java/MD/JSON/YAML) across files (prefer 10-20 files/batch, max 40) in one call, plus optional tiny <=120-line slices. For reading >150 lines of known ranges, prefer parallel built-in read_file(StartLine, EndLine) (46KB/call inline, 0 remote check).",
-      inputSchema: {
-        type: "object",
-        properties: {
-          cwd: {
-            type: "string",
-            description: "Workspace root directory for relative paths (required if the host does not report MCP roots/list, e.g. Desktop 2.0 Hub)."
-          },
-          outlines: {
-            type: "array",
-            maxItems: 40,
-            items: { type: "string" },
-            description: "File paths to extract top-level symbol/section line ranges from (prefer 10-20 per batch for fuller outlines; max 40)."
-          },
-          slices: {
-            type: "array",
-            maxItems: 30,
-            description: "Optional tiny 1-based inclusive [startLine, endLine] ranges to piggyback (total response hard-capped <= 8800 UTF-8 bytes). For flat shorthand, you may also pass 'lineRanges'.",
-            items: {
-              type: "object",
-              properties: {
-                path: { type: "string" },
-                ranges: {
-                  type: "array",
-                  minItems: 1,
-                  items: {
+    );
+  }
+  if (shouldRegister("apply_edits")) {
+    server.registerTool(
+      () => applySchemaCompat(buildApplyEditsToolDefinition(hostCompat)),
+      async (args) => {
+        const resolved = resolveToolArgs(args);
+        if (!resolved.ok) return { text: resolved.error, isError: true };
+        return runApplyEdits(resolved.value);
+      }
+    );
+  }
+  if (shouldRegister("read_slices")) {
+    server.registerTool(
+      applySchemaCompat({
+        name: "read_slices",
+        description: "Batch outlines (TS/JS/HTML/Vue/Svelte/CSS/Py/GDScript/Go/Rust/Java/MD/JSON/YAML; prefer 10-20, max 40) + tiny <=120-line slices. For >150 known lines total, prefer parallel read_file(StartLine, EndLine) if available (agy: 46KB/call, no remote check). Absolute cwd if no roots/list (Desktop 2.0 Hub). slices: 1-based inclusive [start,end]; lineRanges: 'path:start-end,s2-e2'. maxChars default 8500; 8800 UTF-8 bytes total.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            cwd: { type: "string" },
+            outlines: {
+              type: "array",
+              maxItems: 40,
+              items: { type: "string" }
+            },
+            slices: {
+              type: "array",
+              maxItems: 30,
+              items: {
+                type: "object",
+                properties: {
+                  path: { type: "string" },
+                  ranges: {
                     type: "array",
-                    minItems: 2,
-                    maxItems: 2,
-                    items: { type: "integer", minimum: 1 }
+                    minItems: 1,
+                    items: {
+                      type: "array",
+                      minItems: 2,
+                      maxItems: 2,
+                      items: { type: "integer", minimum: 1 }
+                    }
                   }
-                }
-              },
-              required: ["path", "ranges"]
-            }
-          },
-          lineRanges: {
-            type: "array",
-            maxItems: 30,
-            items: { type: "string" },
-            description: "Flat shorthand for tiny slices: 'path:start-end' or 'path:start1-end1,start2-end2' (e.g. 'src/server.ts:1-50,120-160')."
-          },
-          maxChars: {
-            type: "integer",
-            minimum: 1e3,
-            maximum: 8800,
-            description: "Total character cap (default 8500; hard inline UTF-8 cap <= 8800 bytes to prevent output.txt spills)."
+                },
+                required: ["path", "ranges"]
+              }
+            },
+            lineRanges: {
+              type: "array",
+              maxItems: 30,
+              items: { type: "string" }
+            },
+            maxChars: { type: "integer", minimum: 1e3, maximum: 8800 }
           }
         }
+      }),
+      async (args) => {
+        const resolved = resolveToolArgs(args);
+        if (!resolved.ok) return { text: resolved.error, isError: true };
+        return runReadSlices(resolved.value);
       }
-    },
-    async (args) => {
-      const resolved = resolveToolArgs(args);
-      if (!resolved.ok) return { text: resolved.error, isError: true };
-      return runReadSlices(resolved.value);
-    }
-  );
-  server.registerTool(
-    {
-      name: "quick_outline",
-      description: "Fast symbol/section outline extractor for unknown large files (TS/JS/HTML/Vue/Svelte/CSS/Python/GDScript/Go/Rust/Java/MD/JSON/YAML; prefer 10-20 files/batch, max 40). Flat paths-only schema for mapping line ranges before parallel built-in read_file(StartLine, EndLine).",
-      inputSchema: {
-        type: "object",
-        properties: {
-          cwd: {
-            type: "string",
-            description: "Workspace root directory for relative paths (required if the host does not report MCP roots/list, e.g. Desktop 2.0 Hub)."
+    );
+  }
+  if (shouldRegister("quick_outline")) {
+    server.registerTool(
+      applySchemaCompat({
+        name: "quick_outline",
+        description: "Fast symbol/section line-range outlines for large files (TS/JS/HTML/Vue/Svelte/CSS/Py/GDScript/Go/Rust/Java/MD/JSON/YAML; prefer 10-20, max 40) before parallel ranged read_file(StartLine, EndLine). Flat paths-only schema. Absolute cwd if no roots/list (Desktop 2.0 Hub). maxChars default 8500; 8800 UTF-8 bytes total.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            cwd: { type: "string" },
+            paths: {
+              type: "array",
+              minItems: 1,
+              maxItems: 40,
+              items: { type: "string" }
+            },
+            maxChars: { type: "integer", minimum: 1e3, maximum: 8800 }
           },
-          paths: {
-            type: "array",
-            minItems: 1,
-            maxItems: 40,
-            items: { type: "string" },
-            description: "File paths to extract top-level symbol/section line ranges from (prefer 10-20 per batch; max 40)."
-          },
-          maxChars: {
-            type: "integer",
-            minimum: 1e3,
-            maximum: 8800,
-            description: "Total character cap (default 8500; hard inline UTF-8 cap <= 8800 bytes)."
-          }
-        },
-        required: ["paths"]
+          required: ["paths"]
+        }
+      }),
+      async (args) => {
+        const resolved = resolveToolArgs(args);
+        if (!resolved.ok) return { text: resolved.error, isError: true };
+        return runQuickOutline(resolved.value);
       }
-    },
-    async (args) => {
-      const resolved = resolveToolArgs(args);
-      if (!resolved.ok) return { text: resolved.error, isError: true };
-      return runQuickOutline(resolved.value);
-    }
-  );
-  server.registerTool(
-    {
-      name: "run_checks",
-      description: "Run multiple independent non-interactive shell commands concurrently under one check (build/typecheck/lint/test with outputMode 'compact', or diagnostic/audit scripts with outputMode 'full').",
-      inputSchema: {
-        type: "object",
-        properties: {
-          cwd: {
-            type: "string",
-            description: "Workspace root directory for relative paths (required if the host does not report MCP roots/list, e.g. Desktop 2.0 Hub)."
+    );
+  }
+  if (shouldRegister("run_checks")) {
+    server.registerTool(
+      applySchemaCompat({
+        name: "run_checks",
+        description: `Batch >=2 independent non-interactive shell commands concurrently (for 1 lightweight command, prefer run_command). outputMode 'compact' (default) hides pass logs, keeps failures; 'full' keeps passing stdout. concurrency default 4. Per-cmd timeoutSec default 60; shared ${MCP_CALL_BUDGET_SEC}s budget (agy drops results at 180s; commands that cannot start are marked not run). Absolute cwd if no roots/list (Desktop 2.0 Hub); command.cwd overrides; name is label. maxChars default 8000; 8800 UTF-8 bytes total.`,
+        inputSchema: {
+          type: "object",
+          properties: {
+            cwd: { type: "string" },
+            commands: {
+              type: "array",
+              minItems: 1,
+              maxItems: 12,
+              items: {
+                type: "object",
+                properties: {
+                  name: { type: "string" },
+                  command: { type: "string" },
+                  cwd: { type: "string" },
+                  timeoutSec: { type: "integer", minimum: 1, maximum: MCP_CALL_BUDGET_SEC }
+                },
+                required: ["command"]
+              }
+            },
+            concurrency: { type: "integer", minimum: 1, maximum: 8 },
+            timeoutSec: { type: "integer", minimum: 1, maximum: MCP_CALL_BUDGET_SEC },
+            outputMode: { type: "string", enum: ["compact", "full"] },
+            maxChars: { type: "integer", minimum: 500, maximum: 8800 }
           },
-          commands: {
-            type: "array",
-            minItems: 1,
-            maxItems: 12,
-            description: "Commands to execute concurrently.",
-            items: {
-              type: "object",
-              properties: {
-                name: { type: "string", description: "Short label (e.g. 'typecheck')." },
-                command: { type: "string", description: "Shell command to run." },
-                cwd: { type: "string", description: "Optional working directory override." },
-                timeoutSec: { type: "integer", minimum: 1, maximum: MCP_CALL_BUDGET_SEC }
-              },
-              required: ["command"]
-            }
-          },
-          concurrency: {
-            type: "integer",
-            minimum: 1,
-            maximum: 8,
-            description: "Max parallel commands (default 4)."
-          },
-          timeoutSec: {
-            type: "integer",
-            minimum: 1,
-            maximum: MCP_CALL_BUDGET_SEC,
-            description: `Default per-command timeout in seconds (default 60). All commands of one call share a ${MCP_CALL_BUDGET_SEC}s budget because agy drops MCP results after 180s; commands that cannot start within it are reported as not run.`
-          },
-          outputMode: {
-            type: "string",
-            enum: ["compact", "full"],
-            description: "'compact' hides verbose pass logs (default); 'full' preserves stdout for diagnostic/inspection commands."
-          },
-          maxChars: {
-            type: "integer",
-            minimum: 500,
-            maximum: 8800,
-            description: "Total character cap (default 8000; hard inline UTF-8 cap <= 8800 bytes)."
-          }
-        },
-        required: ["commands"]
+          required: ["commands"]
+        }
+      }),
+      async (args) => {
+        const resolved = resolveToolArgs(args);
+        if (!resolved.ok) return { text: resolved.error, isError: true };
+        return runChecks(resolved.value);
       }
-    },
-    async (args) => {
-      const resolved = resolveToolArgs(args);
-      if (!resolved.ok) return { text: resolved.error, isError: true };
-      return runChecks(resolved.value);
-    }
-  );
+    );
+  }
   return server;
 }
+
+// src/mcp-server.ts
 function main() {
-  const server = createAgyFastServer();
+  if (process.argv[2] === "--cli") {
+    void runAgyFastCli(process.argv.slice(3)).then((code) => {
+      process.exitCode = code;
+    }).catch((err) => {
+      process.stderr.write(
+        `Error: ${err instanceof Error ? err.message : String(err)}
+`
+      );
+      process.exitCode = 1;
+    });
+    return;
+  }
+  const cliParsed = parseMcpServerCliArgs(process.argv.slice(2), process.env);
+  if (!cliParsed.ok) {
+    process.stderr.write(`Error: ${cliParsed.error}
+`);
+    process.exitCode = 1;
+    return;
+  }
+  if (cliParsed.help) {
+    printMcpServerHelp();
+    return;
+  }
+  const server = createAgyFastServer({
+    schemaCompat: cliParsed.schemaCompat,
+    tools: cliParsed.tools
+  });
   let flushing = false;
   const exitImmediately = () => {
     process.exit(0);
@@ -8416,5 +11101,12 @@ function main() {
 }
 main();
 export {
-  createAgyFastServer
+  ALL_MCP_TOOLS,
+  createAgyFastServer,
+  parseMcpServerCliArgs,
+  parseSchemaCompatMode,
+  parseServerCliArgs,
+  parseToolFilter,
+  printMcpServerHelp,
+  sanitizeSchemaToMinimalSubset
 };
